@@ -23,20 +23,20 @@ from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
 from megatron.core import mpu
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.optimizer import MegatronOptimizer
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_tensor_model_parallel_src_rank, 
-    get_pipeline_model_parallel_last_rank, 
-    get_pipeline_model_parallel_group, 
-    get_tensor_model_parallel_world_size
+    get_pipeline_model_parallel_group,
+    get_pipeline_model_parallel_last_rank,
+    get_tensor_model_parallel_src_rank,
+    get_tensor_model_parallel_world_size,
+    is_pipeline_last_stage,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_tensor_model_parallel_src_rank, get_tensor_model_parallel_world_size, is_pipeline_last_stage
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.utils import toggle_cuda_graphs
