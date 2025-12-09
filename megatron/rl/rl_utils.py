@@ -66,9 +66,6 @@ from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_ra
 
 logger = logging.getLogger(__name__)
 
-# Global variable to store packing context for forward_step
-_GLOBAL_PACKING_CONTEXT = None
-
 GroupedRollouts = list[list[TokenRollout | Rollout]]
 
 
@@ -600,7 +597,6 @@ def load_packed_data_by_index(bin_idx: int):
     else:
         ref_logprobs = None
     loss_mask = packing_context['packed_loss_mask'][idx, 1:]
-    print(f"loss_mask: {loss_mask.shape}")
 
     # Get sequence-level data for this bin
     packing_info = packing_context['packing_info']
@@ -2340,8 +2336,16 @@ def calculate_grpo_loss(
         advantages = advantages.view(-1, 1)
 
     ref_diff = ref_logprobs - current_logprobs
-    kl_term = ref_diff.exp() - ref_diff - 1
+    # Clamp ref_diff to avoid overflow in exp() - large positive values cause inf
+    ref_diff_clamped = torch.clamp(ref_diff, max=50.0)  # exp(50) is large but finite
+    kl_term = ref_diff_clamped.exp() - ref_diff - 1
+    
+    # Entropy calculation: entropy = -p * log(p), where p = exp(logprobs)
+    # When logprobs = -inf (p = 0), mathematically lim_{p->0} -p*log(p) = 0
+    # But numerically: exp(-inf) * (-inf) = 0 * (-inf) = NaN
+    # Fix: use nan_to_num to replace NaN with 0 (the correct limit)
     entropy_term = -current_logprobs.exp() * current_logprobs
+    entropy_term = torch.nan_to_num(entropy_term, nan=0.0, posinf=0.0, neginf=0.0)
 
     is_weights = torch.tensor(1.0, dtype=old_logprobs.dtype).to(old_logprobs.device)
     if inference_logprobs is not None:
@@ -2495,8 +2499,10 @@ def get_iteration_sequence_count(args):
 def update_sequence_packing_metrics(args):
     """Update bin tracking for sequence packing mode."""
     if args.rl_use_sequence_packing:
+        # Sequence packing always uses micro_batch_size=1 (one bin per microbatch)
+        # regardless of args.micro_batch_size setting
         bin_count = (
-            mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            mpu.get_data_parallel_world_size() * 1 * get_num_microbatches()
         )
         args.consumed_train_bins += bin_count
 
@@ -2512,8 +2518,10 @@ def get_sequence_packing_tensorboard_metrics(args):
     """Get tensorboard metrics for sequence packing mode."""
     metrics = {}
     if args.consumed_train_bins > 0:
+        # Sequence packing always uses micro_batch_size=1 (one bin per microbatch)
+        # regardless of args.micro_batch_size setting
         bin_batch_size = (
-            mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            mpu.get_data_parallel_world_size() * 1 * get_num_microbatches()
         )
         metrics['bin-batch-size'] = bin_batch_size
         metrics['consumed-bins'] = args.consumed_train_bins
