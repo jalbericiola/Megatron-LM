@@ -1563,14 +1563,69 @@ def training_log(
         ])
     # Add timers from RL loop if needed.
     if getattr(args, 'perform_rl_step', False):
-        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
-                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
-                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
-                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
-                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
-                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
-                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
-                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
+        # Level 1 RL timers - high-level phases
+        if args.timing_log_level >= 1:
+            timers_to_log.extend([
+                # Rollout collection phase
+                'rl-rollout-collection-total',
+                'rl-enter-inference-mode',
+                'rl-inference-setup',
+                'rl-generate-rollouts',
+                'rl-exit-inference-mode',
+                'rl-sync-rollouts',
+                # Inference mode transitions
+                'rl-offload-optimizer',
+                'rl-toggle-cuda-graphs-on',
+                'rl-get-inference-interface',
+                'rl-onload-kv-cache',
+                'rl-wait-decode-only',
+                'rl-build-cuda-graphs',
+                'rl-inference-resume',
+                'rl-inference-suspend',
+                'rl-offload-kv-cache',
+                'rl-toggle-cuda-graphs-off',
+                'rl-onload-optimizer',
+                # Data preparation phase
+                'rl-prepare-data-total',
+                'rl-compute-group-stats',
+                'rl-prepare-advantages',
+                'rl-prepare-trajectories',
+                'rl-sequence-packing',
+                # Logprobs computation
+                'rl-compute-logprobs-total',
+                'rl-compute-old-logprobs',
+                'rl-compute-ref-logprobs',
+                'rl-save-current-state-dict',
+                'rl-load-ref-state-dict',
+                'rl-ref-logprobs-forward',
+                'rl-restore-current-state-dict',
+                'rl-cuda-sync-and-gc',
+                # Post-logprobs processing
+                'rl-pack-logprobs',
+                'rl-align-inference-logprobs',
+                'rl-create-dataloader',
+                'rl-log-metrics',
+                # Sequence packing
+                'rl-packing-allgather',
+                'rl-packing-binpack',
+                'rl-packing-distribute',
+                'rl-packing-bin-advantages',
+                'rl-packing-create-seq-params',
+                # Evaluation
+                'rl-evaluation-total',
+                'rl-eval-inference-mode',
+                'rl-eval-generate',
+                'rl-eval-exit-inference',
+                'rl-eval-gather-results',
+            ])
+        # Level 2 RL timers - fine-grained forward step
+        if args.timing_log_level >= 2:
+            timers_to_log.extend([
+                'rl-load-batch-data',
+                'rl-clear-rope-cache',
+                'rl-forward-get-logprobs',
+                'rl-forward-grpo-loss',
+            ])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()

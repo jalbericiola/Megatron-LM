@@ -470,5 +470,6 @@ class Timers:
                 _, max_time = name_to_min_max_time[name]
                 if isinstance(writer, SummaryWriter) and SummaryWriter is not None:
                     writer.add_scalar(name + '-time', max_time, iteration)
-                elif writer == wandb and wandb is not None:
-                    writer.log({name + '-time': max_time}, iteration)
+                elif wandb is not None and hasattr(writer, 'log') and hasattr(writer, 'config'):
+                    # Check for wandb run object (has log method and config attribute)
+                    writer.log({name + '-time': max_time}, step=iteration)
