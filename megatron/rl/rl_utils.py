@@ -326,13 +326,16 @@ def get_environment_rollouts(
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
+    timers = get_timers()
 
     assert (
         n_prompts % mpu.get_expert_data_parallel_world_size() == 0
     ), "n_prompts must be divisible by data_parallel_world_size"
 
+    timers('rl-rollout-collection-total', log_level=1).start()
     with nvtx_range("rollout-collection"):
         loop = get_asyncio_loop()
+        timers('rl-enter-inference-mode', log_level=1).start()
         with megatron_rl_inference_mode(
             model,
             optimizer,
@@ -342,16 +345,20 @@ def get_environment_rollouts(
             args.rl_offload_kv_cache_during_training,
             args.rl_remove_kv_cache_during_training,
         ) as inference_interface:
+            timers('rl-enter-inference-mode').stop()
 
             with nvtx_range("inference-setup"):
+                timers('rl-inference-setup', log_level=1).start()
                 # Asyncronously run inference and rollout collection
                 rollout_generator = get_rollout_generator(
                     args, inference_interface, n_prompts, samples_per_group
                 )
+                timers('rl-inference-setup').stop()
 
             # NOTE(jbarker): we need to double check this when using PP>1
             rank = torch.distributed.get_rank()
             with nvtx_range("collect-rollouts"):
+                timers('rl-generate-rollouts', log_level=1).start()
                 if rank == 0:
                     log_single_rank(
                         logger,
@@ -371,12 +378,19 @@ def get_environment_rollouts(
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
+                timers('rl-generate-rollouts').stop()
+
+            timers('rl-exit-inference-mode', log_level=1).start()
+        timers('rl-exit-inference-mode').stop()
 
         with nvtx_range("sync-rollouts"):
+            timers('rl-sync-rollouts', log_level=1).start()
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
+            timers('rl-sync-rollouts').stop()
         logger.debug(f"Got rollouts on rank {rank}")
+    timers('rl-rollout-collection-total').stop()
 
     if lang_rl_log_dir and rank == get_tensor_model_parallel_src_rank():
         with open(
@@ -830,11 +844,14 @@ def prepare_data_for_update(
     tb_writer = get_tensorboard_writer()
     nvtx_range = get_nvtx_range()                
     runtime_state = get_rl_runtime_state()
+    timers = get_timers()
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
+    timers('rl-prepare-data-total', log_level=1).start()
     with nvtx_range("prepare-data-for-update"):
         with nvtx_range("compute-group-stats"):
+            timers('rl-compute-group-stats', log_level=1).start()
             # These are computed on all rollouts for reporting purposes
             group_stats = compute_group_stats(rollouts, tokenizer)
             rewards = np.array([[rollout.reward for rollout in group] for group in rollouts])
@@ -848,8 +865,10 @@ def prepare_data_for_update(
                 .tolist()
             )
             global_rollout_count = len(group_stats.rewards)
+            timers('rl-compute-group-stats').stop()
 
-        with nvtx_range("prepare_advantages", time=True):        
+        with nvtx_range("prepare_advantages", time=True):
+            timers('rl-prepare-advantages', log_level=1).start()
             # [g, group_size]
             # Making an assumption that all groups are of the same size!
             rewards = torch.tensor(rewards, device='cpu')
@@ -859,6 +878,7 @@ def prepare_data_for_update(
 
             # Flatten advantages for training and move to GPU
             advantages = global_advantages = advantages.view(-1).cuda()
+            timers('rl-prepare-advantages').stop()
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
@@ -880,13 +900,16 @@ def prepare_data_for_update(
             advantages = advantages.view(-1).cuda()
 
         with nvtx_range("prepare_trajectories"):
+            timers('rl-prepare-trajectories', log_level=1).start()
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length
             )
+            timers('rl-prepare-trajectories').stop()
 
         # Build trajectories based on sequence packing or standard processing
         if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing", time=True):
+                timers('rl-sequence-packing', log_level=1).start()
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
                     trajs, 
                     generation_masks, 
@@ -896,6 +919,7 @@ def prepare_data_for_update(
                     args.rl_sequence_packing_max_sequences_per_bin,
                     args.rl_sequence_packing_algo
                     )
+                timers('rl-sequence-packing').stop()
     
                 compute_trajs = packing_context.packed_trajs
                 compute_position_ids = packing_context.packed_position_ids
@@ -926,6 +950,7 @@ def prepare_data_for_update(
                 logprobs_batch_size = args.micro_batch_size
 
 
+        timers('rl-compute-logprobs-total', log_level=1).start()
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
@@ -1006,27 +1031,44 @@ def prepare_data_for_update(
                 return logprobs.cpu()
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+                timers('rl-compute-old-logprobs', log_level=1).start()
                 old_logprobs = _compute_logprobs_batch()
+                timers('rl-compute-old-logprobs').stop()
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
+                timers('rl-compute-ref-logprobs', log_level=1).start()
                 # We need to load the ref model state dict and compute the logprobs for the ref model
+                timers('rl-save-current-state-dict', log_level=1).start()
                 cur_st_dict = {
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
                 }
+                timers('rl-save-current-state-dict').stop()
+                
+                timers('rl-load-ref-state-dict', log_level=1).start()
                 model.load_state_dict(ref_state_dict)
+                timers('rl-load-ref-state-dict').stop()
 
+                timers('rl-ref-logprobs-forward', log_level=1).start()
                 ref_logprobs = _compute_logprobs_batch()
+                timers('rl-ref-logprobs-forward').stop()
 
                 # logprobs are [b, seq, h] now.
+                timers('rl-restore-current-state-dict', log_level=1).start()
                 model.load_state_dict(cur_st_dict)
+                timers('rl-restore-current-state-dict').stop()
+                timers('rl-compute-ref-logprobs').stop()
 
+            timers('rl-cuda-sync-and-gc', log_level=1).start()
             torch.cuda.synchronize()
             gc.collect()
             torch.cuda.empty_cache()
+            timers('rl-cuda-sync-and-gc').stop()
+        timers('rl-compute-logprobs-total').stop()
 
 
         if args.rl_use_sequence_packing:
             with nvtx_range("pack_logprobs", time=True):
+                timers('rl-pack-logprobs', log_level=1).start()
                 # Store logprobs on gpu in packing context
                 # Since PackingContext is a dataclass, we add these as new attributes
                 packing_context.old_logprobs = old_logprobs.cuda()
@@ -1054,8 +1096,10 @@ def prepare_data_for_update(
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
                     # Only mark as having inference logprobs for IS correction if enabled
                     packing_context.has_inference_logprobs = args.rl_inference_logprobs_is_correction
+                timers('rl-pack-logprobs').stop()
         else:
             with nvtx_range("align_inference_logprobs", time=True):
+                timers('rl-align-inference-logprobs', log_level=1).start()
                 if inference_logprobs is not None:
                     inference_logprobs = align_unpacked_inference_logprobs(
                         inference_logprobs=inference_logprobs,
@@ -1068,8 +1112,10 @@ def prepare_data_for_update(
                     # Nullify logprobs if not used in IS correction,
                     if not args.rl_inference_logprobs_is_correction:
                         inference_logprobs = None
+                timers('rl-align-inference-logprobs').stop()
 
         with nvtx_range("create_dataloader"):
+            timers('rl-create-dataloader', log_level=1).start()
             if args.rl_use_sequence_packing:
                loader, optimizer_steps = get_microbatch_dataloader(packing_context)
                runtime_state.global_batches_per_collection = optimizer_steps
@@ -1091,8 +1137,10 @@ def prepare_data_for_update(
 
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
+            timers('rl-create-dataloader').stop()
 
         with nvtx_range("log-wandb-tb"):
+            timers('rl-log-metrics', log_level=1).start()
             maybe_log_training_metrics(
                 group_stats=group_stats,
                 current_iteration=args.curr_iteration,
@@ -1101,7 +1149,9 @@ def prepare_data_for_update(
                 wandb_writer=wandb_writer,
                 tb_writer=tb_writer,
             )
+            timers('rl-log-metrics').stop()
 
+    timers('rl-prepare-data-total').stop()
     return RerunDataIterator(itertools.cycle(loader))
 
 
@@ -1176,13 +1226,16 @@ def evaluate_and_print_results_rl(
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
     """
     args = get_args()
+    timers = get_timers()
 
     # TODO(vitalyk): I do not track eval loss as in training. We probably should.
     # megatron-lm uses forward_step_func to do the above.
 
     # Use context manager to temporarily disable sequence parallelism for evaluation
 
+    timers('rl-evaluation-total', log_level=1).start()
     with torch.no_grad():
+        timers('rl-eval-inference-mode', log_level=1).start()
         with megatron_rl_inference_mode(
             model,
             optimizer,
@@ -1192,10 +1245,12 @@ def evaluate_and_print_results_rl(
             args.rl_offload_kv_cache_during_training,
             args.rl_remove_kv_cache_during_training,
         ) as inference_interface:
+            timers('rl-eval-inference-mode').stop()
 
             loop = get_asyncio_loop()
 
             rank = torch.distributed.get_rank()
+            timers('rl-eval-generate', log_level=1).start()
             if rank == 0:
                 logger.info(f"Collecting evaluation results...")
                 agent = get_agent(args)
@@ -1215,7 +1270,12 @@ def evaluate_and_print_results_rl(
                     evaluation_responses = [evaluation_responses]
             else:
                 evaluation_responses = None
+            timers('rl-eval-generate').stop()
 
+            timers('rl-eval-exit-inference', log_level=1).start()
+        timers('rl-eval-exit-inference').stop()
+
+        timers('rl-eval-gather-results', log_level=1).start()
         dp_eval_results: list[None | list[EvaluationResponse]] = [
             None for _ in range(args.world_size)
         ]
@@ -1224,6 +1284,7 @@ def evaluate_and_print_results_rl(
             dp_eval_results if dist.get_rank() == (args.world_size - 1) else None,
             dst=args.world_size - 1,
         )
+        timers('rl-eval-gather-results').stop()
 
         if dist.get_rank() == args.world_size - 1:
             dp_eval_results = [x for x in dp_eval_results if x is not None]
@@ -1269,6 +1330,7 @@ def evaluate_and_print_results_rl(
                     'wb',
                 ) as f:
                     pickle.dump(dp_eval_results, f)
+    timers('rl-evaluation-total').stop()
 
 
 def calculate_grpo_loss(
@@ -1393,6 +1455,7 @@ def megatron_rl_inference_mode(
     args = get_args()
     loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
+    timers = get_timers()
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
@@ -1412,15 +1475,22 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-before-inference"):
+                timers('rl-offload-optimizer', log_level=1).start()
                 optimizer.offload_to_cpu()
+                timers('rl-offload-optimizer').stop()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none":
+            timers('rl-toggle-cuda-graphs-on', log_level=1).start()
             toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
+            timers('rl-toggle-cuda-graphs-on').stop()
 
+        timers('rl-get-inference-interface', log_level=1).start()
         inference_interface = get_inference_interface(args, loop, model)
+        timers('rl-get-inference-interface').stop()
 
         with nvtx_range("onload-kv-cache-before-inference"):
+            timers('rl-onload-kv-cache', log_level=1).start()
             if offload_kv_cache_during_training:
                 assert (
                     reset_cuda_graphs
@@ -1433,27 +1503,37 @@ def megatron_rl_inference_mode(
             elif remove_kv_cache_during_training:
                 if inference_interface._inference_engine.context.memory_buffer is None:
                     inference_interface._inference_engine.context.build_memory_buffer()
+            timers('rl-onload-kv-cache').stop()
 
         # TODO: Improve this if statement once a change is made to CUDA graph handling.
         cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
         if cuda_graph_impl != "none" and not cuda_graph_exists:
             with nvtx_range("wait-for-decode-only"):
+                timers('rl-wait-decode-only', log_level=1).start()
                 while not inference_interface._inference_engine.context.is_decode_only():
                     active_requests, finished_requests, step_time = loop.run_until_complete(
                         inference_interface._inference_engine.async_step()
                     )
+                timers('rl-wait-decode-only').stop()
             with nvtx_range("build-cuda-graphs"):
+                timers('rl-build-cuda-graphs', log_level=1).start()
                 inference_interface._inference_engine.create_cuda_graphs(reset_context=True)
+                timers('rl-build-cuda-graphs').stop()
 
+        timers('rl-inference-resume', log_level=1).start()
         loop.run_until_complete(inference_interface.resume())
+        timers('rl-inference-resume').stop()
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
         yield inference_interface
 
         with nvtx_range("suspend-engine"):
+            timers('rl-inference-suspend', log_level=1).start()
             loop.run_until_complete(inference_interface.suspend())
+            timers('rl-inference-suspend').stop()
 
         with nvtx_range("offload-kv-cache-after-inference"):
+            timers('rl-offload-kv-cache', log_level=1).start()
             if offload_kv_cache_during_training:
                 kv_cache = inference_interface._inference_engine.context.memory_buffer
                 logger.debug(
@@ -1462,14 +1542,19 @@ def megatron_rl_inference_mode(
                 inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
+            timers('rl-offload-kv-cache').stop()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none":
+            timers('rl-toggle-cuda-graphs-off', log_level=1).start()
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
+            timers('rl-toggle-cuda-graphs-off').stop()
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
+                timers('rl-onload-optimizer', log_level=1).start()
                 optimizer.restore_from_cpu()
+                timers('rl-onload-optimizer').stop()
 
         lang_module.train()
 

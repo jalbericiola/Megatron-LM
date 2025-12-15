@@ -204,6 +204,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
+    timers('rl-load-batch-data', log_level=2).start()
     if args.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
@@ -251,11 +252,13 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         )
 
         runtime_state.increment_sequences(tokens.shape[0])
+    timers('rl-load-batch-data').stop()
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
 
     # Clear RoPE cache to avoid inference tensor errors
+    timers('rl-clear-rope-cache', log_level=2).start()
     try:
         for module in model_to_use.modules():
             if hasattr(module, '_forward') and hasattr(module._forward, 'cache_clear'):
@@ -264,12 +267,15 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                 module.forward.cache_clear()
     except:
         pass
+    timers('rl-clear-rope-cache').stop()
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
+        timers('rl-forward-get-logprobs', log_level=2).start()
         logprobs_or_hidden_states = get_logprobs(
             model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
         )
+        timers('rl-forward-get-logprobs').stop()
 
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states
@@ -282,6 +288,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             )
         else:
             # Calculate loss using unified function
+            timers('rl-forward-grpo-loss', log_level=2).start()
             current_logprobs = logprobs_or_hidden_states
             loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
                 calculate_grpo_loss(
@@ -300,6 +307,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                 )
             )
             output_tensor = loss
+            timers('rl-forward-grpo-loss').stop()
 
     # loss_mask will not be applied to 0th token as we do not have a logprob for it.
     return output_tensor, partial(
