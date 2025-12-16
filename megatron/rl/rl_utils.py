@@ -1030,39 +1030,93 @@ def prepare_data_for_update(
                 )
                 return logprobs.cpu()
 
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+            # Optimization: Skip old_logprobs computation if inference logprobs are available
+            # The inference logprobs are exactly π_old for generated tokens, which is all we need
+            # since loss_mask=0 for prompt tokens. This saves ~33 seconds per iteration.
+            skip_old_logprobs = (
+                getattr(args, 'rl_skip_old_logprobs_computation', False) and
+                inference_logprobs is not None
+            )
+            
+            if skip_old_logprobs:
                 timers('rl-compute-old-logprobs', log_level=1).start()
-                old_logprobs = _compute_logprobs_batch()
+                log_single_rank(
+                    logger, logging.INFO, 
+                    "Using inference logprobs as old_logprobs (skipping forward pass)"
+                )
+                # Use inference logprobs directly - they need to be aligned with the sequence
+                if args.rl_use_sequence_packing:
+                    # For packing mode, use the packed inference logprobs
+                    # Shape should match [num_bins, seq_length-1]
+                    old_logprobs = pack_inference_logprobs(
+                        inference_logprobs=packing_context.original_inference_logprobs,
+                        packing_info=packing_context.packing_info,
+                        generation_masks=packing_context.original_generation_masks,
+                        bin_size=args.seq_length,
+                    )
+                else:
+                    # For non-packing mode, align inference logprobs to match expected shape
+                    # Start with zeros (for prompt positions where loss_mask=0 anyway)
+                    old_logprobs = torch.zeros(
+                        len(compute_trajs), args.seq_length - 1, dtype=dtype, device='cpu'
+                    )
+                    # Fill in the generated token positions with inference logprobs
+                    for i, (gen_mask, inf_lp) in enumerate(zip(generation_masks, inference_logprobs)):
+                        if inf_lp is not None:
+                            # Find first generation position (shifted by 1 for logprobs)
+                            first_gen_idx = gen_mask.int().argmax().item() - 1
+                            end_idx = min(first_gen_idx + len(inf_lp), args.seq_length - 1)
+                            actual_len = end_idx - first_gen_idx
+                            if actual_len > 0 and first_gen_idx >= 0:
+                                old_logprobs[i, first_gen_idx:end_idx] = inf_lp[:actual_len]
                 timers('rl-compute-old-logprobs').stop()
+            else:
+                with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+                    timers('rl-compute-old-logprobs', log_level=1).start()
+                    old_logprobs = _compute_logprobs_batch()
+                    timers('rl-compute-old-logprobs').stop()
 
-            with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
-                timers('rl-compute-ref-logprobs', log_level=1).start()
-                # We need to load the ref model state dict and compute the logprobs for the ref model
-                timers('rl-save-current-state-dict', log_level=1).start()
-                cur_st_dict = {
-                    k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
-                }
-                timers('rl-save-current-state-dict').stop()
-                
-                timers('rl-load-ref-state-dict', log_level=1).start()
-                model.load_state_dict(ref_state_dict)
-                timers('rl-load-ref-state-dict').stop()
+            # Skip reference logprobs computation if KL beta is 0 (saves ~34s per iteration)
+            if args.grpo_kl_beta > 0:
+                with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
+                    timers('rl-compute-ref-logprobs', log_level=1).start()
+                    # We need to load the ref model state dict and compute the logprobs for the ref model
+                    timers('rl-save-current-state-dict', log_level=1).start()
+                    # Keep state dict on GPU for faster swap (avoid CPU<->GPU transfer)
+                    cur_st_dict = {
+                        k: (v.clone() if v is not None else v) for k, v in model.state_dict().items()
+                    }
+                    timers('rl-save-current-state-dict').stop()
+                    
+                    timers('rl-load-ref-state-dict', log_level=1).start()
+                    model.load_state_dict(ref_state_dict)
+                    timers('rl-load-ref-state-dict').stop()
 
-                timers('rl-ref-logprobs-forward', log_level=1).start()
-                ref_logprobs = _compute_logprobs_batch()
-                timers('rl-ref-logprobs-forward').stop()
+                    timers('rl-ref-logprobs-forward', log_level=1).start()
+                    ref_logprobs = _compute_logprobs_batch()
+                    timers('rl-ref-logprobs-forward').stop()
 
-                # logprobs are [b, seq, h] now.
-                timers('rl-restore-current-state-dict', log_level=1).start()
-                model.load_state_dict(cur_st_dict)
-                timers('rl-restore-current-state-dict').stop()
-                timers('rl-compute-ref-logprobs').stop()
+                    # logprobs are [b, seq, h] now.
+                    timers('rl-restore-current-state-dict', log_level=1).start()
+                    model.load_state_dict(cur_st_dict)
+                    timers('rl-restore-current-state-dict').stop()
+                    # Free temporary state dict immediately
+                    del cur_st_dict
+                    timers('rl-compute-ref-logprobs').stop()
+            else:
+                # When KL beta is 0, ref_logprobs are not used in loss calculation
+                # Use old_logprobs as placeholder to maintain tensor shapes
+                log_single_rank(logger, logging.INFO, "Skipping ref logprobs computation (grpo_kl_beta=0)")
+                ref_logprobs = old_logprobs
 
-            timers('rl-cuda-sync-and-gc', log_level=1).start()
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
-            timers('rl-cuda-sync-and-gc').stop()
+            # Only run expensive GC operations if we did actual forward passes
+            # Skip if we used inference logprobs and skipped ref logprobs
+            if not skip_old_logprobs or args.grpo_kl_beta > 0:
+                timers('rl-cuda-sync-and-gc', log_level=1).start()
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+                timers('rl-cuda-sync-and-gc').stop()
         timers('rl-compute-logprobs-total').stop()
 
 

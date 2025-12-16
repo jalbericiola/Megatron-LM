@@ -2054,6 +2054,9 @@ def _add_rl_args(parser):
                        help='If set, use partial rollouts.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
+    group.add_argument('--rl-skip-old-logprobs-computation', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='If set, use inference logprobs directly as old_logprobs, skipping the expensive '
+                            'old_logprobs forward pass (~33s savings). Requires that rollouts include logprobs.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
     group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
