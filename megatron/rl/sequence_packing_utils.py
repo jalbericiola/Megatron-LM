@@ -588,28 +588,31 @@ def compute_packed_inference_logprobs_stats(
         packed_loss_mask: Loss mask indicating valid positions [num_bins, seq_len]
         group_stats: Statistics object to update with computed metrics
     """
-    # Lazy import to avoid circular dependency (rl_utils imports from this module)
-    from megatron.rl.rl_utils import update_inference_logprobs_group_stats
+    nvtx_range = get_nvtx_range()
+    
+    with nvtx_range("rl/pack-logprobs/compute-stats", log_level=2):
+        # Lazy import to avoid circular dependency (rl_utils imports from this module)
+        from megatron.rl.rl_utils import update_inference_logprobs_group_stats
 
-    # Ensure all tensors are on the same device (CPU for stats computation)
-    old_logprobs = old_logprobs.cpu()
-    packed_inference_logprobs = packed_inference_logprobs.cpu()
-    packed_loss_mask = packed_loss_mask.cpu()
+        # Ensure all tensors are on the same device (CPU for stats computation)
+        old_logprobs = old_logprobs.cpu()
+        packed_inference_logprobs = packed_inference_logprobs.cpu()
+        packed_loss_mask = packed_loss_mask.cpu()
 
-    # Use packed_loss_mask to identify valid positions for stats (shift by 1 for logprobs)
-    mask = packed_loss_mask[:, 1:].bool()
+        # Use packed_loss_mask to identify valid positions for stats (shift by 1 for logprobs)
+        mask = packed_loss_mask[:, 1:].bool()
 
-    # Ensure shapes match
-    if mask.shape != old_logprobs.shape:
-        return
+        # Ensure shapes match
+        if mask.shape != old_logprobs.shape:
+            return
 
-    # Update group statistics using common helper
-    update_inference_logprobs_group_stats(
-        old_logprobs=old_logprobs,
-        inference_logprobs=packed_inference_logprobs,
-        mask=mask,
-        group_stats=group_stats,
-    )
+        # Update group statistics using common helper
+        update_inference_logprobs_group_stats(
+            old_logprobs=old_logprobs,
+            inference_logprobs=packed_inference_logprobs,
+            mask=mask,
+            group_stats=group_stats,
+        )
 
 
 class SequencePacker:

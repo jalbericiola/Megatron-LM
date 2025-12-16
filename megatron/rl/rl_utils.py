@@ -1129,22 +1129,22 @@ def prepare_data_for_update(
                 if inference_logprobs is not None:
                     # Pack the inference logprobs using the helper function
                     # We do this for logging purposes even if is_correction is disabled
-                    with nvtx_range("rl/pack-logprobs/pack-inference", log_level=2):
-                        packed_inference_logprobs = pack_inference_logprobs(
-                            inference_logprobs=packing_context.original_inference_logprobs,
-                            packing_info=packing_context.packing_info,
-                            generation_masks=packing_context.original_generation_masks,
-                            bin_size=args.seq_length,
-                        )
+                    # Note: pack_inference_logprobs has its own timer inside
+                    packed_inference_logprobs = pack_inference_logprobs(
+                        inference_logprobs=packing_context.original_inference_logprobs,
+                        packing_info=packing_context.packing_info,
+                        generation_masks=packing_context.original_generation_masks,
+                        bin_size=args.seq_length,
+                    )
 
                     # Compute statistics for logging using packed data
-                    with nvtx_range("rl/pack-logprobs/compute-stats", log_level=2):
-                        compute_packed_inference_logprobs_stats(
-                            old_logprobs=old_logprobs,
-                            packed_inference_logprobs=packed_inference_logprobs,
-                            packed_loss_mask=packing_context.packed_loss_mask,
-                            group_stats=group_stats,
-                        )
+                    # Note: compute_packed_inference_logprobs_stats has its own timer inside
+                    compute_packed_inference_logprobs_stats(
+                        old_logprobs=old_logprobs,
+                        packed_inference_logprobs=packed_inference_logprobs,
+                        packed_loss_mask=packing_context.packed_loss_mask,
+                        group_stats=group_stats,
+                    )
 
                     # Store packed inference logprobs in packing context
                     with nvtx_range("rl/pack-logprobs/store-inference", log_level=2):
