@@ -1,23 +1,24 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import torch
+import logging
 import math
-import numpy as np
-from typing import List, Dict, Any, Tuple, Optional
-from torch.utils.data import DataLoader, TensorDataset
+import typing
 from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+from megatron.core import mpu
+from megatron.core.num_microbatches_calculator import (
+    get_num_microbatches,
+    reconfigure_num_microbatches_calculator,
+)
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 from megatron.training.utils import get_nvtx_range
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core import mpu
-import logging
-import typing
-from megatron.core.num_microbatches_calculator import (
-        get_num_microbatches,
-        reconfigure_num_microbatches_calculator,
-    )
 
 logger = logging.getLogger(__name__)
 
