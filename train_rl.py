@@ -23,6 +23,7 @@ from megatron.rl.rl_utils import (
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.utils import get_nvtx_range
 from model_provider import model_provider
 
 stimer = StragglerDetector()
@@ -204,78 +205,77 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
-    timers('rl-load-batch-data', log_level=2).start()
-    if args.rl_use_sequence_packing:
-        # Get bin index from data iterator
-        bin_tensor = batch_data[0]
+    nvtx_range = get_nvtx_range()
+    
+    with nvtx_range("rl-load-batch-data", time=True):
+        if args.rl_use_sequence_packing:
+            # Get bin index from data iterator
+            bin_tensor = batch_data[0]
 
-        (
-            tokens,
-            advantages,
-            old_logprobs,
-            loss_mask,
-            position_ids,
-            ref_logprobs,
-            inference_logprobs,
-            seq_starts,
-            seq_lengths,
-            seq_indices,
-            packed_seq_params,
-        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, args.rl_inference_logprobs_is_correction)
+            (
+                tokens,
+                advantages,
+                old_logprobs,
+                loss_mask,
+                position_ids,
+                ref_logprobs,
+                inference_logprobs,
+                seq_starts,
+                seq_lengths,
+                seq_indices,
+                packed_seq_params,
+            ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, args.rl_inference_logprobs_is_correction)
 
-        runtime_state.increment_sequences(len(seq_indices))
-    else:
-        # Extract unpacked data
-        (
-            tokens,
-            advantages,
-            old_logprobs,
-            loss_mask,
-            position_ids,
-            ref_logprobs,
-            inference_logprobs,
-        ) = batch_data
+            runtime_state.increment_sequences(len(seq_indices))
+        else:
+            # Extract unpacked data
+            (
+                tokens,
+                advantages,
+                old_logprobs,
+                loss_mask,
+                position_ids,
+                ref_logprobs,
+                inference_logprobs,
+            ) = batch_data
 
-        seq_starts = None
-        seq_lengths = None
-        packed_seq_params = None
+            seq_starts = None
+            seq_lengths = None
+            packed_seq_params = None
 
-        # Move to CUDA
-        tokens = tokens.cuda()
-        position_ids = position_ids.cuda()
-        old_logprobs = old_logprobs.cuda()
-        ref_logprobs = ref_logprobs.cuda()
-        # advantages already on GPU from prepare_data_for_update
-        loss_mask = loss_mask[:, 1:].contiguous().cuda()
-        inference_logprobs = (
-            inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
-        )
+            # Move to CUDA
+            tokens = tokens.cuda()
+            position_ids = position_ids.cuda()
+            old_logprobs = old_logprobs.cuda()
+            ref_logprobs = ref_logprobs.cuda()
+            # advantages already on GPU from prepare_data_for_update
+            loss_mask = loss_mask[:, 1:].contiguous().cuda()
+            inference_logprobs = (
+                inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
+            )
 
-        runtime_state.increment_sequences(tokens.shape[0])
-    timers('rl-load-batch-data').stop()
+            runtime_state.increment_sequences(tokens.shape[0])
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
 
     # Clear RoPE cache to avoid inference tensor errors
-    timers('rl-clear-rope-cache', log_level=2).start()
-    try:
-        for module in model_to_use.modules():
-            if hasattr(module, '_forward') and hasattr(module._forward, 'cache_clear'):
-                module._forward.cache_clear()
-            if hasattr(module, 'forward') and hasattr(module.forward, 'cache_clear'):
-                module.forward.cache_clear()
-    except:
-        pass
-    timers('rl-clear-rope-cache').stop()
+    with nvtx_range("rl-clear-rope-cache", time=True):
+        try:
+            for module in model_to_use.modules():
+                if hasattr(module, '_forward') and hasattr(module._forward, 'cache_clear'):
+                    module._forward.cache_clear()
+                if hasattr(module, 'forward') and hasattr(module.forward, 'cache_clear'):
+                    module.forward.cache_clear()
+        except:
+            pass
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
-        timers('rl-forward-get-logprobs', log_level=2).start()
-        logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
-        )
-        timers('rl-forward-get-logprobs').stop()
+        with nvtx_range("rl-forward-get-logprobs", time=True):
+            logprobs_or_hidden_states = get_logprobs(
+                model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
+            )
 
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states
@@ -288,26 +288,25 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             )
         else:
             # Calculate loss using unified function
-            timers('rl-forward-grpo-loss', log_level=2).start()
-            current_logprobs = logprobs_or_hidden_states
-            loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
-                calculate_grpo_loss(
-                    current_logprobs=current_logprobs,
-                    old_logprobs=old_logprobs,
-                    ref_logprobs=ref_logprobs,
-                    advantages=advantages,
-                    clamp_eps_lower=args.grpo_clamp_eps_lower,
-                    clamp_eps_upper=args.grpo_clamp_eps_upper,
-                    kl_beta=args.grpo_kl_beta,
-                    entropy_weight=args.grpo_entropy_term_weight,
-                    inference_logprobs=inference_logprobs,
-                    is_truncation_coef=args.rl_importance_sampling_truncation_coef,
-                    seq_starts=seq_starts,
-                    seq_lengths=seq_lengths,
+            with nvtx_range("rl-forward-grpo-loss", time=True):
+                current_logprobs = logprobs_or_hidden_states
+                loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+                    calculate_grpo_loss(
+                        current_logprobs=current_logprobs,
+                        old_logprobs=old_logprobs,
+                        ref_logprobs=ref_logprobs,
+                        advantages=advantages,
+                        clamp_eps_lower=args.grpo_clamp_eps_lower,
+                        clamp_eps_upper=args.grpo_clamp_eps_upper,
+                        kl_beta=args.grpo_kl_beta,
+                        entropy_weight=args.grpo_entropy_term_weight,
+                        inference_logprobs=inference_logprobs,
+                        is_truncation_coef=args.rl_importance_sampling_truncation_coef,
+                        seq_starts=seq_starts,
+                        seq_lengths=seq_lengths,
+                    )
                 )
-            )
-            output_tensor = loss
-            timers('rl-forward-grpo-loss').stop()
+                output_tensor = loss
 
     # loss_mask will not be applied to 0th token as we do not have a logprob for it.
     return output_tensor, partial(

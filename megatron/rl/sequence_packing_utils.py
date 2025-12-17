@@ -7,8 +7,8 @@ from typing import List, Dict, Any, Tuple, Optional
 from torch.utils.data import DataLoader, TensorDataset
 from dataclasses import dataclass, field
 from megatron.core.utils import log_single_rank
-from megatron.training.global_vars import get_args, get_tokenizer, get_timers
-from megatron.training.utils import get_nvtx_range
+from megatron.training.global_vars import get_args, get_tokenizer
+from megatron.rl.rl_utils import get_rl_nvtx_range
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core import mpu
@@ -958,11 +958,8 @@ def distribute_packed_bins(
 def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
     tokenizer = get_tokenizer()
     expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
-    nvtx_range = get_nvtx_range()
-    timers = get_timers()
-
-    with nvtx_range("regather_trajectories", time=True):
-        timers('rl-packing-allgather', log_level=1).start()
+    rl_nvtx_range = get_rl_nvtx_range()
+    with rl_nvtx_range("rl-packing-allgather", time=True, log_level=2):
         # Regather trajectories from all ranks for packing
         trajs = trajs.cuda()
         trajs_list = [torch.empty_like(trajs) for _ in range(expert_data_parallel_world_size)]
@@ -987,10 +984,8 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
                 logprobs_list, inference_logprobs, group=mpu.get_expert_data_parallel_group()
             )
             inference_logprobs = torch.cat(logprobs_list, dim=0)
-        timers('rl-packing-allgather').stop()
 
-    with nvtx_range("pack_sequences", time=True):
-        timers('rl-packing-binpack', log_level=1).start()
+    with rl_nvtx_range("rl-packing-binpack", time=True, log_level=2):
         # Create packer with max sequences per bin limit to prevent extreme imbalance
         packer = SequencePacker(
             bin_size=bin_size,
@@ -1007,10 +1002,9 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             packing_info,
         ) = packer.pack_sequences(trajs, generation_masks)
         packing_info.packing_algo = packing_algo
-        timers('rl-packing-binpack').stop()
 
+    with rl_nvtx_range("rl-packing-distribute", time=True, log_level=2):
         # Distribute packed bins across the data parallel ranks
-        timers('rl-packing-distribute', log_level=1).start()
         (
             packed_trajs,
             packed_position_ids,
@@ -1024,33 +1018,30 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             packed_loss_mask,
             packing_info,
         )
-        timers('rl-packing-distribute').stop()
 
-    # Create bin_advantages list
-    timers('rl-packing-bin-advantages', log_level=1).start()
-    bin_advantages = []
-    for seq_indices in packing_info.bin_seq_indices:
-        if seq_indices:
-            bin_advantages.append(global_advantages[seq_indices])
-        else:
-            bin_advantages.append(
-                torch.tensor([], dtype=global_advantages.dtype, device=global_advantages.device)
-            )
-    timers('rl-packing-bin-advantages').stop()
+    with rl_nvtx_range("rl-packing-bin-advantages", time=True, log_level=2):
+        # Create bin_advantages list
+        bin_advantages = []
+        for seq_indices in packing_info.bin_seq_indices:
+            if seq_indices:
+                bin_advantages.append(global_advantages[seq_indices])
+            else:
+                bin_advantages.append(
+                    torch.tensor([], dtype=global_advantages.dtype, device=global_advantages.device)
+                )
 
-    # Pre-compute all PackedSeqParams for all bins ONCE to avoid repeated
-    # tensor allocations that cause CUDA memory fragmentation and periodic spikes
-    # Create a temporary packing context to pass to create_packed_seq_params
-    timers('rl-packing-create-seq-params', log_level=1).start()
-    cached_packed_seq_params = [
-        create_packed_seq_params_for_bin(
-                packing_info=packing_info,
-                bin_idx=bin_idx,
-                bin_size=bin_size,
-                device=packed_trajs.device,
-            ) for bin_idx in range(len(packed_trajs))
-    ]
-    timers('rl-packing-create-seq-params').stop()
+    with rl_nvtx_range("rl-packing-create-seq-params", time=True, log_level=2):
+        # Pre-compute all PackedSeqParams for all bins ONCE to avoid repeated
+        # tensor allocations that cause CUDA memory fragmentation and periodic spikes
+        # Create a temporary packing context to pass to create_packed_seq_params
+        cached_packed_seq_params = [
+            create_packed_seq_params_for_bin(
+                    packing_info=packing_info,
+                    bin_idx=bin_idx,
+                    bin_size=bin_size,
+                    device=packed_trajs.device,
+                ) for bin_idx in range(len(packed_trajs))
+        ]
 
     # Create the final PackingContext
     packing_context = PackingContext(
