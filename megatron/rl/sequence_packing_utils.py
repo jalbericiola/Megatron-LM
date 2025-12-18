@@ -157,8 +157,8 @@ def log_packing_efficiency(packing_context: PackingContext):
     total_capacity = packed_trajs.shape[0] * packed_trajs.shape[1]
     packing_efficiency = my_tokens / total_capacity if total_capacity > 0 else 0
     avg_seq_length = total_tokens / len(packing_info.seq_lengths)
-    rank = mpu.get_expert_data_parallel_rank()
-    expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+    rank = mpu.get_data_parallel_rank()
+    data_parallel_world_size = mpu.get_data_parallel_world_size()
 
     log_single_rank(logger, logging.INFO, f"[Sequence Packing] Statistics:")
     log_single_rank(
@@ -801,10 +801,10 @@ def distribute_packed_bins(
     packing_info: PackingInfo,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
     """Distribute packed bins across the data parallel ranks."""
-    nvtx_range = get_nvtx_range()
-    rank = mpu.get_expert_data_parallel_rank()
-    world_size = mpu.get_expert_data_parallel_world_size()
+    rank = mpu.get_data_parallel_rank()
+    world_size = mpu.get_data_parallel_world_size()
     tokenizer = get_tokenizer()
+    nvtx_range = get_nvtx_range()
 
     # Distribute packed bins across data parallel ranks
     num_bins, bin_size = packed_trajs.shape
@@ -969,25 +969,25 @@ def distribute_packed_bins(
 
 def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
     tokenizer = get_tokenizer()
-    expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+    data_parallel_world_size = mpu.get_data_parallel_world_size()
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("rl/sequence-packing/regather", log_level=1):
         # Regather trajectories from all ranks for packing
         with nvtx_range("rl/sequence-packing/allgather/trajs", log_level=2):
             trajs = trajs.cuda()
-            trajs_list = [torch.empty_like(trajs) for _ in range(expert_data_parallel_world_size)]
+            trajs_list = [torch.empty_like(trajs) for _ in range(data_parallel_world_size)]
             torch.distributed.all_gather(
-                trajs_list, trajs, group=mpu.get_expert_data_parallel_group()
+                trajs_list, trajs, group=mpu.get_data_parallel_group()
             )
             trajs = torch.cat(trajs_list, dim=0)
 
         # Gather all generation masks
         with nvtx_range("rl/sequence-packing/allgather/masks", log_level=2):
             generation_masks = generation_masks.cuda()
-            masks_list = [torch.empty_like(generation_masks) for _ in range(expert_data_parallel_world_size)]
+            masks_list = [torch.empty_like(generation_masks) for _ in range(data_parallel_world_size)]
             torch.distributed.all_gather(
-                masks_list, generation_masks, group=mpu.get_expert_data_parallel_group()
+                masks_list, generation_masks, group=mpu.get_data_parallel_group()
             )
             generation_masks = torch.cat(masks_list, dim=0)
 
@@ -995,9 +995,9 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         if inference_logprobs is not None:
             with nvtx_range("rl/sequence-packing/allgather/logprobs", log_level=2):
                 inference_logprobs = inference_logprobs.cuda()
-                logprobs_list = [torch.empty_like(inference_logprobs) for _ in range(expert_data_parallel_world_size)]
+                logprobs_list = [torch.empty_like(inference_logprobs) for _ in range(data_parallel_world_size)]
                 torch.distributed.all_gather(
-                    logprobs_list, inference_logprobs, group=mpu.get_expert_data_parallel_group()
+                    logprobs_list, inference_logprobs, group=mpu.get_data_parallel_group()
                 )
                 inference_logprobs = torch.cat(logprobs_list, dim=0)
 
