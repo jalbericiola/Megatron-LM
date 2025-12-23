@@ -143,6 +143,7 @@ def get_dynamic_inference_engine(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=inference_tp_size,
         materialize_only_last_token_logits=True,
@@ -158,7 +159,7 @@ def get_dynamic_inference_engine(
         metrics_writer=metrics_writer,
     )
 
-    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
+    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context, pg_collection=pg_collection)
 
     inference_wrapped_model.model_is_pipeline_parallel = not (
         is_pp_first_stage(pg_collection.pp) and is_pp_last_stage(pg_collection.pp)
@@ -199,6 +200,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         assert self._client is not None, "Client is not initialized"
 
         tokenizer = get_tokenizer()
+        args = get_args()
 
         sampling_params = SamplingParams(
             num_tokens_to_generate=None,
@@ -209,7 +211,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             termination_id=self._inference_engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs=True,
-            add_BOS=tokenizer.bos is not None,
+            add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
         )
         requests = [
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)

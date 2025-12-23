@@ -4,6 +4,7 @@ import gc
 
 # Keep this to make the env registered.
 import itertools
+import json
 import logging
 import math
 import pickle
@@ -256,7 +257,7 @@ def align_unpacked_inference_logprobs(
     return padded_inference_logprobs
 
 
-def get_agent(args):
+def get_agent(args, parallel_generation_tasks: int | None = None):
     """Get an agent based on environment configuration.
 
     If args.langrl_env_config is provided, uses weighted environment selection.
@@ -265,7 +266,10 @@ def get_agent(args):
     with open(args.langrl_env_config, 'r') as f:
         config = yaml.safe_load(f)
 
-    return WeightedMultiTask.from_config(config)
+    return WeightedMultiTask.from_config(
+        config,
+        parallel_generation_tasks=parallel_generation_tasks,
+    )
 
 
 _INFERENCE_INTERFACE = None
@@ -317,20 +321,14 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     nvtx_range = get_nvtx_range()
     if not args.rl_partial_rollouts or _ROLLOUT_GENERATOR is None:
         with nvtx_range("rl_timing/rollout-collection/create-agent", log_level=2):
-            agent = get_agent(args)
+            agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         # Collect Rollouts
-        with nvtx_range("rl_timing/rollout-collection/create-request", log_level=2):
+        with nvtx_range("rl_timing/rollout-collection/create-request", log_level=2  ):
             request = GroupedRolloutRequest(
                 num_groups=-1 if args.rl_partial_rollouts else n_prompts,
                 rollouts_per_group=samples_per_group,
                 inference_interface=inference_interface,
-                generation_args={
-                    'temperature': args.grpo_default_temperature,
-                    'max_tokens': args.inference_max_seq_length,
-                    'top_p': args.grpo_default_top_p,
-                },
-                filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
-            )
+                generation_tasks=args.rl_parallel_generation_tasks)
             _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR
 
@@ -831,9 +829,14 @@ def prepare_trajectories(
         inference_logprobs = None
 
     # Some sanity checks regarding the tokenization
-    assert (
-        tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
-    ), "First token should be bos"
+    if not args.rl_skip_bos_token:
+        assert (
+            tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
+        ), "First token should be bos"
+    else:
+        assert (
+            tokenizer.bos is None or (trajs[:, 0] != tokenizer.bos).all()
+        ), "First token should not be bos"  
     assert (
         tokenizer.bos is None or (trajs[:, 1] != tokenizer.bos).all()
     ), "Second token should not be bos"
@@ -1323,18 +1326,14 @@ def evaluate_and_print_results_rl(
             with nvtx_range('rl-eval-generate', log_level=1):
                 if rank == 0:
                     logger.info(f"Collecting evaluation results...")
+                
                     agent = get_agent(args)
                     request = EvaluationRequest(
                         inference_interface=inference_interface,
                         num_prompts=args.rl_prompts_per_eval,
                         validation=True,
                         rank_info=None,
-                        generation_args={
-                            'temperature': args.grpo_default_temperature,
-                            'max_tokens': args.seq_length,
-                            'top_p': args.grpo_default_top_p,
-                        },
-                    )
+                        generation_tasks=args.rl_parallel_generation_tasks)
                     evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))
                     if not isinstance(evaluation_responses, list):
                         evaluation_responses = [evaluation_responses]

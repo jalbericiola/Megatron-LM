@@ -875,7 +875,6 @@ def validate_args(args, defaults={}):
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
     if args.moe_grouped_gemm:
-        assert args.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
@@ -1051,8 +1050,6 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
-        assert not args.fp16, \
-            "Expert parallelism is not supported with fp16 training."
 
     # MoE router check
     if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
@@ -1568,7 +1565,7 @@ def _add_inference_args(parser):
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
-                       type=int, default=1, choices=[0, 1],
+                       type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
                        'inference context. The levels are: 0) no unified memory, '
                        '1) allocate `memory_buffer` in unified memory. '
@@ -2046,6 +2043,8 @@ def _add_rl_args(parser):
                        help="Default temperature for model inference.")
     group.add_argument('--grpo-default-top-p', type=float, default=0,
                        help="Default top-p for model inference.")
+    group.add_argument('--grpo-default-top-k', type=int, default=-1,
+                       help="Default top-k for model inference.")
     group.add_argument('--langrl-inference-server-type', type=str,
                        choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
                        help="Type of inference server to use.")
@@ -2079,6 +2078,7 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+<<<<<<< HEAD
     # SOL (Speed of Light) estimation arguments
     group.add_argument('--rl-enable-sol-tracking', action='store_true', default=False,
                        help='Enable Speed of Light (SOL) performance tracking. '
@@ -2096,6 +2096,12 @@ def _add_rl_args(parser):
                        help='Enable SOL tracking of CUDA graph captures and replays. '
                             'Tracks graph.capture_begin/end, graph.replay() with timing. '
                             'Essential for accurate estimation when using CUDA graphs for inference.')
+=======
+    group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
+                        help='Number of parallel generation tasks for RL inference.')
+    group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                        help='Skip BOS token at the beginning of the sequences. Default is False.')
+>>>>>>> jbarker/rl_nanov3_support
     return parser
 
 def _add_training_args(parser):
@@ -2920,6 +2926,12 @@ def _add_data_args(parser):
                        'we pass in a file path from which we read those arguments. '
                        'This is useful when the list of data is too big. Format is a '
                        'json file with `train`, `valid, `test` keys')
+    group.add_argument('--per-dataset-sequences-path', default=None,
+                       help='Path to a json file with the sequences per dataset. Check the tools/build_sequences_per_dataset.py script to build this file.')
+    group.add_argument('--dataloader-fast-cache-load', action='store_true',
+                       help='Option to use the fast cache loading path when building the datasets. Requires all the dataset caches to be built and stored in --data-cache-path.')
+    group.add_argument('--dataloader-defer-npy-index-mmap', action='store_true',
+                       help='Defer the mmap of the dataset indexes (.npy files) until the first access. Requires all the dataset caches to be built and stored in --data-cache-path.')
     group.add_argument('--data-cache-path', default=None,
                        help='Path to a directory to hold cached index files.')
     group.add_argument('--no-mmap-bin-files', action='store_false',
