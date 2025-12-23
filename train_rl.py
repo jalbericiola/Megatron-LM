@@ -20,6 +20,7 @@ from megatron.rl.rl_utils import (
     get_logprobs,
     get_rl_runtime_state,
     load_packed_data_by_index,
+    sol_nvtx_range,
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
@@ -267,9 +268,10 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
-        logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
-        )
+        with sol_nvtx_range("rl/train/forward", log_level=2):
+            logprobs_or_hidden_states = get_logprobs(
+                model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
+            )
 
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states
@@ -283,22 +285,23 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         else:
             # Calculate loss using unified function
             current_logprobs = logprobs_or_hidden_states
-            loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
-                calculate_grpo_loss(
-                    current_logprobs=current_logprobs,
-                    old_logprobs=old_logprobs,
-                    ref_logprobs=ref_logprobs,
-                    advantages=advantages,
-                    clamp_eps_lower=args.grpo_clamp_eps_lower,
-                    clamp_eps_upper=args.grpo_clamp_eps_upper,
-                    kl_beta=args.grpo_kl_beta,
-                    entropy_weight=args.grpo_entropy_term_weight,
-                    inference_logprobs=inference_logprobs,
-                    is_truncation_coef=args.rl_importance_sampling_truncation_coef,
-                    seq_starts=seq_starts,
-                    seq_lengths=seq_lengths,
+            with sol_nvtx_range("rl/train/grpo-loss", log_level=2):
+                loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+                    calculate_grpo_loss(
+                        current_logprobs=current_logprobs,
+                        old_logprobs=old_logprobs,
+                        ref_logprobs=ref_logprobs,
+                        advantages=advantages,
+                        clamp_eps_lower=args.grpo_clamp_eps_lower,
+                        clamp_eps_upper=args.grpo_clamp_eps_upper,
+                        kl_beta=args.grpo_kl_beta,
+                        entropy_weight=args.grpo_entropy_term_weight,
+                        inference_logprobs=inference_logprobs,
+                        is_truncation_coef=args.rl_importance_sampling_truncation_coef,
+                        seq_starts=seq_starts,
+                        seq_lengths=seq_lengths,
+                    )
                 )
-            )
             output_tensor = loss
 
     # loss_mask will not be applied to 0th token as we do not have a logprob for it.

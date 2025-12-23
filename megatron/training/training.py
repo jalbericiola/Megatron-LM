@@ -1371,6 +1371,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
+        # SOL tracking: wrap forward_backward to capture ops
+        sol_context = None
+        if has_rl_utils and getattr(args, 'rl_enable_sol_tracking', False):
+            try:
+                from megatron.rl.sol_integration import get_sol_tracker
+                tracker = get_sol_tracker()
+                if tracker and tracker.initialized:
+                    sol_context = tracker.phase("rl_timing/train-step/forward-backward")
+                    sol_context.__enter__()
+            except Exception:
+                pass
+        
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -1382,6 +1394,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+        
+        if sol_context is not None:
+            try:
+                sol_context.__exit__(None, None, None)
+            except Exception:
+                pass
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
@@ -1398,6 +1416,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    
+    # SOL tracking: wrap optimizer step  
+    opt_sol_context = None
+    if has_rl_utils and getattr(args, 'rl_enable_sol_tracking', False):
+        try:
+            from megatron.rl.sol_integration import get_sol_tracker
+            tracker = get_sol_tracker()
+            if tracker and tracker.initialized:
+                opt_sol_context = tracker.phase("rl_timing/train-step/optimizer")
+                opt_sol_context.__enter__()
+        except Exception:
+            pass
+    
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -1405,6 +1436,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     log_max_attention_logit = 0
     if args.qk_clip or args.log_max_attention_logit:
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+    
+    if opt_sol_context is not None:
+        try:
+            opt_sol_context.__exit__(None, None, None)
+        except Exception:
+            pass
             
     timers('optimizer').stop()
 
@@ -1562,112 +1599,113 @@ def training_log(
             'forward-backward-send-forward-backward-recv',
         ])
     # Add timers from RL loop if needed.
+    # RL timers use "rl_timing/" prefix to group them in a separate WandB panel
     if getattr(args, 'perform_rl_step', False):
         # Level 1 RL timers - high-level phases
         if args.timing_log_level >= 1:
             timers_to_log.extend([
                 # Rollout collection phase
-                'rl/rollout-collection',
-                'rl/rollout-collection/generate',
-                'rl/rollout-collection/sync',
+                'rl_timing/rollout-collection',
+                'rl_timing/rollout-collection/generate',
+                'rl_timing/rollout-collection/sync',
                 # Inference mode transitions
-                'rl/inference-mode/setup',
-                'rl/inference-mode/suspend',
-                'rl/inference-mode/resume',
-                'rl/inference-mode/offload-optimizer',
-                'rl/inference-mode/onload-optimizer',
-                'rl/inference-mode/offload-kv-cache',
-                'rl/inference-mode/onload-kv-cache',
-                'rl/inference-mode/cuda-graphs-on',
-                'rl/inference-mode/cuda-graphs-off',
-                'rl/inference-mode/build-cuda-graphs',
-                'rl/inference-mode/wait-decode-only',
-                'rl/inference-mode/get-interface',
+                'rl_timing/inference-mode/setup',
+                'rl_timing/inference-mode/suspend',
+                'rl_timing/inference-mode/resume',
+                'rl_timing/inference-mode/offload-optimizer',
+                'rl_timing/inference-mode/onload-optimizer',
+                'rl_timing/inference-mode/offload-kv-cache',
+                'rl_timing/inference-mode/onload-kv-cache',
+                'rl_timing/inference-mode/cuda-graphs-on',
+                'rl_timing/inference-mode/cuda-graphs-off',
+                'rl_timing/inference-mode/build-cuda-graphs',
+                'rl_timing/inference-mode/wait-decode-only',
+                'rl_timing/inference-mode/get-interface',
                 # Data preparation phase
-                'rl/prepare-data',
-                'rl/prepare-data/group-stats',
-                'rl/prepare-data/advantages',
-                'rl/prepare-data/trajectories',
-                'rl/prepare-data/dataloader',
+                'rl_timing/prepare-data',
+                'rl_timing/prepare-data/group-stats',
+                'rl_timing/prepare-data/advantages',
+                'rl_timing/prepare-data/trajectories',
+                'rl_timing/prepare-data/dataloader',
                 # Sequence packing
-                'rl/sequence-packing',
-                'rl/sequence-packing/pack-sequences',
-                'rl/sequence-packing/regather',
+                'rl_timing/sequence-packing',
+                'rl_timing/sequence-packing/pack-sequences',
+                'rl_timing/sequence-packing/regather',
                 # Logprobs computation
-                'rl/compute-logprobs',
-                'rl/compute-logprobs/old',
-                'rl/compute-logprobs/old/from-inference',
-                'rl/compute-logprobs/ref',
+                'rl_timing/compute-logprobs',
+                'rl_timing/compute-logprobs/old',
+                'rl_timing/compute-logprobs/old/from-inference',
+                'rl_timing/compute-logprobs/ref',
                 # Post-logprobs processing
-                'rl/pack-logprobs',
-                'rl/align-logprobs',
-                'rl/log-metrics',
+                'rl_timing/pack-logprobs',
+                'rl_timing/align-logprobs',
+                'rl_timing/log-metrics',
             ])
         # Level 2 RL timers - finer-grained operations
         if args.timing_log_level >= 2:
             timers_to_log.extend([
                 # Inference interface
-                'rl/inference-mode/get-interface/launch',
-                'rl/rollout-collection/create-agent',
-                'rl/rollout-collection/create-request',
+                'rl_timing/inference-mode/get-interface/launch',
+                'rl_timing/rollout-collection/create-agent',
+                'rl_timing/rollout-collection/create-request',
                 # Data preparation
-                'rl/prepare-data/split-dp',
-                'rl/prepare-data/trajectories/loop',
-                'rl/prepare-data/trajectories/to-tensor',
+                'rl_timing/prepare-data/split-dp',
+                'rl_timing/prepare-data/trajectories/loop',
+                'rl_timing/prepare-data/trajectories/to-tensor',
                 # Logprobs computation details
-                'rl/compute-logprobs/get-logprobs',
-                'rl/compute-logprobs/get-logprobs/forward',
-                'rl/compute-logprobs/get-logprobs/log-softmax',
-                'rl/compute-logprobs/batch/loop',
-                'rl/compute-logprobs/batch/concat',
-                'rl/compute-logprobs/batch/broadcast',
-                'rl/compute-logprobs/batch/to-cpu',
+                'rl_timing/compute-logprobs/get-logprobs',
+                'rl_timing/compute-logprobs/get-logprobs/forward',
+                'rl_timing/compute-logprobs/get-logprobs/log-softmax',
+                'rl_timing/compute-logprobs/batch/loop',
+                'rl_timing/compute-logprobs/batch/concat',
+                'rl_timing/compute-logprobs/batch/broadcast',
+                'rl_timing/compute-logprobs/batch/to-cpu',
                 # Reference logprobs
-                'rl/compute-logprobs/ref/save-state',
-                'rl/compute-logprobs/ref/load-ref-state',
-                'rl/compute-logprobs/ref/forward',
-                'rl/compute-logprobs/ref/restore-state',
-                'rl/compute-logprobs/ref/gc',
+                'rl_timing/compute-logprobs/ref/save-state',
+                'rl_timing/compute-logprobs/ref/load-ref-state',
+                'rl_timing/compute-logprobs/ref/forward',
+                'rl_timing/compute-logprobs/ref/restore-state',
+                'rl_timing/compute-logprobs/ref/gc',
                 # Packing operations
-                'rl/sequence-packing/allgather/trajs',
-                'rl/sequence-packing/allgather/logprobs',
-                'rl/sequence-packing/allgather/masks',
-                'rl/sequence-packing/binpack',
-                'rl/sequence-packing/distribute',
-                'rl/sequence-packing/bin-advantages',
-                'rl/sequence-packing/create-seq-params',
-                'rl/pack-logprobs/to-cuda',
-                'rl/pack-logprobs/pack-inference',
-                'rl/pack-logprobs/compute-stats',
-                'rl/pack-logprobs/store-inference',
+                'rl_timing/sequence-packing/allgather/trajs',
+                'rl_timing/sequence-packing/allgather/logprobs',
+                'rl_timing/sequence-packing/allgather/masks',
+                'rl_timing/sequence-packing/binpack',
+                'rl_timing/sequence-packing/distribute',
+                'rl_timing/sequence-packing/bin-advantages',
+                'rl_timing/sequence-packing/create-seq-params',
+                'rl_timing/pack-logprobs/to-cuda',
+                'rl_timing/pack-logprobs/pack-inference',
+                'rl_timing/pack-logprobs/compute-stats',
+                'rl_timing/pack-logprobs/store-inference',
                 # Alignment
-                'rl/align-logprobs/total',
+                'rl_timing/align-logprobs/total',
                 # GRPO loss
-                'rl/grpo-loss',
+                'rl_timing/grpo-loss',
             ])
         # Level 3 RL timers - most detailed operations
         if args.timing_log_level >= 3:
             timers_to_log.extend([
                 # Logprobs batch details
-                'rl/compute-logprobs/batch/forward',
-                'rl/compute-logprobs/selective-log-softmax',
-                'rl/compute-logprobs/selective-log-softmax/fp32',
-                'rl/compute-logprobs/selective-log-softmax/bf16',
+                'rl_timing/compute-logprobs/batch/forward',
+                'rl_timing/compute-logprobs/selective-log-softmax',
+                'rl_timing/compute-logprobs/selective-log-softmax/fp32',
+                'rl_timing/compute-logprobs/selective-log-softmax/bf16',
                 # Alignment details
-                'rl/align-logprobs/clone',
-                'rl/align-logprobs/loop',
-                'rl/align-logprobs/mask',
-                'rl/align-logprobs/stats',
+                'rl_timing/align-logprobs/clone',
+                'rl_timing/align-logprobs/loop',
+                'rl_timing/align-logprobs/mask',
+                'rl_timing/align-logprobs/stats',
                 # GRPO loss details
-                'rl/grpo-loss/ratios',
-                'rl/grpo-loss/advantages',
-                'rl/grpo-loss/kl-entropy',
-                'rl/grpo-loss/is-weights',
-                'rl/grpo-loss/final',
+                'rl_timing/grpo-loss/ratios',
+                'rl_timing/grpo-loss/advantages',
+                'rl_timing/grpo-loss/kl-entropy',
+                'rl_timing/grpo-loss/is-weights',
+                'rl_timing/grpo-loss/final',
                 # Packing details
-                'rl/pack-logprobs/pack-inference/alloc',
-                'rl/pack-logprobs/pack-inference/mapping',
-                'rl/pack-logprobs/pack-inference/loop',
+                'rl_timing/pack-logprobs/pack-inference/alloc',
+                'rl_timing/pack-logprobs/pack-inference/mapping',
+                'rl_timing/pack-logprobs/pack-inference/loop',
             ])
 
     # Calculate batch size.
@@ -2532,6 +2570,11 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
         ft_integration.on_training_step_end()
+        
+        # SOL (Speed of Light) logging for training operations
+        if has_rl_utils and getattr(args, 'rl_enable_sol_tracking', False):
+            rl_utils.log_training_sol(iteration, clear=True)
+        
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,

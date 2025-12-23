@@ -1916,7 +1916,7 @@ def _add_logging_args(parser):
                        'number of floating-point operations) to progress.txt file in checkpoint '
                        'directory.')
     group.add_argument('--timing-log-level', type=int,
-                       default=0, choices=range(0,3),
+                       default=0, choices=range(0,4),
                        help='Granularity level to measure and report timing. '
                        '   0: report only iteration time and make sure timing '
                        '      does not introduce extra overhead.'
@@ -2079,6 +2079,23 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    # SOL (Speed of Light) estimation arguments
+    group.add_argument('--rl-enable-sol-tracking', action='store_true', default=False,
+                       help='Enable Speed of Light (SOL) performance tracking. '
+                            'Compares measured operation times with theoretical maximums '
+                            'based on hardware specifications.')
+    group.add_argument('--rl-sol-report-interval', type=int, default=100,
+                       help='Interval (in iterations) for printing detailed SOL reports.')
+    group.add_argument('--rl-enable-sol-comm-tracking', action='store_true', default=False,
+                       help='Enable SOL tracking of torch.distributed collective communication. '
+                            'Tracks all_reduce, all_gather, etc. with bandwidth-based estimates.')
+    group.add_argument('--rl-enable-sol-sync-tracking', action='store_true', default=False,
+                       help='Enable SOL tracking of CUDA synchronization overhead. '
+                            'Tracks torch.cuda.synchronize(), stream.synchronize(), etc.')
+    group.add_argument('--rl-enable-sol-graph-tracking', action='store_true', default=False,
+                       help='Enable SOL tracking of CUDA graph captures and replays. '
+                            'Tracks graph.capture_begin/end, graph.replay() with timing. '
+                            'Essential for accurate estimation when using CUDA graphs for inference.')
     return parser
 
 def _add_training_args(parser):
