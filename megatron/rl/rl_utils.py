@@ -1612,11 +1612,14 @@ def megatron_rl_inference_mode(
                 assert (
                     reset_cuda_graphs
                 ), "reset_cuda_graphs must be True when offloading kv cache during training"
+                context = inference_interface._inference_engine.context
                 logger.debug(
-                    f"[{dist.get_rank()}] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
+                    f"[{dist.get_rank()}] Restoring kv cache ({context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
+                context.memory_buffer = context.memory_buffer.cuda()
+                if context.is_hybrid_model:
+                    context.mamba_conv_states = context.mamba_conv_states.cuda()
+                    context.mamba_ssm_states = context.mamba_ssm_states.cuda()
             elif remove_kv_cache_during_training:
                 if inference_interface._inference_engine.context.memory_buffer is None:
                     inference_interface._inference_engine.context.build_memory_buffer()
@@ -1642,11 +1645,14 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("offload-kv-cache-after-inference"):
             if offload_kv_cache_during_training:
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
+                context = inference_interface._inference_engine.context
                 logger.debug(
-                    f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
+                    f"[{dist.get_rank()}] Offloading kv cache ({context.memory_buffer.numel() * context.memory_buffer.element_size() / 1024**3:.2f} GB) to CPU"
                 )
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
+                context.memory_buffer = context.memory_buffer.cpu()
+                if context.is_hybrid_model:
+                    context.mamba_conv_states = context.mamba_conv_states.cpu()
+                    context.mamba_ssm_states = context.mamba_ssm_states.cpu()
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
 
