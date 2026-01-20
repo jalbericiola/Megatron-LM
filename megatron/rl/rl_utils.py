@@ -84,6 +84,14 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 
+# SOL (Speed of Light) integration
+from megatron.rl.sol_integration import (
+    initialize_sol,
+    sol_nvtx_range,
+    log_training_sol,
+    clear_sol_captures,
+    is_sol_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1179,10 +1187,10 @@ def prepare_data_for_update(
                     dist.broadcast(logprobs, src=get_pp_last_rank(pp_group), group=pp_group)
                 return logprobs.cpu()
 
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+            with torch.no_grad(), sol_nvtx_range("rl/compute-old-logprobs", log_level=2):
                 old_logprobs = _compute_logprobs_batch()
 
-            with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
+            with torch.no_grad(), sol_nvtx_range("rl/compute-ref-logprobs", log_level=2):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
                 cur_st_dict = {
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
@@ -1322,6 +1330,9 @@ def setup_grpo_data_iterator(
     args = get_args()
     runtime_state = get_rl_runtime_state()
 
+
+    # Initialize SOL tracking if enabled
+    initialize_sol(model, args)
     if inference_model is not None:
         inference_pg_collection = unwrap_model(inference_model[0]).pg_collection
     else:
