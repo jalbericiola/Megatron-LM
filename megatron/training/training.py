@@ -1804,14 +1804,28 @@ def training_log(
         ])
     # Add timers from RL loop if needed.
     if getattr(args, 'perform_rl_step', False):
-        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
-                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
-                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
-                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
-                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
-                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
-                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
-                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
+        timers_to_log.extend([
+            # Core RL phases
+            'rl/rollout-collection', 'rl/inference-setup', 'rl/collect-rollouts',
+            'rl/sync-rollouts', 'rl/prepare-data-for-update',
+            # Data preparation
+            'rl/compute-group-stats', 'rl/prepare-advantages', 'rl/prepare-trajectories',
+            'rl/sequence-packing', 'rl/get-ltor-masks', 'rl/create-dataloader',
+            # Logprob computation  
+            'rl/compute-logprobs', 'rl/compute-old-logprobs', 'rl/compute-ref-logprobs',
+            'rl/pack-logprobs', 'rl/align-inference-logprobs',
+            'rl/get-logprobs', 'rl/forward-pass', 'rl/log-softmax',
+            # Training step
+            'rl/train/forward', 'rl/train/grpo-loss',
+            # Memory management
+            'rl/prefetch-weights-to-gpu', 'rl/prefetch-weights-to-cpu',
+            'rl/offload-optimizer-before-inference', 'rl/onload-optimizer-after-inference',
+            'rl/onload-kv-cache-before-inference', 'rl/offload-kv-cache-after-inference',
+            # CUDA graphs
+            'rl/wait-for-decode-only', 'rl/build-cuda-graphs', 'rl/suspend-engine',
+            # Logging
+            'rl/log-wandb-tb',
+        ])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
