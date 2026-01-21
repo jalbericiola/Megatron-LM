@@ -2707,6 +2707,11 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
         ft_integration.on_training_step_end()
+
+        # Log SOL metrics for RL training
+        if getattr(args, "perform_rl_step", False) and getattr(args, "rl_enable_sol_tracking", False):
+            from megatron.rl.sol_integration import log_training_sol
+            log_training_sol(iteration, tb_writer=tensorboard_writer, wandb_writer=wandb_writer, clear=True)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
