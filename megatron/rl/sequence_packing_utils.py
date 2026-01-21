@@ -1079,8 +1079,9 @@ def get_microbatch_dataloader(packing_context: PackingContext) -> Tuple[DataLoad
     num_bins_this_rank = len(packing_context.packed_trajs)
     dp_world_size = mpu.get_data_parallel_world_size()
 
-    # Ratio of collected sequences to the global batch size
-    pct_of_sequences_per_batch = len(packing_context.packing_info.seq_lengths) / args.global_batch_size
+    # Fraction of collected sequences to use per optimizer step
+    # (i.e., what fraction of local bins should we process per step)
+    pct_of_sequences_per_batch = args.global_batch_size / len(packing_context.packing_info.seq_lengths)
 
     # Ceiling division means we will reuse some bins
     # If we did floor we would leave some behind

@@ -2255,6 +2255,16 @@ def _add_rl_args(parser):
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
+
+    # SOL (Speed of Light) Estimator arguments
+    group.add_argument('--rl-enable-sol-tracking', action=argparse.BooleanOptionalAction, default=False,
+                       help='Enable SOL (Speed of Light) tracking for performance analysis. '
+                            'This tracks operation timings and computes theoretical efficiency.')
+    group.add_argument('--rl-sol-report-interval', type=int, default=100,
+                       help='Print SOL report every N iterations. Set to 0 to disable printing.')
+    group.add_argument('--rl-sol-track-backward', action=argparse.BooleanOptionalAction, default=True,
+                       help='Track backward pass operations in SOL analysis.')
+
     return parser
 
 def _add_training_args(parser):
