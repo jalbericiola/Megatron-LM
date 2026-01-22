@@ -7,10 +7,12 @@ import itertools
 import json
 import logging
 import math
+import os
 import pickle
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -92,6 +94,12 @@ from megatron.rl.sol_integration import (
     log_training_sol,
     clear_sol_captures,
     is_sol_enabled,
+)
+from megatron.rl.rl_profiling import (
+    initialize_rl_profiler,
+    log_iteration_profile,
+    shutdown_rl_profiler,
+    get_rl_profiler,
 )
 
 logger = logging.getLogger(__name__)
@@ -1890,6 +1898,9 @@ def rl_inference_interface_shutdown():
         _INFERENCE_INTERFACE = None
     else:
         logger.warning("No inference interface to shutdown. This should not happen.")
+    
+    # Also shutdown the profiler and export final data
+    shutdown_rl_profiler()
 
 
 def get_iteration_sequence_count(args):
@@ -1901,3 +1912,87 @@ def get_iteration_sequence_count(args):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
     return int(sequences_tensor.item())
+
+
+def initialize_rl_training_profiler(args, run_id: str = None):
+    """
+    Initialize the RL profiler for training.
+    
+    Should be called once at the start of RL training.
+    
+    Args:
+        args: Megatron args object
+        run_id: Optional unique identifier for this run
+    """
+    # Determine output directory
+    output_dir = None
+    if hasattr(args, 'save') and args.save:
+        output_dir = args.save + "/profiles"
+    elif lang_rl_log_dir:
+        output_dir = lang_rl_log_dir + "/profiles"
+    
+    # Generate run_id from job info if available
+    if run_id is None:
+        job_id = os.environ.get("SLURM_JOB_ID", "")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = f"{job_id}_{timestamp}" if job_id else timestamp
+    
+    # Check if profiling is enabled via args
+    enabled = getattr(args, 'rl_enable_profiling', True)
+    
+    profiler = initialize_rl_profiler(
+        output_dir=output_dir,
+        run_id=run_id,
+        enabled=enabled,
+        log_to_wandb=getattr(args, 'wandb_project', None) is not None,
+        log_to_tensorboard=getattr(args, 'tensorboard_dir', None) is not None,
+    )
+    
+    print_rank_0(f"[RLProfiler] Initialized with output_dir={output_dir}, run_id={run_id}")
+    return profiler
+
+
+def log_rl_iteration_profile(
+    iteration: int,
+    elapsed_time_ms: float,
+    throughput_tflops: float = None,
+    global_batch_size: int = None,
+):
+    """
+    Log profiling data for the current RL training iteration.
+    
+    Should be called after each iteration, typically after timers.log().
+    
+    Args:
+        iteration: Current training iteration
+        elapsed_time_ms: Total iteration time in milliseconds
+        throughput_tflops: TFLOPS throughput (optional)
+        global_batch_size: Global batch size (optional)
+    """
+    timers = get_timers()
+    wandb_writer = get_wandb_writer()
+    tb_writer = get_tensorboard_writer()
+    
+    # Get token throughput metrics
+    runtime_state = get_rl_runtime_state()
+    tokens_per_sec = None
+    tokens_per_sec_per_gpu = None
+    
+    if runtime_state.tokens_this_iteration > 0 and runtime_state.iteration_start_time:
+        elapsed_sec = runtime_state.get_iteration_elapsed_time()
+        if elapsed_sec > 0:
+            tokens_per_sec = runtime_state.tokens_this_iteration / elapsed_sec
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            tokens_per_sec_per_gpu = tokens_per_sec / world_size
+    
+    log_iteration_profile(
+        iteration=iteration,
+        timers=timers,
+        elapsed_time_ms=elapsed_time_ms,
+        throughput_tflops=throughput_tflops,
+        global_batch_size=global_batch_size,
+        tokens_per_sec=tokens_per_sec,
+        tokens_per_sec_per_gpu=tokens_per_sec_per_gpu,
+        wandb_writer=wandb_writer,
+        tb_writer=tb_writer,
+    )

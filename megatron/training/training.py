@@ -2056,6 +2056,15 @@ def training_log(
         # Log timers to stdout
         timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
 
+        # Log RL profiling data
+        if has_rl_utils and getattr(args, 'perform_rl_step', False):
+            rl_utils.log_rl_iteration_profile(
+                iteration=iteration,
+                elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
+                throughput_tflops=throughput if args.log_throughput else None,
+                global_batch_size=batch_size,
+            )
+
     return report_memory_flag
 
 
@@ -2447,6 +2456,10 @@ def train(
         model_module.train()
 
     model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+
+    # Initialize RL profiler for tracking timer data across iterations
+    if getattr(args, 'perform_rl_step', False):
+        rl_utils.initialize_rl_training_profiler(args)
 
     # Tracking loss.
     total_loss_dict = {}
