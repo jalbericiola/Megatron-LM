@@ -2273,6 +2273,8 @@ def _add_rl_args(parser):
                             'When enabled, SOL ranges will also appear in Megatron timing reports.')
     group.add_argument('--rl-sol-timer-log-level', type=int, default=1,
                        help='Log level for Megatron timers in SOL ranges (0=always, 1=default, 2=verbose).')
+    group.add_argument('--rl-log-token-throughput', action=argparse.BooleanOptionalAction, default=True,
+                       help='Log token throughput (tokens/sec) for RL training.')
 
     return parser
 

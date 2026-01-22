@@ -250,16 +250,74 @@ class RLRuntimeState:
         self.global_batches_per_collection = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        # Token throughput tracking (per collection)
+        self.tokens_this_iteration = 0
+        self.generation_tokens_this_iteration = 0  # Decode/rollout generation
+        self.inference_tokens_this_iteration = 0   # Logprob computation (no_grad)
+        self.training_tokens_this_iteration = 0    # Training forward pass
+        self.iteration_start_time = None
+        # Per-step tracking
+        self.tokens_this_step = 0
+        self.step_start_time = None
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
         self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
+        self.tokens_this_iteration = 0
+        self.generation_tokens_this_iteration = 0
+        self.inference_tokens_this_iteration = 0
+        self.training_tokens_this_iteration = 0
+        self.iteration_start_time = None
 
     def increment_sequences(self, count):
         """Increment the sequence counter."""
         self.sequences_this_iteration_on_rank += count
         self.latest_batch_num_sequences = count
+
+    def add_tokens(self, count: int, phase: str = "total"):
+        """Add tokens to the iteration counter.
+        
+        Args:
+            count: Number of tokens processed
+            phase: 'generation', 'inference', 'training', or 'total'
+        """
+        self.tokens_this_iteration += count
+        if phase == "generation":
+            self.generation_tokens_this_iteration += count
+        elif phase == "inference":
+            self.inference_tokens_this_iteration += count
+        elif phase == "training":
+            self.training_tokens_this_iteration += count
+
+    def start_iteration_timer(self):
+        """Start timing the iteration."""
+        import time
+        self.iteration_start_time = time.time()
+
+    def get_iteration_elapsed_time(self) -> float:
+        """Get elapsed time since iteration started (seconds)."""
+        import time
+        if self.iteration_start_time is None:
+            return 0.0
+        return time.time() - self.iteration_start_time
+
+    def start_step_timer(self):
+        """Start timing a single training step."""
+        import time
+        self.tokens_this_step = 0
+        self.step_start_time = time.time()
+
+    def get_step_elapsed_time(self) -> float:
+        """Get elapsed time since step started (seconds)."""
+        import time
+        if self.step_start_time is None:
+            return 0.0
+        return time.time() - self.step_start_time
+
+    def add_step_tokens(self, count: int):
+        """Add tokens to the step counter."""
+        self.tokens_this_step += count
 
 
 # Global runtime state instance
@@ -269,6 +327,115 @@ _rl_runtime_state = RLRuntimeState()
 def get_rl_runtime_state():
     """Get the global RL runtime state."""
     return _rl_runtime_state
+
+
+def compute_rl_token_throughput() -> dict:
+    """Compute token throughput metrics for the current RL iteration.
+    
+    Returns:
+        Dictionary with throughput metrics (tokens/sec, breakdown by phase)
+    """
+    runtime_state = get_rl_runtime_state()
+    
+    elapsed = runtime_state.get_iteration_elapsed_time()
+    if elapsed <= 0:
+        return {}
+    
+    # Get local token counts
+    total_tokens = runtime_state.tokens_this_iteration
+    generation_tokens = runtime_state.generation_tokens_this_iteration
+    inference_tokens = runtime_state.inference_tokens_this_iteration
+    training_tokens = runtime_state.training_tokens_this_iteration
+    
+    # Reduce across all ranks to get global counts
+    if dist.is_initialized():
+        device = torch.cuda.current_device()
+        token_tensor = torch.tensor(
+            [total_tokens, generation_tokens, inference_tokens, training_tokens],
+            device=device, dtype=torch.long
+        )
+        dist.all_reduce(token_tensor, op=dist.ReduceOp.SUM)
+        total_tokens = token_tensor[0].item()
+        generation_tokens = token_tensor[1].item()
+        inference_tokens = token_tensor[2].item()
+        training_tokens = token_tensor[3].item()
+    
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    
+    metrics = {
+        'rl/tokens_per_sec': total_tokens / elapsed,
+        'rl/tokens_per_sec_per_gpu': total_tokens / elapsed / world_size,
+        'rl/total_tokens': total_tokens,
+        'rl/elapsed_time_sec': elapsed,
+    }
+    
+    if generation_tokens > 0:
+        metrics['rl/generation_tokens_per_sec'] = generation_tokens / elapsed
+        metrics['rl/generation_tokens'] = generation_tokens
+    
+    if inference_tokens > 0:
+        metrics['rl/inference_tokens_per_sec'] = inference_tokens / elapsed
+        metrics['rl/inference_tokens'] = inference_tokens
+    
+    if training_tokens > 0:
+        metrics['rl/training_tokens_per_sec'] = training_tokens / elapsed
+        metrics['rl/training_tokens'] = training_tokens
+    
+    return metrics
+
+
+def log_rl_token_throughput(iteration: int, tb_writer=None, wandb_writer=None) -> dict:
+    """Log RL token throughput to TensorBoard/WandB and return metrics.
+    
+    Args:
+        iteration: Current training iteration
+        tb_writer: TensorBoard writer (optional)
+        wandb_writer: WandB writer (optional)
+        
+    Returns:
+        Dictionary of logged metrics
+    """
+    metrics = compute_rl_token_throughput()
+    if not metrics:
+        return {}
+    
+    # Log to TensorBoard
+    if tb_writer:
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                tb_writer.add_scalar(key, value, iteration)
+    
+    # Log to WandB
+    if wandb_writer:
+        wandb_writer.log(metrics, step=iteration)
+    
+    # Print summary
+    tps = metrics.get('rl/tokens_per_sec', 0)
+    tps_per_gpu = metrics.get('rl/tokens_per_sec_per_gpu', 0)
+    total = metrics.get('rl/total_tokens', 0)
+    elapsed = metrics.get('rl/elapsed_time_sec', 0)
+    
+    # Build breakdown string
+    breakdown_parts = []
+    if 'rl/generation_tokens' in metrics:
+        gen_tps = metrics.get('rl/generation_tokens_per_sec', 0)
+        breakdown_parts.append(f"gen={gen_tps/1000:.1f}k")
+    if 'rl/inference_tokens' in metrics:
+        inf_tps = metrics.get('rl/inference_tokens_per_sec', 0)
+        breakdown_parts.append(f"inf={inf_tps/1000:.1f}k")
+    if 'rl/training_tokens' in metrics:
+        train_tps = metrics.get('rl/training_tokens_per_sec', 0)
+        breakdown_parts.append(f"train={train_tps/1000:.1f}k")
+    breakdown = f" ({', '.join(breakdown_parts)})" if breakdown_parts else ""
+    
+    print_rank_0(
+        f"[RL Throughput] iter {iteration}: "
+        f"{tps/1000:.1f}k tok/s{breakdown}, "
+        f"{tps_per_gpu:.0f} tok/s/GPU, "
+        f"{total:,} tokens in {elapsed:.2f}s"
+    )
+    
+    return metrics
 
 
 def update_inference_logprobs_group_stats(
@@ -534,6 +701,13 @@ def get_environment_rollouts(
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
+        
+        # Count generated tokens for throughput tracking
+        runtime_state = get_rl_runtime_state()
+        for group in rollouts:
+            for rollout in group:
+                if rollout is not None and hasattr(rollout, 'trajectory'):
+                    runtime_state.add_tokens(len(rollout.trajectory), "generation")
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -639,6 +813,24 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     fp32_output=fp32_output,
                 )
             model.config.flash_decode = flash_decode
+            
+            # Track tokens processed for throughput measurement
+            runtime_state = get_rl_runtime_state()
+            # For sequence packing, use cu_seqlens to get actual token count (excluding padding)
+            if packed_seq_params is not None and hasattr(packed_seq_params, 'cu_seqlens_q') and packed_seq_params.cu_seqlens_q is not None:
+                # cu_seqlens_q[-1] gives total actual tokens in the packed batch
+                cu_seqlens = packed_seq_params.cu_seqlens_q
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.numel() > 0:
+                    num_tokens = int(cu_seqlens[-1].item())
+                else:
+                    num_tokens = tokens.numel()
+            else:
+                num_tokens = tokens.numel()
+            phase = "training" if not no_grad else "inference"
+            runtime_state.add_tokens(num_tokens, phase)
+            # Also track per-step tokens for training
+            if phase == "training":
+                runtime_state.add_step_tokens(num_tokens)
 
         pg_collection = get_attr_wrapped_model(model, "pg_collection")
         pp_group = pg_collection.pp
@@ -1347,6 +1539,7 @@ def setup_grpo_data_iterator(
     ):
         train_data_iterator = get_rollout_data_iterator(model,inference_model, optimizer, iteration, ref_state_dict)
         runtime_state.reset_iteration_counters(iteration)
+        runtime_state.start_iteration_timer()
     else:
         train_data_iterator = buffered_rollouts
 

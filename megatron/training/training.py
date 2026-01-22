@@ -1934,7 +1934,7 @@ def training_log(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
-            wandb_writer=wandb_writer,
+            wandb_writer=get_wandb_writer(),
             total_loss_dict=total_loss_dict,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
@@ -1956,7 +1956,7 @@ def training_log(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
-            wandb_writer=wandb_writer,
+            wandb_writer=get_wandb_writer(),
             total_loss_dict=total_loss_dict,
         )
     if iteration % args.log_interval == 0 or is_first_iteration:
@@ -2725,7 +2725,16 @@ def train(
         # Log SOL metrics for RL training
         if getattr(args, "perform_rl_step", False) and getattr(args, "rl_enable_sol_tracking", False):
             from megatron.rl.sol_integration import log_training_sol
-            log_training_sol(iteration, tb_writer=tensorboard_writer, wandb_writer=wandb_writer, clear=True)
+            log_training_sol(iteration, tb_writer=get_tensorboard_writer(), wandb_writer=get_wandb_writer(), clear=True)
+        
+        # Log RL token throughput
+        if getattr(args, "perform_rl_step", False) and getattr(args, "rl_log_token_throughput", True):
+            if iteration % args.log_interval == 0:
+                rl_utils.log_rl_token_throughput(
+                    iteration,
+                    tb_writer=get_tensorboard_writer(),
+                    wandb_writer=get_wandb_writer(),
+                )
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,

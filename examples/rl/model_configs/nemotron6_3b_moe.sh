@@ -69,7 +69,6 @@ MODEL_OPTIONS="\
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
   --inference-dynamic-batching-num-cuda-graphs 2 \
-  --decode-only-cuda-graphs \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
   --use-checkpoint-args \
