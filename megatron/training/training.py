@@ -2054,9 +2054,8 @@ def training_log(
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
             timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
         # Log timers to stdout
-        timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
 
-        # Log RL profiling data
+        # Log RL profiling data (before timers.log which resets timers)
         if has_rl_utils and getattr(args, 'perform_rl_step', False):
             rl_utils.log_rl_iteration_profile(
                 iteration=iteration,
@@ -2064,6 +2063,8 @@ def training_log(
                 throughput_tflops=throughput if args.log_throughput else None,
                 global_batch_size=batch_size,
             )
+
+        timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
 
     return report_memory_flag
 

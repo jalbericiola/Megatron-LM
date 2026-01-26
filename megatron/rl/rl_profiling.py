@@ -307,6 +307,11 @@ class RLProfiler:
         # Collect timer data (min, max across ranks)
         timer_data = self._collect_timer_data(timers)
         
+        # Warn if no timer data was collected (might indicate timing issue)
+        if not timer_data:
+            logger.warning(f"[RLProfiler] No timer data collected for iteration {iteration}. "
+                          "Timers may have been reset before profiling.")
+        
         # Compute load imbalance metrics
         load_imbalance = {}
         for name, (min_t, max_t) in timer_data.items():
