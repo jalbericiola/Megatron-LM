@@ -86,8 +86,8 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
-if HAVE_TORCH_MEMORY_SAVER:
+from megatron.core.inference.contexts import dynamic_context as _dynamic_context_module
+if _dynamic_context_module.HAVE_TORCH_MEMORY_SAVER:
     from torch_memory_saver import torch_memory_saver
 
 # SOL (Speed of Light) integration
@@ -1824,10 +1824,11 @@ def megatron_rl_inference_mode(
         inference_interface = get_inference_interface(args, loop, model)
 
         with sol_nvtx_range("rl/onload-kv-cache-before-inference"):
-            if offload_kv_cache_during_training:
+            if offload_kv_cache_during_training and _dynamic_context_module.HAVE_TORCH_MEMORY_SAVER:
                 # Restore the KV cache by re-binding physical pages to a consistent virtual address
                 torch_memory_saver.resume("kv_cache")
 
+                context = inference_interface._inference_engine.context
                 logger.debug(
                     f"[{dist.get_rank()}] Restoring kv cache ({context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
@@ -1859,7 +1860,7 @@ def megatron_rl_inference_mode(
             loop.run_until_complete(inference_interface.suspend())
 
         with sol_nvtx_range("rl/offload-kv-cache-after-inference"):
-            if offload_kv_cache_during_training:
+            if offload_kv_cache_during_training and _dynamic_context_module.HAVE_TORCH_MEMORY_SAVER:
                 context = inference_interface._inference_engine.context
                 logger.debug(
                     f"[{dist.get_rank()}] Offloading kv cache ({context.memory_buffer.numel() * context.memory_buffer.element_size() / 1024**3:.2f} GB) to CPU"

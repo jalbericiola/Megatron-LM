@@ -89,9 +89,9 @@ try:
 except ImportError:
     HAVE_PSUTIL = False
 
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+from megatron.core.inference.contexts import dynamic_context as _dynamic_context_module
 
-if HAVE_TORCH_MEMORY_SAVER:
+if _dynamic_context_module.HAVE_TORCH_MEMORY_SAVER:
     from torch_memory_saver import torch_memory_saver
 
 
@@ -342,7 +342,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
-        if HAVE_TORCH_MEMORY_SAVER:
+        if _dynamic_context_module.HAVE_TORCH_MEMORY_SAVER:
             torch_memory_saver.pause("kv_cache")
 
     @internal_api

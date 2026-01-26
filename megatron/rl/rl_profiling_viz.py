@@ -43,26 +43,30 @@ except ImportError:
 
 
 # Phase definitions for high-level breakdown
+# Note: These are mutually exclusive leaf timers to avoid double-counting
+# Phases marked with "(R0)" are rank-0 only operations - other ranks are idle/waiting
 PHASE_DEFINITIONS = {
-    "Rollout Generation": ["rl/collect-rollouts"],
+    "Rollout Gen (R0)": ["rl/collect-rollouts"],       # Rank-0 only: vLLM inference
+    "Engine Suspend (R0)": ["rl/suspend-engine"],      # Rank-0 only: shutting down vLLM engine
     "Optimizer Offload": ["rl/offload-optimizer-before-inference"],
     "Optimizer Onload": ["rl/onload-optimizer-after-inference"],
     "Old Logprobs": ["rl/compute-old-logprobs"],
     "Ref Logprobs": ["rl/compute-ref-logprobs"],
     "Training": ["forward-backward"],
-    "Sync/Wait": ["forward-backward", "rl/sync-rollouts"],
+    "Sync Rollouts": ["rl/sync-rollouts"],             # Broadcast rollouts from rank-0 to all ranks
     "Data Prep": ["rl/prepare-trajectories", "rl/compute-group-stats", "rl/get-ltor-masks"],
 }
 
 # Colors for phases (using a colorblind-friendly palette)
 PHASE_COLORS = {
-    "Rollout Generation": "#2ecc71",  # Green
+    "Rollout Gen (R0)": "#2ecc71",    # Green
+    "Engine Suspend (R0)": "#27ae60", # Dark Green (rank-0 related)
     "Optimizer Offload": "#e74c3c",   # Red
     "Optimizer Onload": "#c0392b",    # Dark Red
     "Old Logprobs": "#3498db",        # Blue
     "Ref Logprobs": "#2980b9",        # Dark Blue
     "Training": "#9b59b6",            # Purple
-    "Sync/Wait": "#f39c12",           # Orange
+    "Sync Rollouts": "#f39c12",       # Orange
     "Data Prep": "#1abc9c",           # Teal
     "Other": "#95a5a6",               # Gray
 }
@@ -400,6 +404,13 @@ def generate_html_report(
     tokens_per_sec = [p.get("tokens_per_sec", 0) for p in filtered_profiles if p.get("tokens_per_sec")]
     avg_tokens_per_sec = statistics.mean(tokens_per_sec) if tokens_per_sec else 0
     
+    tokens_per_sec_per_gpu = [p.get("tokens_per_sec_per_gpu", 0) for p in filtered_profiles if p.get("tokens_per_sec_per_gpu")]
+    avg_tokens_per_sec_per_gpu = statistics.mean(tokens_per_sec_per_gpu) if tokens_per_sec_per_gpu else 0
+    
+    # Get GPU count from profiles if available
+    global_batch_sizes = [p.get("global_batch_size", 0) for p in filtered_profiles if p.get("global_batch_size")]
+    avg_global_batch_size = statistics.mean(global_batch_sizes) if global_batch_sizes else 0
+    
     phase_totals = defaultdict(float)
     for p in filtered_profiles:
         phases = compute_phase_times(p)
@@ -584,12 +595,18 @@ def generate_html_report(
                     <td class="label">Analyzed:</td><td class="value">{analyzed_iterations}</td></tr>
                 <tr><td class="label">Avg Iteration Time:</td><td class="value">{avg_iteration_time/1000:.2f}s</td>
                     <td class="label">Min / Max:</td><td class="value">{min_iteration_time/1000:.2f}s / {max_iteration_time/1000:.2f}s</td></tr>
-                <tr><td class="label">Avg Throughput:</td><td class="value">{avg_throughput:.2f} TFLOPS</td>
-                    <td class="label">Tokens/sec:</td><td class="value">{avg_tokens_per_sec:.1f}</td></tr>
                 <tr><td class="label">Avg Training:</td><td class="value">{phase_avgs.get('Training', 0)/1000:.2f}s</td>
-                    <td class="label">Avg Rollout:</td><td class="value">{phase_avgs.get('Rollout Generation', 0)/1000:.2f}s</td></tr>
+                    <td class="label">Avg Rollout (R0):</td><td class="value">{phase_avgs.get('Rollout Gen (R0)', 0)/1000:.2f}s</td></tr>
             </table>
-            <p class="note">Statistics exclude first {warmup_iterations} warm-up iterations.</p>
+            
+            <h3 style="margin-top: 1.5rem; margin-bottom: 0.75rem; font-size: 1rem; color: #444;">Throughput Metrics</h3>
+            <table class="summary-table">
+                <tr><td class="label">System TFLOPS:</td><td class="value">{avg_throughput:.2f}</td>
+                    <td class="label" style="padding-left: 2rem;">Global Batch Size:</td><td class="value">{avg_global_batch_size:.0f}</td></tr>
+                <tr><td class="label">Tokens/sec (system):</td><td class="value">{avg_tokens_per_sec:.1f}</td>
+                    <td class="label" style="padding-left: 2rem;">Tokens/sec (per GPU):</td><td class="value">{avg_tokens_per_sec_per_gpu:.1f}</td></tr>
+            </table>
+            <p class="note">Statistics exclude first {warmup_iterations} warm-up iterations. System metrics are aggregated across all GPUs.</p>
         </div>
         
         <div class="section">
@@ -616,6 +633,7 @@ def generate_html_report(
             html += f'                <div class="legend-item"><div class="legend-color" style="background: {color};"></div>{phase}: {time/1000:.1f}s ({pct:.1f}%)</div>\n'
     
     html += """            </div>
+            <p class="note">(R0) = Rank-0 only operation. Other ranks are idle/waiting during this time.</p>
         </div>
         
         <div class="section">

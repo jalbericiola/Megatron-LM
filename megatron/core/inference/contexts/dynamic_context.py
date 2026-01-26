@@ -66,6 +66,24 @@ try:
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
+
+def _safe_torch_memory_saver_region(tag: str, enable_cpu_backup: bool):
+    """Wrapper that catches OSError from torch_memory_saver when CUDA library version mismatches."""
+    global HAVE_TORCH_MEMORY_SAVER
+    if not HAVE_TORCH_MEMORY_SAVER:
+        return nullcontext()
+    try:
+        return torch_memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
+    except OSError as e:
+        # This happens when torch_memory_saver is built for a different CUDA version
+        # e.g., built for CUDA 12 but running on CUDA 13
+        logging.warning(
+            f"torch_memory_saver failed to initialize (likely CUDA version mismatch): {e}. "
+            "Disabling KV cache offloading."
+        )
+        HAVE_TORCH_MEMORY_SAVER = False
+        return nullcontext()
+
 try:
     import wandb  # pylint: disable=unused-import
 
@@ -664,7 +682,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
             else:
                 ctx = (
-                    torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
+                    _safe_torch_memory_saver_region(tag="kv_cache", enable_cpu_backup=True)
                     if HAVE_TORCH_MEMORY_SAVER and self.offload_kv_cache
                     else nullcontext()
                 )
