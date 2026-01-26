@@ -86,6 +86,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+if HAVE_TORCH_MEMORY_SAVER:
+    from torch_memory_saver import torch_memory_saver
 
 # SOL (Speed of Light) integration
 from megatron.rl.sol_integration import (
@@ -1822,10 +1825,9 @@ def megatron_rl_inference_mode(
 
         with sol_nvtx_range("rl/onload-kv-cache-before-inference"):
             if offload_kv_cache_during_training:
-                assert (
-                    reset_cuda_graphs
-                ), "reset_cuda_graphs must be True when offloading kv cache during training"
-                context = inference_interface._inference_engine.context
+                # Restore the KV cache by re-binding physical pages to a consistent virtual address
+                torch_memory_saver.resume("kv_cache")
+
                 logger.debug(
                     f"[{dist.get_rank()}] Restoring kv cache ({context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
@@ -1862,10 +1864,8 @@ def megatron_rl_inference_mode(
                 logger.debug(
                     f"[{dist.get_rank()}] Offloading kv cache ({context.memory_buffer.numel() * context.memory_buffer.element_size() / 1024**3:.2f} GB) to CPU"
                 )
-                context.memory_buffer = context.memory_buffer.cpu()
-                if context.is_hybrid_model:
-                    context.mamba_conv_states = context.mamba_conv_states.cpu()
-                    context.mamba_ssm_states = context.mamba_ssm_states.cpu()
+                torch_memory_saver.pause("kv_cache")
+
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
 
