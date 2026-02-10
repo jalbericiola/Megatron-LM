@@ -146,6 +146,58 @@ TIMER_HIERARCHY = {
 
 
 @dataclass
+class MemoryMetrics:
+    """GPU memory metrics for a single point in time.
+    
+    Inspired by PyTorch's memory snapshot tool (torch.cuda.memory._snapshot()),
+    but tracking high-level metrics per iteration rather than individual allocations.
+    All sizes are in bytes unless otherwise noted.
+    """
+    # Current memory state
+    allocated_bytes: int = 0          # Memory occupied by tensors
+    reserved_bytes: int = 0           # Memory reserved by the caching allocator (>= allocated)
+    max_allocated_bytes: int = 0      # Peak allocated since last reset
+    max_reserved_bytes: int = 0       # Peak reserved since last reset
+    
+    # Allocation counts
+    num_alloc_retries: int = 0        # Times allocator retried after cudaMalloc failure
+    num_ooms: int = 0                 # Out-of-memory errors
+    num_allocations: int = 0          # Current number of active allocations
+    
+    # Fragmentation metrics (inspired by PyTorch's segsum() visualization)
+    inactive_split_bytes: int = 0     # Free memory in active segments (internal fragmentation)
+    
+    # Optional: per-phase memory snapshots (e.g., after rollout, after training)
+    phase_memory: Dict[str, int] = field(default_factory=dict)  # phase_name -> allocated_bytes
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to flat dictionary for JSON serialization."""
+        result = {
+            "memory_allocated_bytes": self.allocated_bytes,
+            "memory_reserved_bytes": self.reserved_bytes,
+            "memory_max_allocated_bytes": self.max_allocated_bytes,
+            "memory_max_reserved_bytes": self.max_reserved_bytes,
+            "memory_num_alloc_retries": self.num_alloc_retries,
+            "memory_num_ooms": self.num_ooms,
+            "memory_num_allocations": self.num_allocations,
+            "memory_inactive_split_bytes": self.inactive_split_bytes,
+            # Derived metrics (in MB for readability)
+            "memory_allocated_mb": self.allocated_bytes / (1024 * 1024),
+            "memory_reserved_mb": self.reserved_bytes / (1024 * 1024),
+            "memory_max_allocated_mb": self.max_allocated_bytes / (1024 * 1024),
+            "memory_fragmentation_pct": (
+                (self.inactive_split_bytes / self.reserved_bytes * 100)
+                if self.reserved_bytes > 0 else 0.0
+            ),
+        }
+        # Add per-phase memory
+        for phase, mem_bytes in self.phase_memory.items():
+            safe_phase = phase.replace("/", "_").replace("-", "_")
+            result[f"memory_phase_{safe_phase}_mb"] = mem_bytes / (1024 * 1024)
+        return result
+
+
+@dataclass
 class IterationProfile:
     """Profile data for a single iteration."""
     iteration: int
@@ -165,6 +217,9 @@ class IterationProfile:
     load_imbalance: Dict[str, float] = field(default_factory=dict)  # timer -> max/min ratio
     # Rank0 times (for detailed analysis - rank0 is typically the coordinator)
     rank0_timers: Dict[str, float] = field(default_factory=dict)  # timer_name -> rank0_ms
+    
+    # Memory metrics
+    memory: Optional[MemoryMetrics] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -196,6 +251,10 @@ class IterationProfile:
         for name, ratio in self.load_imbalance.items():
             safe_name = name.replace("/", "_").replace("-", "_")
             result[f"imbalance_{safe_name}"] = ratio
+        
+        # Add memory metrics
+        if self.memory is not None:
+            result.update(self.memory.to_dict())
             
         return result
 
@@ -232,6 +291,8 @@ class RLProfiler:
         log_to_wandb: bool = True,
         log_to_tensorboard: bool = True,
         timer_names: Optional[List[str]] = None,
+        track_memory: bool = True,
+        memory_snapshot_interval: int = 0,
     ):
         """
         Initialize the RL Profiler.
@@ -243,11 +304,18 @@ class RLProfiler:
             log_to_wandb: Whether to log timer metrics to WandB
             log_to_tensorboard: Whether to log timer metrics to TensorBoard
             timer_names: List of timer names to track. If None, uses RL_TIMER_NAMES
+            track_memory: Whether to collect GPU memory metrics per iteration
+            memory_snapshot_interval: If > 0, capture detailed PyTorch memory snapshots
+                every N iterations (saved as .pickle files viewable at pytorch.org/memory_viz).
+                0 disables snapshot capture.
         """
         self.enabled = enabled
         self.log_to_wandb = log_to_wandb
         self.log_to_tensorboard = log_to_tensorboard
         self.timer_names = timer_names or RL_TIMER_NAMES
+        self.track_memory = track_memory
+        self.memory_snapshot_interval = memory_snapshot_interval
+        self._recording_memory_history = False
         
         # Determine output directory
         if output_dir:
@@ -270,6 +338,7 @@ class RLProfiler:
         # Storage for iteration data
         self.iteration_profiles: List[IterationProfile] = []
         self._timer_history: Dict[str, List[float]] = defaultdict(list)  # For stats
+        self._memory_history: List[MemoryMetrics] = []  # For memory stats
         
         # File handles (lazy init)
         self._jsonl_file = None
@@ -296,6 +365,105 @@ class RLProfiler:
         logger.info(f"[RLProfiler] Writing profiles to {jsonl_path}")
         self._initialized = True
         
+    def _collect_memory_data(self, phase_memory: Optional[Dict[str, int]] = None) -> Optional[MemoryMetrics]:
+        """Collect GPU memory metrics from torch.cuda.memory_stats().
+        
+        Inspired by PyTorch's memory snapshot tool, this collects high-level
+        memory metrics that are useful for understanding memory usage patterns
+        across RL training iterations (rollout, offload/restore, training, etc.).
+        
+        Args:
+            phase_memory: Optional dict of phase_name -> allocated_bytes captured
+                at specific points during the iteration (e.g., after rollout, after training).
+                
+        Returns:
+            MemoryMetrics object, or None if CUDA is not available.
+        """
+        if not torch.cuda.is_available():
+            return None
+            
+        try:
+            stats = torch.cuda.memory_stats()
+        except RuntimeError:
+            return None
+        
+        return MemoryMetrics(
+            allocated_bytes=stats.get("allocated_bytes.all.current", 0),
+            reserved_bytes=stats.get("reserved_bytes.all.current", 0),
+            max_allocated_bytes=stats.get("allocated_bytes.all.peak", 0),
+            max_reserved_bytes=stats.get("reserved_bytes.all.peak", 0),
+            num_alloc_retries=stats.get("num_alloc_retries", 0),
+            num_ooms=stats.get("num_ooms", 0),
+            num_allocations=stats.get("allocation.all.current", 0),
+            inactive_split_bytes=stats.get("inactive_split_bytes.all.current", 0),
+            phase_memory=phase_memory or {},
+        )
+    
+    def _start_memory_recording(self):
+        """Start recording memory history for snapshot capture.
+        
+        NOTE: This adds overhead because it hooks every alloc/free to record
+        stack traces. Only enabled when memory_snapshot_interval > 0.
+        Called once, not per-iteration.
+        """
+        if self._recording_memory_history:
+            return
+        try:
+            torch.cuda.memory._record_memory_history(max_entries=100_000)
+            self._recording_memory_history = True
+            logger.info("[RLProfiler] Started recording memory history for snapshots "
+                        "(adds some overhead to allocations)")
+        except Exception as e:
+            logger.warning(f"[RLProfiler] Failed to start memory history recording: {e}")
+    
+    def _stop_memory_recording(self):
+        """Stop recording memory history."""
+        if not self._recording_memory_history:
+            return
+        try:
+            torch.cuda.memory._record_memory_history(enabled=None)
+            self._recording_memory_history = False
+        except Exception:
+            pass
+    
+    def capture_memory_snapshot(self, iteration: int, label: str = ""):
+        """Capture a detailed PyTorch memory snapshot for deep-dive analysis.
+        
+        The resulting .pickle file can be visualized at https://pytorch.org/memory_viz
+        by dragging and dropping the file, or using:
+            python torch/cuda/_memory_viz.py trace_plot snapshot.pickle -o snapshot.html
+        
+        NOTE: For snapshots to contain useful trace data, memory history recording
+        must be active (automatically managed when memory_snapshot_interval > 0).
+        This recording does add some overhead to every allocation/free.
+        
+        Args:
+            iteration: Current iteration number (used in filename).
+            label: Optional label to include in the filename.
+        """
+        if not torch.cuda.is_available():
+            return
+            
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank != 0:
+            return
+        
+        self._ensure_initialized()
+        
+        try:
+            snapshot_dir = self.output_dir / "memory_snapshots"
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            
+            label_str = f"_{label}" if label else ""
+            snapshot_path = snapshot_dir / f"snapshot_iter{iteration}{label_str}.pickle"
+            
+            torch.cuda.memory._dump_snapshot(str(snapshot_path))
+            
+            logger.info(f"[RLProfiler] Memory snapshot saved: {snapshot_path}")
+            logger.info(f"[RLProfiler]   View at: https://pytorch.org/memory_viz")
+        except Exception as e:
+            logger.warning(f"[RLProfiler] Failed to capture memory snapshot: {e}")
+    
     def log_iteration(
         self,
         iteration: int,
@@ -309,6 +477,7 @@ class RLProfiler:
         actual_tokens_per_sec_per_gpu: Optional[float] = None,
         packing_efficiency: Optional[float] = None,
         extra_metrics: Optional[Dict[str, float]] = None,
+        phase_memory: Optional[Dict[str, int]] = None,
         wandb_writer=None,
         tb_writer=None,
     ):
@@ -327,6 +496,9 @@ class RLProfiler:
             actual_tokens_per_sec_per_gpu: Actual token throughput per GPU
             packing_efficiency: Ratio of actual tokens to compute tokens
             extra_metrics: Additional metrics to log
+            phase_memory: Optional dict of phase_name -> allocated_bytes captured at 
+                specific points during the iteration. Keys should be descriptive names 
+                like "after_rollout", "after_offload", "after_training", etc.
             wandb_writer: WandB writer for metric logging
             tb_writer: TensorBoard writer for metric logging
         """
@@ -349,6 +521,11 @@ class RLProfiler:
             if min_t > 0:
                 load_imbalance[name] = max_t / min_t
         
+        # Collect memory metrics
+        memory_metrics = None
+        if self.track_memory:
+            memory_metrics = self._collect_memory_data(phase_memory)
+        
         # Create profile
         profile = IterationProfile(
             iteration=iteration,
@@ -364,6 +541,7 @@ class RLProfiler:
             packing_efficiency=packing_efficiency,
             load_imbalance=load_imbalance,
             rank0_timers=rank0_timers,
+            memory=memory_metrics,
         )
         
         self.iteration_profiles.append(profile)
@@ -372,11 +550,23 @@ class RLProfiler:
         for name, (_, max_t) in timer_data.items():
             self._timer_history[name].append(max_t)
         
+        # Track memory history
+        if memory_metrics is not None:
+            self._memory_history.append(memory_metrics)
+        
         # Write to JSONL (rank 0 only)
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0 and self._jsonl_file:
             self._jsonl_file.write(json.dumps(profile.to_dict()) + "\n")
             self._jsonl_file.flush()
+        
+        # Optionally capture detailed memory snapshot (opt-in, has overhead)
+        if self.memory_snapshot_interval > 0:
+            # Lazily start recording on first relevant iteration
+            if not self._recording_memory_history:
+                self._start_memory_recording()
+            if iteration % self.memory_snapshot_interval == 0:
+                self.capture_memory_snapshot(iteration)
         
         # Log to WandB/TensorBoard
         if self.log_to_wandb and wandb_writer:
@@ -434,7 +624,7 @@ class RLProfiler:
         iteration: int,
         extra_metrics: Optional[Dict[str, float]] = None,
     ):
-        """Log timer metrics to WandB."""
+        """Log timer and memory metrics to WandB."""
         metrics = {}
         
         # Log max times for each timer (most relevant for optimization)
@@ -450,6 +640,23 @@ class RLProfiler:
         phase_times = self._compute_phase_times(profile)
         for phase, time_ms in phase_times.items():
             metrics[f"profile/phase_{phase}_ms"] = time_ms
+        
+        # Log memory metrics
+        if profile.memory is not None:
+            mem = profile.memory
+            metrics["memory/allocated_mb"] = mem.allocated_bytes / (1024 * 1024)
+            metrics["memory/reserved_mb"] = mem.reserved_bytes / (1024 * 1024)
+            metrics["memory/max_allocated_mb"] = mem.max_allocated_bytes / (1024 * 1024)
+            metrics["memory/max_reserved_mb"] = mem.max_reserved_bytes / (1024 * 1024)
+            metrics["memory/num_alloc_retries"] = mem.num_alloc_retries
+            metrics["memory/num_ooms"] = mem.num_ooms
+            metrics["memory/fragmentation_pct"] = (
+                (mem.inactive_split_bytes / mem.reserved_bytes * 100)
+                if mem.reserved_bytes > 0 else 0.0
+            )
+            # Per-phase memory
+            for phase, mem_bytes in mem.phase_memory.items():
+                metrics[f"memory/phase_{phase}_mb"] = mem_bytes / (1024 * 1024)
             
         if extra_metrics:
             metrics.update(extra_metrics)
@@ -463,7 +670,7 @@ class RLProfiler:
         iteration: int,
         extra_metrics: Optional[Dict[str, float]] = None,
     ):
-        """Log timer metrics to TensorBoard."""
+        """Log timer and memory metrics to TensorBoard."""
         # Log max times for each timer
         for name, (min_t, max_t) in profile.timers.items():
             tb_writer.add_scalar(f"profile/{name}_max_ms", max_t, iteration)
@@ -472,6 +679,20 @@ class RLProfiler:
         phase_times = self._compute_phase_times(profile)
         for phase, time_ms in phase_times.items():
             tb_writer.add_scalar(f"profile/phase_{phase}_ms", time_ms, iteration)
+        
+        # Log memory metrics
+        if profile.memory is not None:
+            mem = profile.memory
+            tb_writer.add_scalar("memory/allocated_mb", mem.allocated_bytes / (1024 * 1024), iteration)
+            tb_writer.add_scalar("memory/reserved_mb", mem.reserved_bytes / (1024 * 1024), iteration)
+            tb_writer.add_scalar("memory/max_allocated_mb", mem.max_allocated_bytes / (1024 * 1024), iteration)
+            tb_writer.add_scalar("memory/max_reserved_mb", mem.max_reserved_bytes / (1024 * 1024), iteration)
+            tb_writer.add_scalar("memory/fragmentation_pct", (
+                (mem.inactive_split_bytes / mem.reserved_bytes * 100)
+                if mem.reserved_bytes > 0 else 0.0
+            ), iteration)
+            for phase, mem_bytes in mem.phase_memory.items():
+                tb_writer.add_scalar(f"memory/phase_{phase}_mb", mem_bytes / (1024 * 1024), iteration)
             
         if extra_metrics:
             for key, value in extra_metrics.items():
@@ -575,7 +796,7 @@ class RLProfiler:
         return str(csv_path)
         
     def print_summary(self):
-        """Print a summary of timer statistics to stdout."""
+        """Print a summary of timer and memory statistics to stdout."""
         if not self.enabled or not self._timer_history:
             return
             
@@ -602,11 +823,39 @@ class RLProfiler:
             p95 = sorted_values[int(n * 0.95)] if n >= 20 else sorted_values[-1]
             max_v = max(values)
             print(f"{name:<50} {mean:>7.1f}ms {p95:>7.1f}ms {max_v:>7.1f}ms")
+        
+        # Print memory summary if available
+        if self._memory_history:
+            print("-" * 80)
+            print("GPU MEMORY")
+            print("-" * 80)
+            alloc_values = [m.allocated_bytes / (1024**3) for m in self._memory_history]
+            reserved_values = [m.reserved_bytes / (1024**3) for m in self._memory_history]
+            peak_values = [m.max_allocated_bytes / (1024**3) for m in self._memory_history]
+            frag_values = [
+                (m.inactive_split_bytes / m.reserved_bytes * 100) if m.reserved_bytes > 0 else 0
+                for m in self._memory_history
+            ]
+            
+            print(f"  {'Allocated (GiB)':<35} Mean: {statistics.mean(alloc_values):>7.2f}  "
+                  f"Min: {min(alloc_values):>7.2f}  Max: {max(alloc_values):>7.2f}")
+            print(f"  {'Reserved (GiB)':<35} Mean: {statistics.mean(reserved_values):>7.2f}  "
+                  f"Min: {min(reserved_values):>7.2f}  Max: {max(reserved_values):>7.2f}")
+            print(f"  {'Peak Allocated (GiB)':<35} Mean: {statistics.mean(peak_values):>7.2f}  "
+                  f"Max: {max(peak_values):>7.2f}")
+            print(f"  {'Fragmentation (%)':<35} Mean: {statistics.mean(frag_values):>7.1f}  "
+                  f"Max: {max(frag_values):>7.1f}")
+            
+            total_ooms = sum(m.num_ooms for m in self._memory_history)
+            total_retries = sum(m.num_alloc_retries for m in self._memory_history)
+            if total_ooms > 0 or total_retries > 0:
+                print(f"  OOM Events: {total_ooms}  |  Alloc Retries: {total_retries}")
             
         print("=" * 80 + "\n")
         
     def close(self):
         """Close file handles and export final summary."""
+        self._stop_memory_recording()
         if self._jsonl_file:
             self._jsonl_file.close()
             self._jsonl_file = None
@@ -627,18 +876,30 @@ def initialize_rl_profiler(
     output_dir: Optional[str] = None,
     run_id: Optional[str] = None,
     enabled: bool = True,
+    track_memory: bool = True,
+    memory_snapshot_interval: int = 0,
     **kwargs,
 ) -> RLProfiler:
     """
     Initialize the global RL profiler.
     
     Should be called once at training start.
+    
+    Args:
+        output_dir: Directory to write profiling data.
+        run_id: Unique identifier for this run.
+        enabled: Whether profiling is enabled.
+        track_memory: Whether to collect GPU memory metrics per iteration.
+        memory_snapshot_interval: If > 0, capture detailed PyTorch memory snapshots
+            every N iterations. View snapshots at https://pytorch.org/memory_viz
     """
     global _RL_PROFILER
     _RL_PROFILER = RLProfiler(
         output_dir=output_dir,
         run_id=run_id,
         enabled=enabled,
+        track_memory=track_memory,
+        memory_snapshot_interval=memory_snapshot_interval,
         **kwargs,
     )
     return _RL_PROFILER
@@ -656,13 +917,14 @@ def log_iteration_profile(
     actual_tokens_per_sec_per_gpu: Optional[float] = None,
     packing_efficiency: Optional[float] = None,
     extra_metrics: Optional[Dict[str, float]] = None,
+    phase_memory: Optional[Dict[str, int]] = None,
     wandb_writer=None,
     tb_writer=None,
 ):
     """
     Convenience function to log iteration profile using global profiler.
     
-    This is the main entry point for logging timer data.
+    This is the main entry point for logging timer and memory data.
     
     Args:
         tokens_per_sec: Compute tokens/sec (includes padding in packed sequences)
@@ -670,6 +932,9 @@ def log_iteration_profile(
         actual_tokens_per_sec: Actual tokens/sec (real tokens, excludes padding)
         actual_tokens_per_sec_per_gpu: Actual tokens/sec per GPU
         packing_efficiency: Ratio of actual to compute tokens (0-1)
+        phase_memory: Optional dict of phase_name -> allocated_bytes for per-phase
+            memory tracking. Capture with torch.cuda.memory_allocated() at key points
+            during the iteration and pass here for visualization.
     """
     profiler = get_rl_profiler()
     if profiler:
@@ -685,9 +950,48 @@ def log_iteration_profile(
             actual_tokens_per_sec_per_gpu=actual_tokens_per_sec_per_gpu,
             packing_efficiency=packing_efficiency,
             extra_metrics=extra_metrics,
+            phase_memory=phase_memory,
             wandb_writer=wandb_writer,
             tb_writer=tb_writer,
         )
+
+
+def capture_phase_memory(phase_name: str):
+    """Capture current GPU memory allocation for a named phase.
+    
+    Call this at key points during the RL iteration to build a per-phase
+    memory profile. The captured data is stored in a thread-local dict
+    and automatically passed to log_iteration_profile.
+    
+    Example usage in RL code:
+        capture_phase_memory("after_rollout")
+        # ... offload optimizer ...
+        capture_phase_memory("after_offload")
+        # ... training ...
+        capture_phase_memory("after_training")
+    
+    Args:
+        phase_name: Descriptive name for the phase (e.g., "after_rollout").
+    """
+    profiler = get_rl_profiler()
+    if profiler and profiler.track_memory and torch.cuda.is_available():
+        if not hasattr(profiler, '_current_phase_memory'):
+            profiler._current_phase_memory = {}
+        profiler._current_phase_memory[phase_name] = torch.cuda.memory_allocated()
+
+
+def get_and_reset_phase_memory() -> Optional[Dict[str, int]]:
+    """Get accumulated phase memory captures and reset for next iteration.
+    
+    Returns:
+        Dict of phase_name -> allocated_bytes, or None if no data.
+    """
+    profiler = get_rl_profiler()
+    if profiler and hasattr(profiler, '_current_phase_memory') and profiler._current_phase_memory:
+        result = dict(profiler._current_phase_memory)
+        profiler._current_phase_memory = {}
+        return result
+    return None
 
 
 def shutdown_rl_profiler():

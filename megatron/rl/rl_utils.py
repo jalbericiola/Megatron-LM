@@ -62,6 +62,11 @@ from megatron.rl.agent.api import (
     Rollout,
     TokenRollout,
 )
+try:
+    from megatron.rl.rl_profiling import capture_phase_memory
+except ImportError:
+    def capture_phase_memory(phase_name: str):
+        pass
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference.megatron import MegatronChatLocal, MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
@@ -529,6 +534,7 @@ def get_environment_rollouts(
     args = get_args()
     nvtx_range = get_nvtx_range()
 
+    capture_phase_memory("before_offload")
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("rl/offload-optimizer-before-inference", time=True):
             if not args.rl_training_cuda_graphs:
@@ -539,6 +545,7 @@ def get_environment_rollouts(
                     "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
             with nvtx_range("rl/offload/optimizer-state", time=True):
                 optimizer.offload_to_cpu()
+        capture_phase_memory("after_offload")
              
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
@@ -614,12 +621,14 @@ def get_environment_rollouts(
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
 
+    capture_phase_memory("after_rollout")
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("rl/restore-optimizer-after-inference", time=True):
             with nvtx_range("rl/restore/grad-buffers", time=True):
                 model[0].restore_grad_buffers()
             with nvtx_range("rl/restore/optimizer-state", time=True):
                 optimizer.restore_from_cpu()
+        capture_phase_memory("after_restore")
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -1174,6 +1183,7 @@ def prepare_data_for_update(
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
     with nvtx_range("rl/prepare-data-for-update", time=True):
+        capture_phase_memory("before_data_prep")
         with nvtx_range("rl/compute-group-stats", time=True):
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
@@ -1259,6 +1269,7 @@ def prepare_data_for_update(
                 logprobs_batch_size = args.micro_batch_size
 
 
+        capture_phase_memory("after_trajectories")
         with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
@@ -1315,10 +1326,12 @@ def prepare_data_for_update(
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
 
+                capture_phase_memory("after_logprobs")
                 with nvtx_range("rl/synchronize-cuda-and-collect-garbage", time=True):
                     torch.cuda.synchronize()
                     gc.collect()
                     torch.cuda.empty_cache()
+                capture_phase_memory("after_gc_empty_cache")
 
 
         if sequence_packing:

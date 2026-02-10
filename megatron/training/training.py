@@ -70,6 +70,7 @@ try:
         log_iteration_profile,
         shutdown_rl_profiler,
         get_rl_profiler,
+        get_and_reset_phase_memory,
     )
     has_rl_profiling = True
 except ImportError:
@@ -1089,14 +1090,20 @@ def pretrain(
         if run_id is None:
             run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         
+        memory_snapshot_interval = getattr(args, 'rl_memory_snapshot_interval', 0)
         initialize_rl_profiler(
             output_dir=profile_dir,
             run_id=run_id,
             enabled=True,
             log_to_wandb=(wandb_writer is not None),
             log_to_tensorboard=(get_tensorboard_writer() is not None),
+            track_memory=True,
+            memory_snapshot_interval=memory_snapshot_interval,
         )
-        print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
+        print_rank_0(f'[RLProfiler] Profiling enabled (with memory tracking), output: {profile_dir}')
+        if memory_snapshot_interval > 0:
+            print_rank_0(f'[RLProfiler] Memory snapshots every {memory_snapshot_interval} iterations '
+                         f'(viewable at https://pytorch.org/memory_viz)')
 
     if not args.skip_train:
         print_rank_0('training ...')
@@ -2262,6 +2269,8 @@ def training_log(
         # Log RL profiling data if enabled (must be before timers.log which resets timers)
         # Note: tokens_per_sec, actual_tokens_per_sec, and packing_efficiency were computed earlier
         if has_rl_profiling and getattr(args, 'rl_profile', False):
+            # Collect any phase memory captures accumulated during this iteration
+            phase_memory = get_and_reset_phase_memory()
             log_iteration_profile(
                 iteration=iteration,
                 timers=timers,
@@ -2273,6 +2282,7 @@ def training_log(
                 actual_tokens_per_sec=actual_tokens_per_sec,
                 actual_tokens_per_sec_per_gpu=actual_tokens_per_sec_per_gpu,
                 packing_efficiency=packing_efficiency,
+                phase_memory=phase_memory,
                 wandb_writer=wandb_writer,
                 tb_writer=writer,
             )

@@ -1997,6 +1997,11 @@ def _add_rl_args(parser):
     group.add_argument('--rl-profile-dir', type=str, default=None,
                         help='Directory to write RL profiling data. If not set, defaults to '
                              '{save}/profiles or ./profiles if save is not set.')
+    group.add_argument('--rl-memory-snapshot-interval', type=int, default=0,
+                        help='If > 0, capture detailed PyTorch memory snapshots every N iterations '
+                             '(saved as .pickle files viewable at pytorch.org/memory_viz). '
+                             'WARNING: This enables memory history recording which adds overhead '
+                             'to every allocation/free. Default: 0 (disabled).')
     return parser
 
 def _add_training_args(parser):
