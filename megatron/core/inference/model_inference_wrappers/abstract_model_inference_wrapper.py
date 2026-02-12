@@ -134,13 +134,36 @@ class AbstractModelInferenceWrapper(abc.ABC):
         # we use num_dummy_tokens equal to tensor model parallel size
         # so that the dummy forward pass will work with sequence parallel
         num_dummy_tokens = self.tp_size
+        batch_size = 1
         tokens = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
+            (batch_size, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
         )
         position_ids = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
+            (batch_size, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
         )
         attention_mask = None
+
+        # Handle pipeline parallelism: non-first PP stages must receive hidden
+        # states from the previous stage, and non-last PP stages must send their
+        # output to the next stage. Without this, non-first stages receive None
+        # as hidden_states, causing crashes in layers like MambaLayer.
+        if not (is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)):
+            recv_buffer = None
+            if not is_pipeline_first_stage(self.pp_group):
+                recv_buffer = self._allocate_recv_buffer(batch_size, num_dummy_tokens)
+                recv_from_prev_pipeline_rank_(recv_buffer, self.pp_group)
+
+            set_input_tensor = get_attr_wrapped_model(self.model, "set_input_tensor")
+            set_input_tensor(recv_buffer)
+            output_tensor = self.model(tokens, position_ids, attention_mask)
+
+            if not is_pipeline_last_stage(self.pp_group):
+                send_to_next_pipeline_rank(
+                    output_tensor.type(dtype=self.pipeline_communication_dtype), self.pp_group
+                )
+
+            return output_tensor
+
         return self.model(tokens, position_ids, attention_mask)
 
     def _get_batch_size_and_seq_len(

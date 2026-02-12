@@ -1754,6 +1754,12 @@ def megatron_rl_inference_mode(
         # TODO: Improve this if statement once a change is made to CUDA graph handling.
         cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
         if cuda_graph_impl != "none" and not cuda_graph_exists:
+            # Reset context before rebuilding CUDA graphs to clear stale request state
+            # from the previous inference session. With unified_memory_level >= 1,
+            # suspend() does not reset the context, and resume() (which does reset)
+            # is called after this block. Without this reset, add_dummy_requests_parallel
+            # fails with RequestOverflowError because total_request_count is still > 0.
+            inference_interface._inference_engine.context.reset()
             with nvtx_range("wait-for-decode-only"):
                 while not inference_interface._inference_engine.context.is_decode_only():
                     active_requests, finished_requests, step_time = loop.run_until_complete(
@@ -1789,6 +1795,12 @@ def megatron_rl_inference_mode(
         # GPU memory during training.
         with nvtx_range("prefetch-inference-model-weights-to-cpu"):
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
+
+        # Release cached memory blocks back to CUDA before restoring optimizer.
+        # This reduces fragmentation from inference<->training memory layout transitions
+        # (e.g., dynamic batching buffers, KV cache blocks, CUDA graph side allocations).
+        with nvtx_range("empty-cache-after-inference"):
+            torch.cuda.empty_cache()
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):

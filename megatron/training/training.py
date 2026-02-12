@@ -3019,6 +3019,12 @@ def train(
                     swap_model_weights(model, inference_model, args.refit_method)
                     rl_eval_model = inference_model
                     rl_training_model = model
+                # Memory diagnostics: log GPU memory before/after eval to track
+                # fragmentation from the extra inference<->training transition.
+                if torch.distributed.get_rank() == 0:
+                    _alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                    _resv = torch.cuda.memory_reserved() / (1024 ** 3)
+                    print(f"[Rank 0] PRE-EVAL memory (GiB) | allocated: {_alloc:.2f} | reserved: {_resv:.2f}")
                 rl_utils.evaluate_and_print_results_rl(
                     valid_data_iterator,
                     rl_eval_model,
@@ -3027,6 +3033,14 @@ def train(
                     write_to_tensorboard=True,
                     training_model=rl_training_model,
                 )
+                if torch.distributed.get_rank() == 0:
+                    _alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                    _resv = torch.cuda.memory_reserved() / (1024 ** 3)
+                    print(f"[Rank 0] POST-EVAL memory (GiB) | allocated: {_alloc:.2f} | reserved: {_resv:.2f}")
+                    torch.cuda.empty_cache()
+                    _alloc_after = torch.cuda.memory_allocated() / (1024 ** 3)
+                    _resv_after = torch.cuda.memory_reserved() / (1024 ** 3)
+                    print(f"[Rank 0] POST-EVAL-CACHE-CLEAR memory (GiB) | allocated: {_alloc_after:.2f} | reserved: {_resv_after:.2f}")
             else:
                 evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
@@ -3042,6 +3056,10 @@ def train(
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
+            # Release fragmented CUDA memory after evaluation to reduce OOM risk
+            # on the subsequent training forward pass. Evaluation runs a full
+            # inference cycle that fragments the allocator's reserved pool.
+            torch.cuda.empty_cache()
             if should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 pre_hook_enabled = True
