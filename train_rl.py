@@ -276,9 +276,20 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
+        # torch.distributed.breakpoint()
+        saved_scope = model_to_use.config.cuda_graph_scope
+        saved_impl = args.cuda_graph_impl
+        model_to_use.config.cuda_graph_scope = []
+        args.cuda_graph_impl = None
+        from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+        _saved_cudagraph_created = _CudagraphGlobalRecord.cudagraph_created
+        _CudagraphGlobalRecord.cudagraph_created = False
         logprobs_or_hidden_states = get_logprobs(
             model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
         )
+        model_to_use.config.cuda_graph_scope = saved_scope
+        args.cuda_graph_impl = saved_impl
+        _CudagraphGlobalRecord.cudagraph_created = _saved_cudagraph_created
 
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states
