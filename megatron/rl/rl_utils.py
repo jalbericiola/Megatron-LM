@@ -23,7 +23,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from megatron.core import mpu
-from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
@@ -31,9 +30,11 @@ from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import (
+    disable_cuda_graphs,
     toggle_cuda_graphs,
     transition_moe_to_full_cudagraphs,
     transition_moe_to_partial_cudagraphs,
@@ -75,7 +76,6 @@ from megatron.training.global_vars import (
     get_tokenizer,
     get_wandb_writer,
 )
-from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import (
     get_ltor_masks_and_position_ids,
     get_nvtx_range,
@@ -519,8 +519,9 @@ def get_environment_rollouts(
                     "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
             optimizer.offload_to_cpu()
              
-    # If we have seperate training and inference models we to refit weights from the training model to the inference model.
-    if inference_model is not None:
+    # If we have separate training and inference models we to refit weights from the training model to the inference model.
+    has_separate_inference_model = inference_model is not None
+    if has_separate_inference_model:
         # If the separate inference model weights were prefetched to CPU while idle, bring them
         # back to GPU before refit/copy and before any CUDA-graph'd inference.
         with nvtx_range("prefetch-inference-model-weights-to-gpu"):
@@ -552,6 +553,7 @@ def get_environment_rollouts(
             False, # offload optimizer during rollout collection is handled above
             args.rl_offload_kv_cache_during_training,
             args.rl_remove_kv_cache_during_training,
+            training_model=model if has_separate_inference_model else None,
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -651,7 +653,7 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def get_logprobs(model, tokens, position_ids, no_grad=True, sequence_packing=False, packed_seq_params=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -692,7 +694,6 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
             fp32_output = not (args.fp16 or args.bf16)
-            no_grad = True
             with torch.no_grad() if no_grad else nullcontext():
                 logits_or_hidden_states = model(
                     tokens,
@@ -745,7 +746,7 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer, seq_len: int,
+    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int,
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -828,7 +829,7 @@ def compute_group_stats(
 def maybe_log_training_metrics(
     group_stats: RolloutStats,
     current_iteration: int,
-    tokenizer: MegatronLegacyTokenizer,
+    tokenizer: MegatronTokenizer,
     example_group: list[TokenRollout | Rollout],
     wandb_writer: wandb_run.Run | None = None,
     tb_writer: SummaryWriter | None = None,
@@ -910,7 +911,7 @@ def maybe_log_training_metrics(
 
 
 def prepare_trajectories(
-    rollouts: Rollouts, tokenizer: MegatronLegacyTokenizer, seq_length: int, sequence_packing: bool, skip_bos_token: bool
+    rollouts: Rollouts, tokenizer: MegatronTokenizer, seq_length: int, sequence_packing: bool, skip_bos_token: bool
 ):
     """Pad trajectories and extract the generation masks.
     Args:
@@ -929,8 +930,7 @@ def prepare_trajectories(
 
     DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>']
 
-
-    if isinstance(tokenizer, _HuggingFaceTokenizer):
+    if tokenizer.library == "huggingface":
         if not tokenizer.pad:
             for pad_token in DEFAULT_PAD_TOKENS:
                 if pad_token in tokenizer.vocab:
@@ -941,7 +941,7 @@ def prepare_trajectories(
                     break
             else:
                 raise ValueError("No pad token found in tokenizer vocabulary")
-    elif isinstance(tokenizer, CustomTikTokenizer):
+    elif tokenizer.library == "tiktoken":
         assert "<SPECIAL_233>" in tokenizer.vocab, "Pad token is NOT in the tokenizer"
         tokenizer._pad_id = tokenizer.vocab["<SPECIAL_233>"]
 
@@ -1067,7 +1067,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
     return logprobs
 
 
-def _compute_logprobs_batch(
+def compute_logprobs_batch(
     model,
     data_loader,
     forward_backward_func,
@@ -1079,6 +1079,7 @@ def _compute_logprobs_batch(
     dtype,
     pp_group,
     is_correction,
+    collect_non_loss_data=False,
 ):
     """Compute logprobs for all batches in the data loader."""
     logprobs_list = []
@@ -1094,6 +1095,7 @@ def _compute_logprobs_batch(
             decoder_seq_length=decoder_seq_length,
             forward_only=True,
             adjust_tensor_shapes_fn=None,
+            collect_non_loss_data=collect_non_loss_data,
         )
         if is_pp_last_stage(pp_group):
             logprobs_list.append(output_tensor[0].detach())
@@ -1119,7 +1121,7 @@ def prepare_data_for_update(
     model: list[LanguageModule],
     ref_state_dict: Dict[str, Any],
     rollouts: GroupedRollouts,
-    tokenizer: MegatronLegacyTokenizer,
+    tokenizer: MegatronTokenizer,
     sequence_packing: bool,
     is_correction: bool,
 ) -> RerunDataIterator:
@@ -1238,82 +1240,63 @@ def prepare_data_for_update(
 
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
+            # TODO(helenn): Re-enable cudagraphs for logprobs calculations.
 
-            # Disable CUDA graphs during logprobs so ALL layers run fully eager.
-            # Three things are needed:
-            #   1. cuda_graph_impl="none" — prevents create_cudagraphs() at end of
-            #      forward_backward_no_pipelining.
-            #   2. use_partial_cudagraphs=False — MoE layers fall through to
-            #      super()._forward_mlp() (eager).
-            #   3. cudagraph_created=False — prevents CudaGraphManagers on non-MoE
-            #      TransformerLayers from entering the replay path (their base
-            #      _should_call_local_cudagraph does NOT check cuda_graph_impl).
-            #      With cudagraph_created=False and model.eval(), they take the
-            #      eager fallback in CudaGraphManager.__call__.
-            if args.rl_training_cuda_graphs:
-                _logprobs_lang_module = (
-                    model.module.module
-                    if hasattr(model.module, "module")
-                    else model.module
-                )
-                transition_moe_to_full_cudagraphs(_logprobs_lang_module)
-                _saved_cuda_graph_impl = model.config.cuda_graph_impl
-                model.config.cuda_graph_impl = "none"
-                _saved_cudagraph_created = _CudagraphGlobalRecord.cudagraph_created
-                _CudagraphGlobalRecord.cudagraph_created = False
-
-            # Wrap forward_backward_func for Full iteration CUDA graph
-            forward_backward_func = get_forward_backward_func()
-            if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-                forward_backward_func = FullCudaGraphWrapper(
-                    forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
-                )
-
-
-            dtype = (
-                torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+            _logprobs_lang_module = (
+                (model.module.module if hasattr(model.module, "module") else model.module)
+                if args.rl_training_cuda_graphs else None
             )
+            with disable_cuda_graphs(model, lang_module=_logprobs_lang_module):
+                forward_backward_func = get_forward_backward_func()
+                if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+                    forward_backward_func = FullCudaGraphWrapper(
+                        forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
+                    )
 
-            pg_collection = get_attr_wrapped_model(model, "pg_collection")
-            pp_group = pg_collection.pp
-
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
-                old_logprobs = _compute_logprobs_batch(
-                    model=model,
-                    data_loader=data_loader,
-                    forward_backward_func=forward_backward_func,
-                    packing_context=packing_context,
-                    trajs_batch_size=len(compute_trajs),
-                    seq_length=args.seq_length,
-                    logprobs_batch_size=logprobs_batch_size,
-                    decoder_seq_length=args.decoder_seq_length,
-                    dtype=dtype,
-                    pp_group=pp_group,
-                    is_correction=args.rl_inference_logprobs_is_correction,
+                dtype = (
+                    torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
                 )
 
-            with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
-                # We need to load the ref model state dict and compute the logprobs for the ref model
-                cur_st_dict = {
-                    k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
-                }
-                model.load_state_dict(ref_state_dict)
-                ref_logprobs = _compute_logprobs_batch(
-                    model=model,
-                    data_loader=data_loader,
-                    forward_backward_func=forward_backward_func,
-                    packing_context=packing_context,
-                    trajs_batch_size=len(compute_trajs),
-                    seq_length=args.seq_length,
-                    logprobs_batch_size=logprobs_batch_size,
-                    decoder_seq_length=args.decoder_seq_length,
-                    dtype=dtype,
-                    pp_group=pp_group,
-                    is_correction=args.rl_inference_logprobs_is_correction,
-                )
+                pg_collection = get_attr_wrapped_model(model, "pg_collection")
+                pp_group = pg_collection.pp
 
-                # logprobs are [b, seq, h] now.
-                model.load_state_dict(cur_st_dict)
+                with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+                    old_logprobs = compute_logprobs_batch(
+                        model=model,
+                        data_loader=data_loader,
+                        forward_backward_func=forward_backward_func,
+                        packing_context=packing_context,
+                        trajs_batch_size=len(compute_trajs),
+                        seq_length=args.seq_length,
+                        logprobs_batch_size=logprobs_batch_size,
+                        decoder_seq_length=args.decoder_seq_length,
+                        dtype=dtype,
+                        pp_group=pp_group,
+                        is_correction=args.rl_inference_logprobs_is_correction,
+                    )
+
+                with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
+                    # We need to load the ref model state dict and compute the logprobs for the ref model
+                    cur_st_dict = {
+                        k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
+                    }
+                    model.load_state_dict(ref_state_dict)
+                    ref_logprobs = compute_logprobs_batch(
+                        model=model,
+                        data_loader=data_loader,
+                        forward_backward_func=forward_backward_func,
+                        packing_context=packing_context,
+                        trajs_batch_size=len(compute_trajs),
+                        seq_length=args.seq_length,
+                        logprobs_batch_size=logprobs_batch_size,
+                        decoder_seq_length=args.decoder_seq_length,
+                        dtype=dtype,
+                        pp_group=pp_group,
+                        is_correction=args.rl_inference_logprobs_is_correction,
+                    )
+
+                    # logprobs are [b, seq, h] now.
+                    model.load_state_dict(cur_st_dict)
 
             # Restore CUDA graph state for the upcoming training step.
             if args.rl_training_cuda_graphs:
@@ -1495,14 +1478,17 @@ def evaluate_and_print_results_rl(
     optimizer: MegatronOptimizer,
     iteration: int,
     write_to_tensorboard: bool = True,
+    training_model: Optional[list[LanguageModule]] = None,
 ):
     """Helper function to evaluate and dump results on screen.
 
     Args:
         data_iterator: Iterator over batches of evaluation dataset.
-        model: Model to evaluate with.
+        model: Model to evaluate with (may be separate inference model).
         iteration: Current training iteration.
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
+        training_model: Training model (if separate from inference model). Used to offload
+            grad buffers and restore to train mode. If None, uses model parameter.
     """
     args = get_args()
 
@@ -1520,6 +1506,7 @@ def evaluate_and_print_results_rl(
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
             args.rl_remove_kv_cache_during_training,
+            training_model,
         ) as inference_interface:
 
             loop = get_asyncio_loop()
@@ -1704,17 +1691,20 @@ def megatron_rl_inference_mode(
     offload_optimizer_during_inference: bool,
     offload_kv_cache_during_training: bool,
     remove_kv_cache_during_training: bool,
+    training_model: Optional[list[LanguageModule]] = None,
 ):
     """Manage the model inference context when collecting rollouts.
 
     Args:
-        model: model to prepare.
+        model: model to prepare for inference (may be separate inference model).
         optimizer: optimizer used to train the model.
         cuda_graph_impl: which cuda graph implementation to use.
         reset_cuda_graphs: rebuild cuda graphs for each inference stage or not.
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
         offload_kv_cache_during_training: manually offload kv cache to host before training or not.
         remove_kv_cache_during_training: manually remove kv cache before training or not.
+        training_model: training model (if separate from inference model). Used to offload
+            grad buffers and restore to train mode. If None, uses model parameter.
 
     Yields:
         None: this context manager does not return a value.
@@ -1756,7 +1746,10 @@ def megatron_rl_inference_mode(
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
                 if not args.rl_training_cuda_graphs:
-                    model[0].offload_grad_buffers()
+                    # Offload grad buffers from the training model (if separate inference model is used)
+                    # or from the inference model (if they're the same model)
+                    model_for_grad_offload = training_model if training_model is not None else model
+                    model_for_grad_offload[0].offload_grad_buffers()
                 else:
                     logger.warning(
                         "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
@@ -1819,7 +1812,7 @@ def megatron_rl_inference_mode(
         # Reset drop_and_pad leaked from inference decode
         set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
 
-        # Change cudagraph scope for training (use proper CudaGraphScope enums)
+        # Change cudagraph scope for training
         model[0].config.cuda_graph_scope = [
             CudaGraphScope.mamba,
             CudaGraphScope.attn,
@@ -1838,10 +1831,15 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
-                model[0].restore_grad_buffers()
+                # Restore grad buffers to the training model (if separate inference model is used)
+                # or to the inference model (if they're the same model)
+                model_for_grad_offload = training_model if training_model is not None else model
+                model_for_grad_offload[0].restore_grad_buffers()
                 optimizer.restore_from_cpu()
 
-        lang_module.train()
+        # Set training model back to train mode (not inference model if they're separate)
+        training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
+        training_lang_module.train()
 
         if has_lru_cache:
             rotary_module.forward.cache_clear()
