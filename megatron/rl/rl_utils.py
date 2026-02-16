@@ -1298,12 +1298,6 @@ def prepare_data_for_update(
                     # logprobs are [b, seq, h] now.
                     model.load_state_dict(cur_st_dict)
 
-            # Restore CUDA graph state for the upcoming training step.
-            if args.rl_training_cuda_graphs:
-                model.config.cuda_graph_impl = _saved_cuda_graph_impl
-                _CudagraphGlobalRecord.cudagraph_created = _saved_cudagraph_created
-                transition_moe_to_partial_cudagraphs(_logprobs_lang_module)
-
             torch.cuda.synchronize()
             gc.collect()
             torch.cuda.empty_cache()
