@@ -46,6 +46,7 @@ MODEL_OPTIONS="\
   --inference-dynamic-batching-max-requests 128 \
   --rl-parallel-generation-tasks 1024 \
   --rl-training-cuda-graphs \
+  --inference-dynamic-batching-cuda-graph-mixed-prefill-count 0 \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
   --use-checkpoint-args \
