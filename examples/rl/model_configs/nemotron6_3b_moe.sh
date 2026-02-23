@@ -41,11 +41,10 @@ MODEL_OPTIONS="\
   --rl-use-sequence-packing \
   --rl-partial-rollouts \
   --moe-pad-experts-for-cuda-graph-inference \
-  --inference-dynamic-batching-num-cuda-graphs 16 \
+  --inference-dynamic-batching-num-cuda-graphs 8 \
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
-  --rl-parallel-generation-tasks 1024 \
-  --rl-training-cuda-graphs \
+  --rl-parallel-generation-tasks 512 \
   --inference-dynamic-batching-cuda-graph-mixed-prefill-count 0 \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
@@ -102,5 +101,6 @@ MODEL_OPTIONS="\
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
   --no-load-rng \
-  --inference-logging-step-interval 100 \
   "
+
+  # --rl-training-cuda-graphs \
