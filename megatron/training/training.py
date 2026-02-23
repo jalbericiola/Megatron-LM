@@ -2108,11 +2108,61 @@ def training_log(
         )
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            # Compute and log MFU (Model FLOPs Utilization)
+            if not hasattr(args, '_gpu_peak_tflops'):
+                try:
+                    from megatron.training.gpu_peak_flops import get_gpu_peak_tflops
+                    args._gpu_peak_tflops = get_gpu_peak_tflops()
+                except Exception:
+                    args._gpu_peak_tflops = 0.0
+
+            training_mfu = 0.0
+            inference_mfu = 0.0
+            total_mfu = 0.0
+            mfu_report = None
+
+            if args._gpu_peak_tflops > 0:
+                # Training-only MFU (training FLOPs / total iteration time)
+                training_mfu = throughput / args._gpu_peak_tflops * 100.0
+
+                # Get inference + total MFU from the global tracker
+                try:
+                    from megatron.training.mfu_tracker import get_mfu_tracker
+                    tracker = get_mfu_tracker()
+                    training_flops = num_floating_point_operations(args, batch_size)
+                    tracker.add_training_flops(training_flops, elapsed_time_per_iteration)
+                    mfu_report = tracker.get_report(args._gpu_peak_tflops, args.world_size)
+                except Exception:
+                    mfu_report = None
+
+                log_string += (
+                    f' MFU: train {training_mfu:.1f}%'
+                )
+                if mfu_report is not None:
+                    inference_mfu = mfu_report['inference_mfu']
+                    total_mfu = mfu_report['total_mfu']
+                    log_string += (
+                        f', infer {inference_mfu:.1f}%'
+                        f', total {total_mfu:.1f}%'
+                    )
+                log_string += ' |'
+
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
+                    if args._gpu_peak_tflops > 0:
+                        writer.add_scalar('mfu/training_percent', training_mfu, iteration)
+                        if mfu_report is not None:
+                            writer.add_scalar('mfu/inference_percent', inference_mfu, iteration)
+                            writer.add_scalar('mfu/total_percent', total_mfu, iteration)
                 if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+                    wandb_log = {'throughput': throughput}
+                    if args._gpu_peak_tflops > 0:
+                        wandb_log['mfu/training_percent'] = training_mfu
+                        if mfu_report is not None:
+                            wandb_log['mfu/inference_percent'] = inference_mfu
+                            wandb_log['mfu/total_percent'] = total_mfu
+                    wandb_writer.log(wandb_log, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
