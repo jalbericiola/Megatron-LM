@@ -1382,7 +1382,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self.cumulative_inference_time += step_time
             try:
                 from megatron.training.mfu_tracker import get_mfu_tracker
-                get_mfu_tracker().add_inference_flops(step_flops_info['total_flops'], step_time)
+                get_mfu_tracker().add_inference_flops(
+                    step_flops_info['total_flops'], step_time, tokens=total_tokens
+                )
             except Exception:
                 pass
 
@@ -1396,6 +1398,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
             }
+
+            batch_dims = self.context.batch_dimensions
+            total_tokens = batch_dims.token_count if batch_dims else 0
+            if step_time > 0 and total_tokens > 0:
+                metrics['inference/tokens_per_sec_per_gpu'] = float(total_tokens / step_time)
 
             if step_flops_info is not None:
                 step_tflops = step_flops_info['total_flops'] / 1e12
@@ -1469,14 +1476,18 @@ class DynamicInferenceEngine(AbstractEngine):
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
+            batch_dims = self.context.batch_dimensions
+            total_tokens = batch_dims.token_count if batch_dims else 0
+            if step_time > 0 and total_tokens > 0:
+                toks_per_sec_per_gpu = total_tokens / step_time
+                output_str += f" toks/s/GPU: {toks_per_sec_per_gpu:.0f},"
             if step_flops_info is not None:
                 step_tflops = step_flops_info['total_flops'] / 1e12
                 step_throughput = step_tflops / step_time if step_time > 0 else 0
-                flops_str = f" FLOPs: {step_tflops:.2f} TFLOP, {step_throughput:.1f} TFLOP/s/GPU"
+                output_str += f" {step_throughput:.1f} TFLOP/s/GPU"
                 if self.gpu_peak_tflops > 0:
                     mfu = step_throughput / self.gpu_peak_tflops * 100.0
-                    flops_str += f", MFU: {mfu:.1f}%"
-                output_str += flops_str
+                    output_str += f", MFU: {mfu:.1f}%"
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)

@@ -27,25 +27,31 @@ class MFUTracker:
         with self._lock:
             self._inference_flops = 0.0
             self._inference_time = 0.0
+            self._inference_tokens = 0
             self._training_flops = 0.0
             self._training_time = 0.0
+            self._training_tokens = 0
             # Per-iteration accumulators (reset each RL iteration)
             self._iter_inference_flops = 0.0
             self._iter_inference_time = 0.0
+            self._iter_inference_tokens = 0
 
-    def add_inference_flops(self, flops: float, time_s: float):
+    def add_inference_flops(self, flops: float, time_s: float, tokens: int = 0):
         """Called by the inference engine each step."""
         with self._lock:
             self._inference_flops += flops
             self._inference_time += time_s
+            self._inference_tokens += tokens
             self._iter_inference_flops += flops
             self._iter_inference_time += time_s
+            self._iter_inference_tokens += tokens
 
-    def add_training_flops(self, flops: float, time_s: float):
+    def add_training_flops(self, flops: float, time_s: float, tokens: int = 0):
         """Called by the training loop each iteration."""
         with self._lock:
             self._training_flops += flops
             self._training_time += time_s
+            self._training_tokens += tokens
 
     def get_iter_inference_flops(self) -> float:
         """Get inference FLOPs accumulated since last reset_iter()."""
@@ -57,11 +63,17 @@ class MFUTracker:
         with self._lock:
             return self._iter_inference_time
 
+    def get_iter_inference_tokens(self) -> int:
+        """Get inference tokens accumulated since last reset_iter()."""
+        with self._lock:
+            return self._iter_inference_tokens
+
     def reset_iter(self):
-        """Reset per-iteration inference accumulators."""
+        """Reset per-iteration accumulators."""
         with self._lock:
             self._iter_inference_flops = 0.0
             self._iter_inference_time = 0.0
+            self._iter_inference_tokens = 0
 
     def get_report(self, gpu_peak_tflops: float, world_size: int) -> dict:
         """Compute MFU breakdown.
@@ -78,11 +90,14 @@ class MFUTracker:
         with self._lock:
             inf_tflops = self._inference_flops / 1e12
             inf_time = self._inference_time
+            inf_tokens = self._inference_tokens
             train_tflops = self._training_flops / 1e12
             train_time = self._training_time
+            train_tokens = self._training_tokens
 
         total_tflops = inf_tflops + train_tflops
         total_time = inf_time + train_time
+        total_tokens = inf_tokens + train_tokens
 
         def _mfu(tflops, time_s):
             if time_s <= 0 or gpu_peak_tflops <= 0:
@@ -90,19 +105,30 @@ class MFUTracker:
             throughput_per_gpu = tflops / (time_s * world_size)
             return throughput_per_gpu / gpu_peak_tflops * 100.0
 
+        def _toks_per_sec_per_gpu(tokens, time_s):
+            if time_s <= 0:
+                return 0.0
+            return tokens / (time_s * world_size)
+
         return {
             'inference_tflops': inf_tflops,
             'inference_time': inf_time,
+            'inference_tokens': inf_tokens,
             'inference_throughput': inf_tflops / (inf_time * world_size) if inf_time > 0 else 0,
             'inference_mfu': _mfu(inf_tflops, inf_time),
+            'inference_toks_per_sec_per_gpu': _toks_per_sec_per_gpu(inf_tokens, inf_time),
             'training_tflops': train_tflops,
             'training_time': train_time,
+            'training_tokens': train_tokens,
             'training_throughput': train_tflops / (train_time * world_size) if train_time > 0 else 0,
             'training_mfu': _mfu(train_tflops, train_time),
+            'training_toks_per_sec_per_gpu': _toks_per_sec_per_gpu(train_tokens, train_time),
             'total_tflops': total_tflops,
             'total_time': total_time,
+            'total_tokens': total_tokens,
             'total_throughput': total_tflops / (total_time * world_size) if total_time > 0 else 0,
             'total_mfu': _mfu(total_tflops, total_time),
+            'total_toks_per_sec_per_gpu': _toks_per_sec_per_gpu(total_tokens, total_time),
         }
 
 

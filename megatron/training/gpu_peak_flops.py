@@ -12,6 +12,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 # BF16 dense tensor core peak TFLOP/s per GPU
+# Dense BF16 tensor core peak (no structured sparsity).
+# Sparse (2:4) peak is 2× these values.
 _GPU_PEAK_TFLOPS_BF16 = {
     "A100-SXM": 312,
     "A100-PCIE": 312,
@@ -20,7 +22,7 @@ _GPU_PEAK_TFLOPS_BF16 = {
     "H200": 989,
     "B100": 1750,
     "B200": 2250,
-    "GB200": 2500,
+    "GB200": 2250,
 }
 
 

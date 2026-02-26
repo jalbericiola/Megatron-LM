@@ -21,7 +21,7 @@ GRPO_KL_BETA=${GRPO_KL_BETA:-"0.0"}
 TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-1024}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-8192}
-EXIT_INTERVAL=${EXIT_INTERVAL:-20}
+EXIT_INTERVAL=${EXIT_INTERVAL:-15}
 CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-20}
 
 
@@ -41,10 +41,11 @@ MODEL_OPTIONS="\
   --rl-use-sequence-packing \
   --rl-partial-rollouts \
   --moe-pad-experts-for-cuda-graph-inference \
-  --inference-dynamic-batching-num-cuda-graphs 8 \
-  --inference-dynamic-batching-max-tokens 8192 \
-  --inference-dynamic-batching-max-requests 128 \
-  --rl-parallel-generation-tasks 512 \
+  --inference-dynamic-batching-num-cuda-graphs 4 \
+  --inference-dynamic-batching-paused-buffer-size-gb 5 \
+    --inference-dynamic-batching-unified-memory-level 1 \
+  --rl-parallel-generation-tasks 16 \
+  --rl-training-cuda-graphs \
   --inference-dynamic-batching-cuda-graph-mixed-prefill-count 0 \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
@@ -101,6 +102,8 @@ MODEL_OPTIONS="\
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
   --no-load-rng \
+   --moe-permute-fusion \
+   --eval-interval 1000 \
   "
 
   # --rl-training-cuda-graphs \
