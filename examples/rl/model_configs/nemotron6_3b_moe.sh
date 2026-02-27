@@ -45,6 +45,7 @@ MODEL_OPTIONS="\
   --inference-dynamic-batching-max-requests 128 \
   --inference-dynamic-batching-paused-buffer-size-gb 5 \
     --inference-dynamic-batching-unified-memory-level 1 \
+    --empty-unused-memory-level 0 \
   --rl-training-cuda-graphs \
   --rl-parallel-generation-tasks 32 \
   --inference-dynamic-batching-cuda-graph-mixed-prefill-count 0 \

@@ -1336,7 +1336,7 @@ def prepare_data_for_update(
 
             torch.cuda.synchronize()
             gc.collect()
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
 
 
         if sequence_packing:
