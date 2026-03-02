@@ -44,10 +44,11 @@ MODEL_OPTIONS="\
   --inference-dynamic-batching-num-cuda-graphs 4 \
   --inference-dynamic-batching-max-requests 128 \
   --inference-dynamic-batching-paused-buffer-size-gb 5 \
+  --inference-dynamic-batching-buffer-size-gb 5 \
     --inference-dynamic-batching-unified-memory-level 1 \
+    --rl-training-cuda-graphs \
     --empty-unused-memory-level 0 \
-  --rl-training-cuda-graphs \
-  --rl-parallel-generation-tasks 32 \
+  --rl-parallel-generation-tasks 128 \
   --inference-dynamic-batching-cuda-graph-mixed-prefill-count 0 \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
@@ -106,7 +107,10 @@ MODEL_OPTIONS="\
   --no-load-rng \
    --moe-permute-fusion \
    --eval-interval 1000 \
+   --timing-log-level 2 \
+   --inference-logging-step-interval 100 \
   "
   # --inference-dynamic-batching-max-tokens 8192 \
-
+#   --rl-training-cuda-graphs \
   # --rl-training-cuda-graphs \
+#      --empty-unused-memory-level 0 \ # try with the default value (=2)
