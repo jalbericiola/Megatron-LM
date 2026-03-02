@@ -395,6 +395,10 @@ def permute(
             # get probs from indices
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
     else:
+        assert (
+            num_out_tokens is not None
+        ), "num_out_tokens is required for the argsort-based permute"
+
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
 
@@ -402,8 +406,7 @@ def permute(
         # This is equivalent to masked_select but produces fixed-shape output,
         # making it compatible with CUDA graph capture.
         flat_sorted = routing_map.reshape(-1).argsort(descending=True, stable=True)
-        if num_out_tokens is not None:
-            flat_sorted = flat_sorted[:num_out_tokens]
+        flat_sorted = flat_sorted[:num_out_tokens]
         sorted_indices = flat_sorted % num_tokens
 
         if probs is not None:
