@@ -108,9 +108,9 @@ MODEL_OPTIONS="\
    --moe-permute-fusion \
    --eval-interval 1000 \
    --timing-log-level 2 \
-   --inference-logging-step-interval 100 \
   "
   # --inference-dynamic-batching-max-tokens 8192 \
 #   --rl-training-cuda-graphs \
   # --rl-training-cuda-graphs \
 #      --empty-unused-memory-level 0 \ # try with the default value (=2)
+  #  --inference-logging-step-interval 100 \
