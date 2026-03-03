@@ -1252,6 +1252,18 @@ def prepare_data_for_update(
                 dataset = TensorDataset(torch.arange(len(compute_trajs)))
                 data_loader = DataLoader(dataset, batch_size=1)
                 logprobs_batch_size = 1
+
+            my_real_tokens = sum(
+                packing_context.packing_info.seq_lengths[idx]
+                for indices in packing_context.packing_info.bin_seq_indices
+                for idx in indices
+            )
+            global_real_tokens = my_real_tokens * mpu.get_data_parallel_world_size()
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+                get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
+            except Exception:
+                pass
         else:
             # Always compute standard masks for the original data (we'll need them later)
             with nvtx_range("get-ltor-masks-and-position-ids", time=True):

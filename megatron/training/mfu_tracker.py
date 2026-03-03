@@ -35,6 +35,8 @@ class MFUTracker:
             self._iter_inference_flops = 0.0
             self._iter_inference_time = 0.0
             self._iter_inference_tokens = 0
+            self._iter_logprob_time = 0.0
+            self._iter_real_training_tokens = 0
 
     def add_inference_flops(self, flops: float, time_s: float, tokens: int = 0):
         """Called by the inference engine each step."""
@@ -68,12 +70,32 @@ class MFUTracker:
         with self._lock:
             return self._iter_inference_tokens
 
+    def add_logprob_time(self, time_s: float):
+        """Called after the compute-logprobs phase each RL iteration."""
+        with self._lock:
+            self._iter_logprob_time += time_s
+
+    def get_iter_logprob_time(self) -> float:
+        with self._lock:
+            return self._iter_logprob_time
+
+    def set_iter_real_training_tokens(self, tokens: int):
+        """Set the real (non-padding) training token count for this iteration."""
+        with self._lock:
+            self._iter_real_training_tokens = tokens
+
+    def get_iter_real_training_tokens(self) -> int:
+        with self._lock:
+            return self._iter_real_training_tokens
+
     def reset_iter(self):
         """Reset per-iteration accumulators."""
         with self._lock:
             self._iter_inference_flops = 0.0
             self._iter_inference_time = 0.0
             self._iter_inference_tokens = 0
+            self._iter_logprob_time = 0.0
+            self._iter_real_training_tokens = 0
 
     def get_report(self, gpu_peak_tflops: float, world_size: int) -> dict:
         """Compute MFU breakdown.

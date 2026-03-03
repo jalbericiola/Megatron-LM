@@ -2128,9 +2128,20 @@ def training_log(
             has_tracker = False
             iter_inference_tokens = 0
             iter_inference_time = 0.0
+            iter_logprob_time = 0.0
             training_only_time = elapsed_time_per_iteration
             training_flops = 0.0
             iter_inference_flops = 0.0
+            effective_tokens = tokens_this_iter
+
+            # Read compute-logprobs time from the existing Megatron timer
+            try:
+                iter_logprob_time = (
+                    timers('compute-logprobs').elapsed(reset=False, barrier=False)
+                    / total_iterations
+                )
+            except Exception:
+                pass
 
             if args._gpu_peak_tflops > 0:
                 try:
@@ -2140,11 +2151,14 @@ def training_log(
                     iter_inference_time = tracker.get_iter_inference_time()
                     iter_inference_flops = tracker.get_iter_inference_flops()
                     iter_inference_tokens = tracker.get_iter_inference_tokens()
+                    real_training_tokens = tracker.get_iter_real_training_tokens()
+                    if real_training_tokens > 0:
+                        effective_tokens = real_training_tokens
                     training_only_time = max(
-                        elapsed_time_per_iteration - iter_inference_time, 1e-6
+                        elapsed_time_per_iteration - iter_inference_time - iter_logprob_time, 1e-6
                     )
                     tracker.add_training_flops(
-                        training_flops, training_only_time, tokens=tokens_this_iter
+                        training_flops, training_only_time, tokens=effective_tokens
                     )
                     tracker.reset_iter()
                     has_tracker = True
@@ -2155,11 +2169,11 @@ def training_log(
 
             ws = args.world_size
 
-            # Per-iteration toks/s/GPU breakdown
-            train_tps = tokens_this_iter / (training_only_time * ws) if training_only_time > 0 else 0.0
+            # Per-iteration toks/s/GPU breakdown (uses real tokens when seq packing is active)
+            train_tps = effective_tokens / (training_only_time * ws) if training_only_time > 0 else 0.0
             inf_tps = iter_inference_tokens / (iter_inference_time * ws) if iter_inference_time > 0 else 0.0
-            total_tps = (tokens_this_iter + iter_inference_tokens) / (elapsed_time_per_iteration * ws)
-            e2e_tps = tokens_this_iter / (elapsed_time_per_iteration * ws)
+            total_tps = (effective_tokens + iter_inference_tokens) / (elapsed_time_per_iteration * ws)
+            e2e_tps = effective_tokens / (elapsed_time_per_iteration * ws)
 
             if has_tracker:
                 log_string += (
