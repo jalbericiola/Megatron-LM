@@ -1301,6 +1301,17 @@ def prepare_data_for_update(
                 )
                 logprobs_batch_size = args.micro_batch_size
 
+            # Without sequence packing, training.py defaults to GBS*seq_length which
+            # counts padding tokens and inflates TPS metrics.  Report only the real
+            # (non-padding) tokens so the metric is comparable to the SP path.
+            my_real_tokens = int((trajs != tokenizer.pad).sum().item())
+            global_real_tokens = my_real_tokens * mpu.get_data_parallel_world_size()
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+                get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
+            except Exception:
+                pass
+
         with torch.no_grad(), nvtx_range("compute-logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
