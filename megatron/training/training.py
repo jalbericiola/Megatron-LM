@@ -1102,6 +1102,14 @@ def pretrain(
         if profile_dir is None:
             if args.save:
                 profile_dir = os.path.join(args.save, 'profiles')
+            elif args.tensorboard_dir:
+                profile_dir = os.path.join(
+                    os.path.dirname(args.tensorboard_dir), 'profiles'
+                )
+            elif args.load:
+                profile_dir = os.path.join(
+                    os.path.dirname(args.load.rstrip('/')), 'profiles'
+                )
             else:
                 profile_dir = './profiles'
 

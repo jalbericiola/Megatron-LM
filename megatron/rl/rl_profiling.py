@@ -37,64 +37,46 @@ logger = logging.getLogger(__name__)
 
 
 
-# Timer names we care about for RL profiling (in hierarchical order)
+# Timer names we care about for RL profiling (in hierarchical order).
+# These must exactly match the names passed to nvtx_range(..., time=True)
+# in rl_utils.py and sequence_packing_utils.py.
 RL_TIMER_NAMES = [
-    # Top-level phases
+    # Top-level phases (from Megatron core)
     "forward-backward",
     "optimizer",
-    "rl/rollout-collection",
-    "rl/prepare-data-for-update",
-    
+
+    # RL top-level phases
+    "rollout-collection",
+    "prepare-data-for-update",
+
     # Rollout collection breakdown
-    "rl/inference-setup",
-    "rl/build-cuda-graphs",
-    "rl/collect-rollouts",
-    "rl/sync-rollouts",
-    "rl/suspend-engine",
-    "rl/wait-for-decode-only",
-    
-    # Optimizer offload/restore (canonical names)
-    "rl/offload-optimizer-before-inference",
-    "rl/restore-optimizer-after-inference",
-    "rl/offload-kv-cache-after-inference",
-    "rl/restore-kv-cache-before-inference",
-    # Fine-grained offload/restore breakdown (using nvtx_range)
-    "rl/offload/grad-buffers",
-    "rl/offload/optimizer-state",
-    "rl/restore/grad-buffers",
-    "rl/restore/optimizer-state",
-    "rl/restore/wait-for-transfers",
-    
-    # Weight prefetching
-    "rl/prefetch-weights-to-gpu",
-    "rl/prefetch-weights-to-cpu",
-    
+    "inference-setup",
+    "collect-rollouts",
+    "sync-rollouts",
+    "suspend-engine",
+
+    # Optimizer offload/restore
+    "offload-optimizer-before-inference",
+    "onload-optimizer-after-inference",
+
     # Data preparation breakdown
-    "rl/compute-group-stats",
-    "rl/prepare-advantages",
-    "rl/prepare-trajectories",
-    "rl/get-ltor-masks",
-    "rl/create-dataloader",
-    "rl/sequence-packing",
-    "rl/pack-logprobs",
-    "rl/align-inference-logprobs",
-    "rl/log-wandb-tb",
+    "compute-group-stats",
+    "prepare-trajectories",
+    "get-ltor-masks-and-position-ids",
+    "create-dataloader",
+    "sequence-packing",
+    "pack-logprobs",
+    "align-inference-logprobs",
+    "log-wandb-tb",
     "pack_sequences",
     "regather_trajectories",
-    
+
     # Logprobs computation
-    "rl/compute-logprobs",
-    "rl/compute-old-logprobs",
-    "rl/compute-ref-logprobs",
-    "rl/get-logprobs",
-    "rl/forward-pass",
-    "rl/log-softmax",
-    
-    # Training
-    "rl/train/forward",
-    "rl/train/grpo-loss",
-    
-    # Gradient sync
+    "compute-logprobs",
+    "compute-old-logprobs",
+    "compute-ref-logprobs",
+
+    # Gradient sync (from Megatron core)
     "embedding-grads-all-reduce",
     "all-grads-sync",
     "params-all-gather",
@@ -103,39 +85,31 @@ RL_TIMER_NAMES = [
     "optimizer-copy-main-to-model-params",
 ]
 
-# Define timer hierarchy for de-duplication analysis
+# Define timer hierarchy for de-duplication analysis.
+# Names must match RL_TIMER_NAMES / the actual nvtx_range names.
 TIMER_HIERARCHY = {
-    "rl/rollout-collection": [
-        "rl/inference-setup",
-        "rl/collect-rollouts", 
-        "rl/sync-rollouts",
-        "rl/suspend-engine",
-        "rl/offload-optimizer-before-inference",
-        "rl/restore-optimizer-after-inference",
-        "rl/prefetch-weights-to-gpu",
-        "rl/prefetch-weights-to-cpu",
-        "rl/restore-kv-cache-before-inference",
-        "rl/offload-kv-cache-after-inference",
+    "rollout-collection": [
+        "inference-setup",
+        "collect-rollouts",
+        "sync-rollouts",
+        "suspend-engine",
+        "offload-optimizer-before-inference",
+        "onload-optimizer-after-inference",
     ],
-    "rl/prepare-data-for-update": [
-        "rl/compute-group-stats",
-        "rl/prepare-advantages",
-        "rl/prepare-trajectories",
-        "rl/get-ltor-masks",
-        "rl/create-dataloader",
-        "rl/sequence-packing",
-        "rl/pack-logprobs",
-        "rl/align-inference-logprobs",
-        "rl/log-wandb-tb",
-        "rl/compute-logprobs",
+    "prepare-data-for-update": [
+        "compute-group-stats",
+        "prepare-trajectories",
+        "get-ltor-masks-and-position-ids",
+        "create-dataloader",
+        "sequence-packing",
+        "pack-logprobs",
+        "align-inference-logprobs",
+        "log-wandb-tb",
+        "compute-logprobs",
     ],
-    "rl/compute-logprobs": [
-        "rl/compute-old-logprobs",
-        "rl/compute-ref-logprobs",
-    ],
-    "rl/get-logprobs": [
-        "rl/forward-pass",
-        "rl/log-softmax",
+    "compute-logprobs": [
+        "compute-old-logprobs",
+        "compute-ref-logprobs",
     ],
     "optimizer": [
         "optimizer-copy-to-main-grad",
@@ -271,29 +245,34 @@ class RLProfiler:
         self.iteration_profiles: List[IterationProfile] = []
         self._timer_history: Dict[str, List[float]] = defaultdict(list)  # For stats
         
-        # File handles (lazy init)
+        # File handles
         self._jsonl_file = None
         self._initialized = False
+
+        # Eagerly create the output file so it exists even if the job
+        # crashes before the first training_log iteration.
+        self._ensure_initialized()
         
     def _ensure_initialized(self):
-        """Lazy initialization of output files (only on rank 0)."""
+        """Initialize output files (only on rank 0)."""
         if self._initialized:
             return
-            
+
         # Only rank 0 writes files
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank != 0:
             self._initialized = True
             return
-            
+
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Open JSONL file for streaming writes
         jsonl_path = self.output_dir / f"profile_{self.run_id}.jsonl"
         self._jsonl_file = open(jsonl_path, "w")
-        
+
         logger.info(f"[RLProfiler] Writing profiles to {jsonl_path}")
+        print(f"[RLProfiler] JSONL profile file created: {jsonl_path}", flush=True)
         self._initialized = True
         
     def log_iteration(
@@ -487,23 +466,23 @@ class RLProfiler:
             return timers.get(name, (0, 0))[1]
         
         # Rollout generation (actual generation, not container)
-        phases["rollout_generation"] = get_max("rl/collect-rollouts")
-        
+        phases["rollout_generation"] = get_max("collect-rollouts")
+
         # Optimizer memory management
-        phases["optimizer_offload"] = get_max("rl/offload-optimizer-before-inference")
-        phases["optimizer_restore"] = get_max("rl/restore-optimizer-after-inference")
+        phases["optimizer_offload"] = get_max("offload-optimizer-before-inference")
+        phases["optimizer_restore"] = get_max("onload-optimizer-after-inference")
         phases["optimizer_memory_mgmt"] = phases["optimizer_offload"] + phases["optimizer_restore"]
-        
+
         # Logprobs computation
-        phases["logprobs_old"] = get_max("rl/compute-old-logprobs")
-        phases["logprobs_ref"] = get_max("rl/compute-ref-logprobs")
+        phases["logprobs_old"] = get_max("compute-old-logprobs")
+        phases["logprobs_ref"] = get_max("compute-ref-logprobs")
         phases["logprobs_total"] = phases["logprobs_old"] + phases["logprobs_ref"]
-        
+
         # Training
         phases["training"] = get_max("forward-backward")
-        
+
         # Wait/sync time (proxy for load imbalance)
-        phases["sync_wait"] = get_max("rl/suspend-engine") + get_max("rl/sync-rollouts")
+        phases["sync_wait"] = get_max("suspend-engine") + get_max("sync-rollouts")
         
         return phases
         
@@ -823,17 +802,17 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
     lines.append("-" * 70)
     
     phases = {
-        "Rollout Generation": ["rl/collect-rollouts"],
+        "Rollout Generation": ["collect-rollouts"],
         "Optimizer Memory Mgmt": [
-            "rl/offload-optimizer-before-inference",
-            "rl/restore-optimizer-after-inference",
+            "offload-optimizer-before-inference",
+            "onload-optimizer-after-inference",
         ],
         "Logprobs Computation": [
-            "rl/compute-old-logprobs",
-            "rl/compute-ref-logprobs",
+            "compute-old-logprobs",
+            "compute-ref-logprobs",
         ],
         "Training": ["forward-backward"],
-        "Sync/Wait": ["rl/suspend-engine", "rl/sync-rollouts"],
+        "Sync/Wait": ["suspend-engine", "sync-rollouts"],
     }
     
     for phase_name, timer_list in phases.items():

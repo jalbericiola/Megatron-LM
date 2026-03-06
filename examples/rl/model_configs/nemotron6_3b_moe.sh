@@ -38,7 +38,7 @@ ENV_DEPENDENT="\
 
 MODEL_OPTIONS="\
   --rl-skip-bos-token \
-  --rl-use-sequence-packing \
+  --no-rl-use-sequence-packing \
   --rl-partial-rollouts \
   --moe-pad-experts-for-cuda-graph-inference \
   --inference-dynamic-batching-num-cuda-graphs 4 \
