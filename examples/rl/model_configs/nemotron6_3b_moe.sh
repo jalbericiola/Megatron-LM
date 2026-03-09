@@ -105,12 +105,5 @@ MODEL_OPTIONS="\
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
   --no-load-rng \
-   --moe-permute-fusion \
-   --eval-interval 1000 \
-   --timing-log-level 2 \
+  --moe-permute-fusion \
   "
-  # --inference-dynamic-batching-max-tokens 8192 \
-#   --rl-training-cuda-graphs \
-  # --rl-training-cuda-graphs \
-#      --empty-unused-memory-level 0 \ # try with the default value (=2)
-  #  --inference-logging-step-interval 100 \

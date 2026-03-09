@@ -393,10 +393,11 @@ def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, d
 
     args = get_args()
 
-    # Must match the fixed size used in create_packed_seq_params_for_bin
-    # so CUDA graphs always see the same tensor shape.
-    fixed_size = max_sequences_per_bin + 2
-    cu_seqlens = torch.full((fixed_size,), seq_length, dtype=torch.int32, device=device)
+    # Pad to the maximum number of sequences in the bin for the attention kernel.
+    # We add 2 to account for the initial 0 and the final bin_size.
+    cu_seqlens = torch.full(
+        (max_sequences_per_bin + 2,), seq_length, dtype=torch.int32, device=device,
+    )
     cu_seqlens[0] = 0
 
     return PackedSeqParams(
@@ -463,14 +464,15 @@ def create_packed_seq_params_for_bin(
     # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
     cumsum_values = np.cumsum([0] + seq_lengths_in_bin)
 
-    # Always create a fixed-size tensor for CUDA graph compatibility.
-    # Worst case: max_sequences_per_bin sequences → max_sequences_per_bin + 1 cumsum entries
-    # plus the final bin_size sentinel = max_sequences_per_bin + 2 entries.
-    # Fill with bin_size so the last element is always bin_size and any unused
-    # slots create zero-length ghost sequences (bin_size → bin_size).
-    fixed_size = max_sequences_per_bin + 2
-    cu_seqlens = torch.full((fixed_size,), bin_size, dtype=torch.int32, device=device)
-    cu_seqlens[:len(cumsum_values)] = torch.tensor(cumsum_values, dtype=torch.int32, device=device)
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
+
+    # Pad cu_seqlens to bin_size by repeating the last value (creates zero-length ghost sequences)
+    # This ensures a fixed tensor size for CUDA graph compatibility
+    # We add 2 to account for the initial 0 and the final bin_size.
+    if len(cu_seqlens) < max_sequences_per_bin + 2:
+        out = cu_seqlens.new_full((max_sequences_per_bin + 2,), bin_size)
+        out[:len(cu_seqlens)] = cu_seqlens
+        cu_seqlens = out
 
     max_seqlen = bin_size
 
