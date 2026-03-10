@@ -131,6 +131,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
         """Run a dummy forward pass through the model, with a single token.
         Use-case: Used in EP on ranks which do not have any work, but are needed
         for the all-to-all communication."""
+        from megatron.core.transformer.cuda_graphs import skip_cudagraphs_context
+
         # we use num_dummy_tokens equal to tensor model parallel size
         # so that the dummy forward pass will work with sequence parallel
         num_dummy_tokens = self.tp_size
@@ -141,7 +143,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
             (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
         )
         attention_mask = None
-        return self.model(tokens, position_ids, attention_mask)
+        with skip_cudagraphs_context():
+            return self.model(tokens, position_ids, attention_mask)
 
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None

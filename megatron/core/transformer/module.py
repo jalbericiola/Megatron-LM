@@ -343,6 +343,10 @@ class GraphableMegatronModule(MegatronModule):
         )
 
     def __call__(self, *args, **kwargs):
+        from megatron.core.transformer.cuda_graphs import skip_cudagraphs
+
+        if skip_cudagraphs():
+            return super().__call__(*args, **kwargs)
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):

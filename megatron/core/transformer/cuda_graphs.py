@@ -66,6 +66,7 @@ except:
 
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
+_SKIP_CUDAGRAPHS = False
 logger = logging.getLogger(__name__)
 
 # Freeze GC during capture.
@@ -113,6 +114,29 @@ def _set_warmup_end():
     """Set graph warmup has ended."""
     global _IS_GRAPH_WARMUP
     _IS_GRAPH_WARMUP = False
+
+
+def skip_cudagraphs():
+    """Query if cudagraphs should be skipped for the current forward pass."""
+    return _SKIP_CUDAGRAPHS
+
+
+class skip_cudagraphs_context:
+    """Context manager to temporarily skip cudagraph dispatch.
+
+    Used by EP dummy forwards that need to run eagerly even when cudagraphs
+    have already been captured.
+    """
+
+    def __enter__(self):
+        global _SKIP_CUDAGRAPHS
+        _SKIP_CUDAGRAPHS = True
+        return self
+
+    def __exit__(self, *exc):
+        global _SKIP_CUDAGRAPHS
+        _SKIP_CUDAGRAPHS = False
+        return False
 
 
 @dataclass
