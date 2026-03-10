@@ -36,6 +36,7 @@ from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import (
+    toggle_context_parallel,
     toggle_cuda_graphs,
     transition_moe_cudagraphs,
 )
@@ -1856,6 +1857,12 @@ def megatron_rl_inference_mode(
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
+    # Disable context parallelism for inference: Mamba layers store CP-derived
+    # dimensions at init time which cause tensor shape mismatches during inference
+    # when the input is not distributed across CP ranks.
+    if args.context_parallel_size > 1:
+        toggle_context_parallel(lang_module, enable=False)
+
     # Switch MoE layers to full CUDA graph capture for inference
     if args.rl_training_cuda_graphs and args.num_experts is not None:
         transition_moe_cudagraphs(lang_module, 'full')
@@ -1934,6 +1941,10 @@ def megatron_rl_inference_mode(
                 model_for_grad_offload = training_model if training_model is not None else model
                 model_for_grad_offload[0].restore_grad_buffers()
                 optimizer.restore_from_cpu()
+
+        # Restore context parallelism for training
+        if args.context_parallel_size > 1:
+            toggle_context_parallel(lang_module, enable=True)
 
         # Set training model back to train mode (not inference model if they're separate)
         training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module

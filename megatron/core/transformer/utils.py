@@ -450,6 +450,88 @@ def transition_moe_cudagraphs(model, scope: str):
             module.transition_cudagraph_scope(scope)
 
 
+_context_parallel_cache = None
+
+
+def _init_context_parallel_cache(model):
+    """
+    Initialize the cache of MambaContextParallel instances and their original CP settings.
+    Only needs to be called once per model; subsequent calls are no-ops.
+    """
+    global _context_parallel_cache
+    model_id = id(model)
+    if _context_parallel_cache is not None and model_id in _context_parallel_cache:
+        return
+
+    from megatron.core.ssm.mamba_context_parallel import MambaContextParallel
+
+    if _context_parallel_cache is None:
+        _context_parallel_cache = {}
+
+    _context_parallel_cache[model_id] = {
+        'original_config_cp_size': model.config.context_parallel_size,
+        'mamba_cp_entries': [],
+    }
+
+    def find_mamba_cp(module):
+        if hasattr(module, 'cp') and isinstance(module.cp, MambaContextParallel):
+            cp = module.cp
+            _context_parallel_cache[model_id]['mamba_cp_entries'].append({
+                'instance': cp,
+                'cp_size': cp.cp_size,
+                'cp_group': cp.cp_group,
+                'd_inner_local_tpcp': cp.d_inner_local_tpcp,
+                'nheads_local_tpcp': cp.nheads_local_tpcp,
+                'ngroups_local_tpcp': cp.ngroups_local_tpcp,
+            })
+        for child in module._modules.values():
+            if child is not None:
+                find_mamba_cp(child)
+
+    find_mamba_cp(model)
+
+
+def toggle_context_parallel(model, enable=True):
+    """
+    Toggle context parallelism on Mamba layers between training (CP enabled)
+    and inference (CP disabled, i.e. CP size = 1).
+
+    MambaContextParallel stores its cp_size and derived per-rank dimensions at
+    init time. During inference the input tensors are not distributed across CP
+    ranks, so these dimensions must temporarily reflect cp_size=1 to avoid
+    tensor-shape mismatches (e.g. split_with_sizes errors).
+
+    Args:
+        model: The unwrapped language model whose Mamba layers should be toggled.
+        enable (bool): True to restore original CP settings (for training),
+                       False to disable CP (for inference).
+    """
+    global _context_parallel_cache
+    model_id = id(model)
+
+    if _context_parallel_cache is None or model_id not in _context_parallel_cache:
+        _init_context_parallel_cache(model)
+
+    cache = _context_parallel_cache[model_id]
+
+    if not enable:
+        model.config.context_parallel_size = 1
+        for entry in cache['mamba_cp_entries']:
+            cp = entry['instance']
+            cp.cp_size = 1
+            cp.d_inner_local_tpcp = cp.d_inner_local_tp
+            cp.nheads_local_tpcp = cp.nheads_local_tp
+            cp.ngroups_local_tpcp = cp.ngroups_local_tp
+    else:
+        model.config.context_parallel_size = cache['original_config_cp_size']
+        for entry in cache['mamba_cp_entries']:
+            cp = entry['instance']
+            cp.cp_size = entry['cp_size']
+            cp.d_inner_local_tpcp = entry['d_inner_local_tpcp']
+            cp.nheads_local_tpcp = entry['nheads_local_tpcp']
+            cp.ngroups_local_tpcp = entry['ngroups_local_tpcp']
+
+
 def is_layer_window_attention(
     window_size: Optional[Tuple[int, int]], window_attn_skip_freq: int | list, layer_number: int
 ) -> bool:
