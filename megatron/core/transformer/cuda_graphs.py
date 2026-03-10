@@ -1500,11 +1500,7 @@ class CudaGraphManager(torch.nn.Module):
 
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
-                    assert False, (
-                        f"`cudagraph_created` is set to True but no matching cudagraph "
-                        f"runners were found. This module has {len(self.cudagraph_runners)} "
-                        f"existing runners. Use `get_mismatch_errors` to debug mismatches."
-                    )
+                    return None
                 else:
                     runner = _CudaGraphRunner(
                         megatron_module,
@@ -1565,6 +1561,11 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(megatron_module, args, kwargs, self.reuse_cudagraphs)
+            if runner is None:
+                if self.func is not None:
+                    return self.func(*args, **kwargs)
+                else:
+                    return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode:
