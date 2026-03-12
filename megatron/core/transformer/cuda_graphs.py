@@ -66,6 +66,7 @@ except:
 
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
+_SKIP_CUDAGRAPHS = False
 logger = logging.getLogger(__name__)
 
 # Freeze GC during capture.
@@ -113,6 +114,29 @@ def _set_warmup_end():
     """Set graph warmup has ended."""
     global _IS_GRAPH_WARMUP
     _IS_GRAPH_WARMUP = False
+
+
+def skip_cudagraphs():
+    """Query if cudagraphs should be skipped for the current forward pass."""
+    return _SKIP_CUDAGRAPHS
+
+
+class skip_cudagraphs_context:
+    """Context manager to temporarily skip cudagraph dispatch.
+
+    Used by EP dummy forwards that need to run eagerly even when cudagraphs
+    have already been captured.
+    """
+
+    def __enter__(self):
+        global _SKIP_CUDAGRAPHS
+        _SKIP_CUDAGRAPHS = True
+        return self
+
+    def __exit__(self, *exc):
+        global _SKIP_CUDAGRAPHS
+        _SKIP_CUDAGRAPHS = False
+        return False
 
 
 @dataclass
@@ -1500,7 +1524,11 @@ class CudaGraphManager(torch.nn.Module):
 
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
-                    return None
+                    assert False, (
+                        f"`cudagraph_created` is set to True but no matching cudagraph "
+                        f"runners were found. This module has {len(self.cudagraph_runners)} "
+                        f"existing runners. Use `get_mismatch_errors` to debug mismatches."
+                    )
                 else:
                     runner = _CudaGraphRunner(
                         megatron_module,
@@ -1553,6 +1581,12 @@ class CudaGraphManager(torch.nn.Module):
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
 
+        if skip_cudagraphs():
+            if self.func is not None:
+                return self.func(*args, **kwargs)
+            else:
+                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
+
         if _CudagraphGlobalRecord.cudagraph_created:
             if self.training and torch.is_grad_enabled():
                 # Trigger Mcore DDP pre-forward hooks
@@ -1561,11 +1595,6 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(megatron_module, args, kwargs, self.reuse_cudagraphs)
-            if runner is None:
-                if self.func is not None:
-                    return self.func(*args, **kwargs)
-                else:
-                    return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode:
