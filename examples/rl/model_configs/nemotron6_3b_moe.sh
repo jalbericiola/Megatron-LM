@@ -59,11 +59,8 @@ MODEL_OPTIONS="\
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
   --rl-partial-rollouts \
-  --moe-pad-experts-for-cuda-graph-inference \
-  --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
   --inference-dynamic-batching-num-cuda-graphs 2 \
-  --decode-only-cuda-graphs \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
   --use-checkpoint-args \
@@ -120,3 +117,7 @@ MODEL_OPTIONS="\
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
   --no-load-rng "
+
+#     --moe-pad-experts-for-cuda-graph-inference \
+#
+  # --inference-dynamic-batching-max-tokens 8192 \

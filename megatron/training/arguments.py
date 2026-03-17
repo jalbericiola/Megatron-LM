@@ -2318,6 +2318,9 @@ def _add_rl_args(parser):
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
                             '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
+    group.add_argument('--rl-profile', action='store_true', default=False,
+                       help='Enable detailed RL profiling timers for rollout collection, '
+                            'optimizer offload/restore, and data preparation phases.')
     return parser
 
 def _add_training_args(parser):
