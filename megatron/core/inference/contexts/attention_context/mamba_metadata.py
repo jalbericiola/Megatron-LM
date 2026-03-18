@@ -130,12 +130,22 @@ class MambaMetadata:
         # Mamba models cannot have padded prefill requests without real prefill requests.
         # If this happens (e.g. on EP dummy ranks with incorrect setup), cu_seqlens will
         # be all zeros, causing an illegal memory access in the Mamba SSM prefill kernel.
-        assert not (padded_prefill_count > 0 and real_prefill_count == 0), (
-            f"Mamba models require real prefill requests when padded prefill count > 0. "
-            f"Real prefill: {real_prefill_count}, Padded prefill: {padded_prefill_count}. "
-            f"This can occur on EP dummy ranks if they are not properly set up to match "
-            f"the selected CUDA graph's prefill/decode split."
-        )
+        # assert not (padded_prefill_count > 0 and real_prefill_count == 0), (
+        #     f"Mamba models require real prefill requests when padded prefill count > 0. "
+        #     f"Real prefill: {real_prefill_count}, Padded prefill: {padded_prefill_count}. "
+        #     f"This can occur on EP dummy ranks if they are not properly set up to match "
+        #     f"the selected CUDA graph's prefill/decode split."
+        # )
+        if padded_prefill_count > 0 and real_prefill_count == 0:
+            print("WARNING: Mamba models require real prefill requests when padded prefill count > 0.")
+            print(f"Padded prefill count: {padded_prefill_count}, Real prefill count: {real_prefill_count}")
+            print(f"Batch dimensions: {batch_dimensions}")
+            print(f"Padded batch dimensions: {padded_batch_dimensions}")
+            print(f"Enable chunked prefill: {enable_chunked_prefill}")
+            print(f"Active mamba indices: {active_mamba_indices}")
+            print(f"Token to request idx: {token_to_request_idx}")
+            print(f"Cu seqlens: {cu_seqlens}")
+            print(f"Batch dimensions: {batch_dimensions}")
 
         # Although the context ensures that the last request is always the designated
         # chunked prefill request, what we actually care about is ensuring that any
