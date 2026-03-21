@@ -1402,20 +1402,8 @@ def prepare_data_for_update(
                 )
                 logprobs_batch_size = args.micro_batch_size
 
-            # Without sequence packing, training.py defaults to GBS*seq_length which
-            # counts padding tokens and inflates TPS metrics.  Report only the real
-            # (non-padding) tokens so the metric is comparable to the SP path.
-            my_real_tokens = int((trajs != tokenizer.pad).sum().item())
-            real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
-            torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
-            global_real_tokens = real_tokens_tensor.item()
-            try:
-                from megatron.training.mfu_tracker import get_mfu_tracker
-                get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
-            except Exception:
-                pass
 
-        with torch.no_grad(), nvtx_range("rl/compute_logprobs", time=True):
+        with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
             forward_backward_func = get_forward_backward_func()
@@ -1960,7 +1948,7 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("rl/restore-optimizer-after-inference", time=True):
-                with nvtx_range("rl/onload/grad-buffers", time=True):
+                with nvtx_range("rl/restore/grad-buffers", time=True):
                     model_for_grad_offload = training_model if training_model is not None else model
                     model_for_grad_offload[0].restore_grad_buffers()
                 with nvtx_range("rl/restore/optimizer-state", time=True):
