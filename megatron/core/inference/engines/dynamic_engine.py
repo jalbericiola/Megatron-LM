@@ -1814,6 +1814,31 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             self.cumulative_inference_flops += step_flops_info['total_flops']
             self.cumulative_inference_time += step_time
+
+        # Split step time into prefill/decode phases based on FLOPs proportions.
+        # For decode-only steps: all time is decode. For mixed/prefill steps: split by FLOPs.
+        if step_flops_info is not None and step_flops_info['total_flops'] > 0:
+            total_flops = step_flops_info['total_flops']
+            prefill_time = step_time * step_flops_info['prefill_flops'] / total_flops
+            decode_time = step_time * step_flops_info['decode_flops'] / total_flops
+        elif context_state["is_decode_only"]:
+            prefill_time = 0.0
+            decode_time = step_time
+        else:
+            prefill_time = step_time
+            decode_time = 0.0
+
+        # Accumulate into Megatron timers so prefill/decode appear in the
+        # per-RL-iteration timer log alongside forward-backward, rollout-collection, etc.
+        # Timers.log() resets elapsed, so the accumulation is automatically per-iteration.
+        try:
+            from megatron.training.global_vars import get_timers
+            _timers = get_timers()
+            _timers('rl/infer-prefill', log_level=2)._elapsed += prefill_time * 1000.0
+            _timers('rl/infer-decode', log_level=2)._elapsed += decode_time * 1000.0
+        except Exception:
+            pass
+        if step_flops_info is not None:
             try:
                 from megatron.training.mfu_tracker import get_mfu_tracker
 
@@ -1866,6 +1891,19 @@ class DynamicInferenceEngine(AbstractEngine):
                     cumulative_mfu = cumulative_throughput / self.gpu_peak_tflops * 100.0
                     metrics['inference/mfu_percent'] = float(mfu)
                     metrics['inference/cumulative_mfu_percent'] = float(cumulative_mfu)
+
+            # Prefill/decode phase timing split.
+            metrics['inference/prefill_time_s'] = float(prefill_time)
+            metrics['inference/decode_time_s'] = float(decode_time)
+            if step_flops_info is not None:
+                if prefill_time > 0:
+                    metrics['inference/prefill_tflops_per_gpu'] = float(
+                        step_flops_info['prefill_flops'] / 1e12 / prefill_time
+                    )
+                if decode_time > 0:
+                    metrics['inference/decode_tflops_per_gpu'] = float(
+                        step_flops_info['decode_flops'] / 1e12 / decode_time
+                    )
 
             # Add KV stats with inference/ prefix
             # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
@@ -1960,6 +1998,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.gpu_peak_tflops > 0:
                     mfu = step_throughput / self.gpu_peak_tflops * 100.0
                     output_str += f", MFU: {mfu:.1f}%"
+            output_str += (
+                f" [prefill: {prefill_time * 1000:.1f}ms"
+                f", decode: {decode_time * 1000:.1f}ms]"
+            )
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
                 output_str += " ... prefix cache: %d hits, %d blocks matched" % (
                     self._prefix_cache_hits,

@@ -59,7 +59,6 @@ MODEL_OPTIONS="\
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
   --rl-partial-rollouts \
-  --inference-dynamic-batching-max-requests 128 \
   --inference-dynamic-batching-num-cuda-graphs 2 \
   --cuda-graph-impl local \
   --cuda-graph-scope full \
@@ -119,5 +118,6 @@ MODEL_OPTIONS="\
   --no-load-rng "
 
 #     --moe-pad-experts-for-cuda-graph-inference \
+  # --inference-dynamic-batching-max-requests 128 \
 #
   # --inference-dynamic-batching-max-tokens 8192 \

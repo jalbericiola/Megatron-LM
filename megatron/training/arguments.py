@@ -2419,6 +2419,9 @@ def _add_rl_args(parser):
     group.add_argument('--rl-profile', action='store_true', default=False,
                        help='Enable detailed RL profiling timers for rollout collection, '
                             'optimizer offload/restore, and data preparation phases.')
+    group.add_argument('--rl-profile-dir', type=str, default=None,
+                       help='Directory for RL profiling output (JSONL/CSV). '
+                            'Defaults to $RUN_DIR/profiles or ./profiles.')
     return parser
 
 def _add_training_args(parser):

@@ -66,6 +66,17 @@ try:
 except ImportError:
     has_rl_utils = False
 
+try:
+    from megatron.rl.rl_profiling import (
+        initialize_rl_profiler,
+        log_iteration_profile,
+        shutdown_rl_profiler,
+        get_rl_profiler,
+    )
+    has_rl_profiling = True
+except ImportError:
+    has_rl_profiling = False
+
 # Canonical list of RL timer names to include in timers_to_log.
 # When the profiling branch is merged, this will be imported from rl_profiling
 # as RL_LOGGABLE_TIMER_NAMES instead of being defined here.
@@ -113,6 +124,9 @@ RL_LOGGABLE_TIMER_NAMES = [
     # Inference / cuda graphs
     'rl/build-cuda-graphs',
     'rl/wait-for-decode-only',
+    # Inference prefill/decode phase split (accumulated from engine per RL iteration)
+    'rl/infer-prefill',
+    'rl/infer-decode',
 ]
 
 try:
@@ -1166,6 +1180,33 @@ def pretrain(
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
+
+    # Initialize RL profiler if enabled
+    if has_rl_profiling and getattr(args, 'rl_profile', False):
+        # Determine output directory: use rl_profile_dir, save/profiles,
+        # $RUN_DIR/profiles (set by run_job.sh), or ./profiles as last resort.
+        profile_dir = getattr(args, 'rl_profile_dir', None)
+        if profile_dir is None:
+            if args.save:
+                profile_dir = os.path.join(args.save, 'profiles')
+            elif os.environ.get('RUN_DIR'):
+                profile_dir = os.path.join(os.environ['RUN_DIR'], 'profiles')
+            else:
+                profile_dir = './profiles'
+
+        # Generate run ID from job name or timestamp
+        run_id = os.getenv("SLURM_JOB_ID", None)
+        if run_id is None:
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        initialize_rl_profiler(
+            output_dir=profile_dir,
+            run_id=run_id,
+            enabled=True,
+            log_to_wandb=(wandb_writer is not None),
+            log_to_tensorboard=(get_tensorboard_writer() is not None),
+        )
+        print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
 
     if not args.skip_train or args.perform_rl_step:
         if args.skip_train:
@@ -2459,6 +2500,28 @@ def training_log(
         if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
             report_memory(f'(after {iteration} iterations)')
+        # Log RL profiling data if enabled (must be before timers.log which resets timers)
+        if has_rl_profiling and getattr(args, 'rl_profile', False):
+            # Compute tokens/sec metrics
+            tokens_per_sec = None
+            tokens_per_sec_per_gpu = None
+            if hasattr(args, 'seq_length') and args.seq_length > 0:
+                tokens_per_iteration = batch_size * args.seq_length
+                tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
+                tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+
+            log_iteration_profile(
+                iteration=iteration,
+                timers=timers,
+                elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
+                throughput_tflops=throughput if args.log_throughput else None,
+                global_batch_size=batch_size,
+                tokens_per_sec=tokens_per_sec,
+                tokens_per_sec_per_gpu=tokens_per_sec_per_gpu,
+                wandb_writer=wandb_writer,
+                tb_writer=writer,
+            )
+
         # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
@@ -3446,6 +3509,10 @@ def train(
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
+
+    # Shutdown RL profiler and export summary
+    if has_rl_profiling and getattr(args, 'rl_profile', False):
+        shutdown_rl_profiler()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
