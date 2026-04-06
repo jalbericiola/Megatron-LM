@@ -2334,6 +2334,22 @@ def training_log(
                     f', total {total_tps:.0f}'
                     f', e2e {e2e_tps:.0f} |'
                 )
+                # Per-phase inference TFLOPS (prefill vs decode).
+                try:
+                    prefill_flops, prefill_time_s, _ = tracker.get_iter_prefill_stats()
+                    decode_flops, decode_time_s, _ = tracker.get_iter_decode_stats()
+                    prefill_tflops_gpu = (
+                        prefill_flops / 1e12 / (prefill_time_s * ws) if prefill_time_s > 0 else 0.0
+                    )
+                    decode_tflops_gpu = (
+                        decode_flops / 1e12 / (decode_time_s * ws) if decode_time_s > 0 else 0.0
+                    )
+                    log_string += (
+                        f' infer TFLOPS/GPU: prefill {prefill_tflops_gpu:.1f}'
+                        f', decode {decode_tflops_gpu:.1f} |'
+                    )
+                except Exception:
+                    pass
 
             # Per-iteration MFU breakdown
             if args._gpu_peak_tflops > 0:

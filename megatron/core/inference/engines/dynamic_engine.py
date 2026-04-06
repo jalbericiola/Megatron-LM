@@ -1842,8 +1842,16 @@ class DynamicInferenceEngine(AbstractEngine):
             try:
                 from megatron.training.mfu_tracker import get_mfu_tracker
 
-                get_mfu_tracker().add_inference_flops(
+                tracker = get_mfu_tracker()
+                tracker.add_inference_flops(
                     step_flops_info['total_flops'], step_time, tokens=total_tokens
+                )
+                # Per-phase accumulation for prefill vs decode TFLOPS reporting.
+                tracker.add_inference_prefill_flops(
+                    step_flops_info['prefill_flops'], prefill_time, tokens=prefill_tokens
+                )
+                tracker.add_inference_decode_flops(
+                    step_flops_info['decode_flops'], decode_time, tokens=decode_tokens
                 )
             except Exception:
                 pass
