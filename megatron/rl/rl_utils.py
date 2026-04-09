@@ -634,6 +634,97 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
+def _scatter_for_context_parallel(
+    tokens: torch.Tensor,
+    position_ids: torch.Tensor,
+    packed_seq_params: 'PackedSeqParams',
+    cp_size: int,
+) -> tuple:
+    """Prepare local inputs for one context-parallel rank.
+
+    Slices the sequence dimension so that each CP rank handles
+    ``seq_len // cp_size`` tokens, and computes the matching token labels
+    needed for the log-softmax without any cross-rank communication.
+
+    Args:
+        tokens:          Full token tensor  [batch, seq_len].
+        position_ids:    Full position-id tensor  [batch, seq_len].
+        packed_seq_params: PackedSeqParams for the full bin.  A shallow copy is
+                         returned with the ``cp_group`` and ``local_cp_size``
+                         fields set so Transformer Engine uses ring attention.
+        cp_size:         Context-parallel world size.
+
+    Returns:
+        (local_tokens, local_position_ids, cp_packed_seq_params, local_labels)
+        where every tensor has sequence length ``seq_len // cp_size``.
+    """
+    cp_rank  = mpu.get_context_parallel_rank()
+    cp_group = mpu.get_context_parallel_group()
+
+    seq_len    = tokens.shape[1]
+    assert seq_len % cp_size == 0, (
+        f"Sequence length {seq_len} must be divisible by "
+        f"context_parallel_size {cp_size}."
+    )
+    local_size = seq_len // cp_size
+    start      = cp_rank * local_size
+    end        = start + local_size
+
+    local_tokens      = tokens[:, start:end].contiguous()
+    local_position_ids = position_ids[:, start:end].contiguous()
+
+    # Build labels without cross-rank communication.
+    # Label for position i is tokens[i+1].  For rank r that means tokens at
+    # indices [r*L+1, (r+1)*L+1).  The last element of the last rank wraps to
+    # tokens[-1] (a padding token that is always loss-masked, so it is harmless).
+    tokens_extended = torch.cat([tokens, tokens[:, -1:]], dim=1)  # [batch, seq_len+1]
+    local_labels = tokens_extended[:, start + 1 : end + 1].contiguous()
+
+    # Shallow-copy so we do not mutate the caller's object.
+    cp_packed_seq_params = copy.copy(packed_seq_params)
+    cp_packed_seq_params.cp_group      = cp_group
+    cp_packed_seq_params.local_cp_size = cp_size
+
+    return local_tokens, local_position_ids, cp_packed_seq_params, local_labels
+
+
+def _gather_logprobs_context_parallel(
+    local_logprobs: torch.Tensor,
+    no_grad: bool,
+) -> torch.Tensor:
+    """All-gather per-rank logprobs into the full-sequence logprob tensor.
+
+    Each CP rank holds ``[batch, local_size]`` logprobs.  After gathering all
+    ranks we get ``[batch, seq_len]`` and drop the final element (the dummy
+    boundary logprob appended by ``_scatter_for_context_parallel``) to obtain
+    ``[batch, seq_len - 1]``.
+
+    Uses ``torch.distributed.nn.functional.all_gather`` on the training path so
+    that gradients flow back through the gather to each rank's local forward
+    pass.  The no-grad path uses the non-differentiable variant.
+
+    Args:
+        local_logprobs: Local logprob tensor  [batch, local_size].
+        no_grad:        True when called in inference/reference-logprob mode.
+
+    Returns:
+        Full logprob tensor  [batch, seq_len - 1].
+    """
+    cp_group = mpu.get_context_parallel_group()
+
+    if no_grad:
+        cp_size = mpu.get_context_parallel_world_size()
+        gathered = [torch.empty_like(local_logprobs) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered, local_logprobs, group=cp_group)
+    else:
+        # Differentiable all-gather: backward is a reduce-scatter that routes
+        # each rank's gradient slice back to the correct local forward pass.
+        gathered = torch.distributed.nn.functional.all_gather(local_logprobs, group=cp_group)
+
+    # cat → [batch, seq_len]; drop the dummy boundary position → [batch, seq_len-1].
+    return torch.cat(gathered, dim=1)[:, :-1]
+
+
 def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
     """Get sequence logprobs from their token ids.
 
@@ -650,8 +741,12 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             Required when packed_seq_params is provided to avoid CPU-GPU synchronization.
 
     Returns:
-        Logprobs of input sequences.
+        Logprobs of input sequences  [batch, seq_len - 1].
 
+        With context parallelism (cp_size > 1) each rank runs the forward pass
+        on its ``seq_len // cp_size`` token slice.  Logprobs are all-gathered
+        after the log-softmax so the returned tensor always has the full
+        sequence length, matching the cp_size == 1 interface exactly.
     """
 
     args = get_args()
@@ -678,6 +773,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 total_tokens=tokens.shape[1],
             )
 
+    cp_size    = mpu.get_context_parallel_world_size()
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("get-logprobs", time=False):
@@ -690,15 +786,32 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
             fp32_output = not (args.fp16 or args.bf16)
-            with torch.no_grad() if no_grad else nullcontext():
-                logits_or_hidden_states = model(
-                    tokens,
-                    position_ids,
-                    attention_mask_for_forward,
-                    packed_seq_params=packed_seq_params,
-                    runtime_gather_output=True,
-                    fp32_output=fp32_output,
+
+            if cp_size > 1:
+                # Scatter: each rank processes seq_len // cp_size tokens.
+                local_tokens, local_position_ids, cp_packed_seq_params, local_labels = (
+                    _scatter_for_context_parallel(tokens, position_ids, packed_seq_params, cp_size)
                 )
+                with torch.no_grad() if no_grad else nullcontext():
+                    logits_or_hidden_states = model(
+                        local_tokens,
+                        local_position_ids,
+                        attention_mask_for_forward,
+                        packed_seq_params=cp_packed_seq_params,
+                        runtime_gather_output=True,
+                        fp32_output=fp32_output,
+                    )
+            else:
+                with torch.no_grad() if no_grad else nullcontext():
+                    logits_or_hidden_states = model(
+                        tokens,
+                        position_ids,
+                        attention_mask_for_forward,
+                        packed_seq_params=packed_seq_params,
+                        runtime_gather_output=True,
+                        fp32_output=fp32_output,
+                    )
+
             model.config.flash_decode = flash_decode
 
         pg_collection = get_attr_wrapped_model(model, "pg_collection")
@@ -706,12 +819,17 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
         if not is_pp_last_stage(pp_group):
             return logits_or_hidden_states
-        else:
-            logits = logits_or_hidden_states
-            with nvtx_range("log-softmax", time=False):
+
+        logits = logits_or_hidden_states
+        with nvtx_range("log-softmax", time=True):
+            if cp_size > 1:
+                # Compute local logprobs then gather the full sequence.
+                local_logprobs = selective_log_softmax(logits, local_labels)
+                logprobs = _gather_logprobs_context_parallel(local_logprobs, no_grad)
+            else:
                 # We do not need logprobs for the n+1 token.
                 logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
-            return logprobs
+        return logprobs
 
 
 def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]]) -> np.ndarray:

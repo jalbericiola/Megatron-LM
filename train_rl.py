@@ -139,8 +139,9 @@ def loss_func(
     masked_truncated_from_above = torch.sum(loss_mask_flat * truncated_from_above_flat)
     masked_truncated_from_below = torch.sum(loss_mask_flat * truncated_from_below_flat)
 
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+    # With context parallelism every rank holds the full logprobs (gathered after the
+    # CP forward pass in get_logprobs) and therefore computes the identical loss.
+    # No cross-CP reduction is required here.
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -187,7 +188,7 @@ def loss_func(
     # Note: This information needs to be determined in forward_step where we have access to the batch data
     # The loss_func doesn't have direct access to this information
 
-    return (loss[0] * args.context_parallel_size, total_tokens.int(), output_dict)
+    return (loss[0], total_tokens.int(), output_dict)
 
 
 def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
