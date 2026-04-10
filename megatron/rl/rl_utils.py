@@ -442,9 +442,35 @@ _INFERENCE_INTERFACE = None
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
+        inference_model = model[0]
+
+        # Speculative rollout: back the inference engine with a fast early-exit
+        # draft model that shares weights with the full model and exits after the
+        # first `rl_speculative_exit_layer` transformer blocks.  The training
+        # forward pass (get_logprobs) always uses the full model, so no IS
+        # correction is required.
+        exit_layer = getattr(args, 'rl_speculative_exit_layer', None)
+        if exit_layer is not None:
+            from megatron.rl.inference.draft_model import EarlyExitGPTModel
+            full_gpt = unwrap_model(inference_model)
+            total_layers = len(full_gpt.decoder.layers)
+            if not (1 <= exit_layer < total_layers):
+                raise ValueError(
+                    f"--rl-speculative-exit-layer={exit_layer} must satisfy "
+                    f"1 <= exit_layer < {total_layers} (total transformer layers)."
+                )
+            inference_model = EarlyExitGPTModel(full_gpt, exit_layer)
+            log_single_rank(
+                logger, logging.INFO,
+                f"[Speculative Rollout] Inference engine uses "
+                f"EarlyExitGPTModel (exit_layer={exit_layer}/{total_layers}). "
+                f"Draft generates {args.rl_speculative_oversample_factor}x rollouts; "
+                f"selection strategy: {args.rl_speculative_selection_strategy}."
+            )
+
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
-                model[0],
+                inference_model,
                 host='0.0.0.0',
                 port=8294,
                 verbose=args.inference_text_gen_server_logging)
@@ -455,14 +481,42 @@ def get_inference_interface(args, loop, model):
 _ROLLOUT_GENERATOR = None
 
 
+async def _speculative_select_generator(base_generator, k, strategy):
+    """Async generator wrapper that down-selects oversampled rollout groups.
+
+    Consumes groups of ``k * oversample_factor`` rollouts from ``base_generator``
+    and yields groups of exactly ``k`` rollouts, selected by ``strategy``.
+    """
+    from megatron.rl.agent.speculative_mixin import select_rollouts, SelectionStrategy
+    strat = SelectionStrategy(strategy)
+    async for group in base_generator:
+        yield select_rollouts(list(group), k, strat)
+
+
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
-        agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks if streaming else n_prompts)
+        agent = get_agent(
+            args,
+            parallel_generation_tasks=args.rl_parallel_generation_tasks if streaming else n_prompts,
+        )
+
+        # When speculative rollout is enabled, inflate rollouts_per_group so the
+        # draft engine generates oversample_factor * samples_per_group candidates.
+        # A thin async wrapper then down-selects to the original samples_per_group
+        # before the rollouts reach the training pipeline.
+        exit_layer = getattr(args, 'rl_speculative_exit_layer', None)
+        effective_rollouts_per_group = (
+            samples_per_group * args.rl_speculative_oversample_factor
+            if exit_layer is not None
+            else samples_per_group
+        )
+
+
         request = GroupedRolloutRequest(
             num_groups=args.rl_generation_batch_size,
             streaming=streaming,
-            rollouts_per_group=samples_per_group,
+            rollouts_per_group=effective_rollouts_per_group,
             inference_interface=inference_interface,
             generation_args={
                 'temperature': args.rl_default_temperature,
@@ -473,7 +527,16 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
             enforce_order=args.rl_enforce_generation_order,
         )
-        _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
+        base_gen = agent.get_grouped_rollouts(request)
+
+        if exit_layer is not None:
+            _ROLLOUT_GENERATOR = _speculative_select_generator(
+                base_gen,
+                k=samples_per_group,
+                strategy=args.rl_speculative_selection_strategy,
+            )
+        else:
+            _ROLLOUT_GENERATOR = base_gen
     return _ROLLOUT_GENERATOR
 
 

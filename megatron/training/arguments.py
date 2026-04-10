@@ -2311,6 +2311,28 @@ def _add_rl_args(parser):
                        help="Default top-p for model inference.")
     group.add_argument('--rl-default-top-k', type=int, default=-1,
                        help="Default top-k for model inference.")
+    # Speculative rollout arguments
+    group.add_argument('--rl-speculative-exit-layer', type=int, default=None,
+                       help='Enable speculative rollout generation using an early-exit draft '
+                            'model that runs only the first N transformer layers.  When set, '
+                            'the inference engine uses the draft model to generate '
+                            '--rl-speculative-oversample-factor * rollouts_per_group candidates '
+                            'and selects the best rollouts_per_group via '
+                            '--rl-speculative-selection-strategy.  Must satisfy '
+                            '1 <= exit_layer < total_layers.')
+    group.add_argument('--rl-speculative-oversample-factor', type=int, default=4,
+                       help='How many times more rollout candidates to generate with the draft '
+                            'model before selection.  Only used when '
+                            '--rl-speculative-exit-layer is set.  Default: 4.')
+    group.add_argument('--rl-speculative-selection-strategy', type=str,
+                       default='variance_maximizing',
+                       choices=['top_k', 'variance_maximizing', 'reward_distance_from_mean'],
+                       help='Strategy for selecting rollouts from oversampled candidates.  '
+                            'top_k: keep highest-reward rollouts.  '
+                            'variance_maximizing: maximise reward variance (best for GRPO).  '
+                            'reward_distance_from_mean: keep rollouts furthest from group mean.  '
+                            'Only used when --rl-speculative-exit-layer is set.  '
+                            'Default: variance_maximizing.')
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
     group.add_argument('--rl-kv-cache-management-mode', type=str, default='persist',
