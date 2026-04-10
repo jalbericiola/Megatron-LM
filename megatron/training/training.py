@@ -2304,6 +2304,13 @@ def training_log(
                     iter_inference_flops = tracker.get_iter_inference_flops() / total_iterations
                     iter_inference_tokens = tracker.get_iter_inference_tokens() / total_iterations
                     real_training_tokens = tracker.get_iter_real_training_tokens()
+                    # Read prefill/decode stats before reset_iter() zeroes them.
+                    iter_prefill_flops, iter_prefill_time_s, _ = tracker.get_iter_prefill_stats()
+                    iter_decode_flops, iter_decode_time_s, _ = tracker.get_iter_decode_stats()
+                    iter_prefill_flops /= total_iterations
+                    iter_prefill_time_s /= total_iterations
+                    iter_decode_flops /= total_iterations
+                    iter_decode_time_s /= total_iterations
                     if real_training_tokens > 0:
                         effective_tokens = real_training_tokens
                     training_only_time = max(
@@ -2335,14 +2342,13 @@ def training_log(
                     f', e2e {e2e_tps:.0f} |'
                 )
                 # Per-phase inference TFLOPS (prefill vs decode).
+                # Uses iter_prefill/decode stats saved before reset_iter() above.
                 try:
-                    prefill_flops, prefill_time_s, _ = tracker.get_iter_prefill_stats()
-                    decode_flops, decode_time_s, _ = tracker.get_iter_decode_stats()
                     prefill_tflops_gpu = (
-                        prefill_flops / 1e12 / (prefill_time_s * ws) if prefill_time_s > 0 else 0.0
+                        iter_prefill_flops / 1e12 / (iter_prefill_time_s * ws) if iter_prefill_time_s > 0 else 0.0
                     )
                     decode_tflops_gpu = (
-                        decode_flops / 1e12 / (decode_time_s * ws) if decode_time_s > 0 else 0.0
+                        iter_decode_flops / 1e12 / (iter_decode_time_s * ws) if iter_decode_time_s > 0 else 0.0
                     )
                     log_string += (
                         f' infer TFLOPS/GPU: prefill {prefill_tflops_gpu:.1f}'

@@ -1834,8 +1834,8 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             from megatron.training.global_vars import get_timers
             _timers = get_timers()
-            _timers('rl/infer-prefill', log_level=2)._elapsed += prefill_time * 1000.0
-            _timers('rl/infer-decode', log_level=2)._elapsed += decode_time * 1000.0
+            _timers('rl/infer-prefill', log_level=2)._elapsed += prefill_time
+            _timers('rl/infer-decode', log_level=2)._elapsed += decode_time
         except Exception:
             pass
         if step_flops_info is not None:

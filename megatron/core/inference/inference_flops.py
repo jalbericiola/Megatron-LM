@@ -209,10 +209,18 @@ class InferenceFLOPsCalculator:
             num_mlp = round(args.num_layers * args.hybrid_mlp_ratio)
             num_mamba = args.num_layers - num_attn - num_mlp
         else:
+            # Non-hybrid model.  Every layer has attention; MoE layers are
+            # determined by num_experts and moe_layer_freq.
+            n_experts = getattr(args, 'num_experts', 0) or 0
+            moe_freq = getattr(args, 'moe_layer_freq', 0) or 0
+            if n_experts > 0 and moe_freq > 0:
+                num_moe = args.num_layers // moe_freq
+                num_mlp = args.num_layers - num_moe
+            else:
+                num_mlp = 0
+                num_moe = 0
             num_attn = args.num_layers
             num_mamba = 0
-            num_mlp = 0
-            num_moe = 0
 
         block_size = getattr(args, 'inference_dynamic_batching_block_size', 256)
 

@@ -1152,14 +1152,6 @@ class _CudaGraphRunner(torch.nn.Module):
             # reference. This is safe for surfaces whose memory is managed by the CUDA graph pool
             # (driver-pinned, stable addresses) but not safe for tensors allocated by the caching
             # allocator, whose data_ptr() may be invalidated by block coalescing or empty_cache().
-            def replace_with_weak_ref_for_input_surface(arg):
-                if torch.is_tensor(arg) and _CudagraphGlobalRecord.tensor_reuse_pool.owns(arg):
-                    return arg
-                return replace_with_weak_ref(arg)
-
-            self.fwd_graph_input_surface = tree_map(
-                replace_with_weak_ref_for_input_surface, self.fwd_graph_input_surface
-            )
 
             self.fwd_graph_input_args = tree_map(replace_with_weak_ref, self.fwd_graph_input_args)
             self.fwd_graph_input_kwargs = tree_map(
