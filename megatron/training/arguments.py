@@ -2329,9 +2329,16 @@ def _add_rl_args(parser):
                             'and selects the best rollouts_per_group via '
                             '--rl-speculative-selection-strategy.  Must satisfy '
                             '1 <= exit_layer < total_layers.')
-    group.add_argument('--rl-speculative-oversample-factor', type=int, default=4,
+    def _positive_int(s):
+        v = int(s)
+        if v < 1:
+            raise argparse.ArgumentTypeError(
+                f"--rl-speculative-oversample-factor must be >= 1; got {v}"
+            )
+        return v
+    group.add_argument('--rl-speculative-oversample-factor', type=_positive_int, default=4,
                        help='How many times more rollout candidates to generate with the draft '
-                            'model before selection.  Only used when '
+                            'model before selection.  Must be >= 1.  Only used when '
                             '--rl-speculative-exit-layer is set.  Default: 4.')
     group.add_argument('--rl-speculative-selection-strategy', type=str,
                        default='variance_maximizing',

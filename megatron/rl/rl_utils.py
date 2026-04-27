@@ -503,10 +503,15 @@ async def _speculative_select_generator(base_generator, k, strategy):
 
     Consumes groups of ``k * oversample_factor`` rollouts from ``base_generator``
     and yields groups of exactly ``k`` rollouts, selected by ``strategy``.
+    Skips falsy groups (``None`` or empty), which can be emitted by upstream
+    filters (e.g. ``filter_groups_with_same_reward``).
     """
     from megatron.rl.agent.speculative_mixin import select_rollouts, SelectionStrategy
     strat = SelectionStrategy(strategy)
     async for group in base_generator:
+        if not group:
+            yield group
+            continue
         yield select_rollouts(list(group), k, strat)
 
 

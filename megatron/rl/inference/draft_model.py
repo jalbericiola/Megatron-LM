@@ -1,19 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Early-exit draft model and utilities for speculative rollout generation.
+"""Early-exit draft model for speculative rollout generation.
 
 EarlyExitGPTModel wraps a full GPTModel and exits the transformer stack after
-the first `exit_layer` blocks.  All parameters are *shared* with the full model
-— no new parameters are created and no explicit weight synchronisation is ever
-needed.
-
-DraftDistillationConfig enables an optional brief knowledge-distillation warm-up
-before RL training to tighten the distribution gap between the early-exit outputs
-and the full model.
+the first ``exit_layer`` blocks.  All parameters are *shared* with the full
+model — no new parameters are created and no explicit weight synchronisation is
+ever needed.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -23,24 +18,31 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
 
-# ---------------------------------------------------------------------------
-# EarlyExitGPTModel
-# ---------------------------------------------------------------------------
+# Attributes the inference engine looks up via get_attr_wrapped_model().  Any
+# new attribute that the engine starts requiring must be added here so the
+# draft model continues to look like a GPTModel from the engine's perspective.
+_FORWARDED_SCALAR_ATTRS = (
+    "max_sequence_length",
+    "model_type",
+    "xattn_needed",
+    "pg_collection",
+    "share_embeddings_and_output_weights",
+)
 
 
 class EarlyExitGPTModel(nn.Module):
-    """GPT model that exits after the first `exit_layer` transformer blocks.
+    """GPT model that exits after the first ``exit_layer`` transformer blocks.
 
     Parameters are shared with ``full_model`` — no separate copy exists and no
     weight-sync step is ever needed.  The draft always reflects the live weights
     of the full model.
 
-    The class is designed for *inference only* (speculative rollout generation).
-    It exposes the same ``forward()`` interface as :class:`GPTModel` so that it
-    can be passed directly to ``MegatronLocal.launch()``.
+    Designed for *inference only* (speculative rollout generation).  Exposes the
+    same ``forward()`` interface as :class:`GPTModel` so it can be passed
+    directly to ``MegatronLocal.launch()``.
 
     Args:
         full_model: The reference GPTModel whose components are reused.
@@ -58,31 +60,35 @@ class EarlyExitGPTModel(nn.Module):
 
         self.exit_layer = exit_layer
 
-        # Expose config properties expected by GPTInferenceWrapper.
+        # Forward scalar / non-Module attributes that the inference engine and
+        # config builders read via get_attr_wrapped_model().
         self.config = full_model.config
         self.pre_process = full_model.pre_process
         self.post_process = full_model.post_process
         self.position_embedding_type = full_model.position_embedding_type
         self.parallel_output = full_model.parallel_output
+        for attr in _FORWARDED_SCALAR_ATTRS:
+            if hasattr(full_model, attr):
+                setattr(self, attr, getattr(full_model, attr))
 
-        # Store the full model in a plain Python list so that nn.Module does
-        # NOT register it as a child, preventing double-counting of its
-        # parameters in the optimizer.  Lists are not traversed by
-        # nn.Module.__setattr__, making this the canonical way to hold a
-        # non-child module reference.
+        # Hold the full model in a list so nn.Module.__setattr__ does NOT
+        # register it as a child — that would double-count its parameters.
         self._full_model_holder: list[GPTModel] = [full_model]
 
     # ------------------------------------------------------------------
-    # Convenience property
+    # Plumbing
     # ------------------------------------------------------------------
 
     @property
     def _full_model(self) -> GPTModel:
         return self._full_model_holder[0]
 
-    # ------------------------------------------------------------------
-    # train / eval propagation
-    # ------------------------------------------------------------------
+    @property
+    def decoder(self):
+        # Property — bypasses nn.Module.__setattr__ child registration.
+        # Required by MambaInferenceStateConfig.from_model() and any other
+        # consumer that walks the decoder via get_attr_wrapped_model().
+        return self._full_model.decoder
 
     def train(self, mode: bool = True) -> "EarlyExitGPTModel":
         super().train(mode)
@@ -109,14 +115,14 @@ class EarlyExitGPTModel(nn.Module):
         runtime_gather_output: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Run the first ``exit_layer`` transformer blocks and return logits.
+        """Run the first ``exit_layer`` transformer blocks and return logits in [b, s, h].
 
         ``labels`` is accepted for interface compatibility but ignored — the
         draft model is never trained directly.
         """
         fm = self._full_model
 
-        # ---- Preprocessing: embeddings + rotary positional encodings ----
+        # Embeddings + rotary positional encodings.
         preproc = fm._preprocess(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -134,7 +140,18 @@ class EarlyExitGPTModel(nn.Module):
         ) = preproc[:6]
         rotary_pos_cos_sin = preproc[6] if len(preproc) == 7 else None
 
-        # ---- Partial decoder: only the first `exit_layer` blocks ----
+        # _preprocess wraps decoder_input in a WrappedTensor during inference
+        # so that TransformerBlock can drop its caller's reference for early
+        # GC.  We iterate layers manually, so unwrap explicitly.
+        if isinstance(decoder_input_tensor, WrappedTensor):
+            decoder_input_tensor = decoder_input_tensor.unwrap()
+
+        # NOTE: We iterate layers directly instead of calling fm.decoder(...)
+        # to skip the full TransformerBlock — that block does activation
+        # checkpointing and other train-time bookkeeping we don't need at
+        # inference.  Trade-off: any inference-specific TransformerBlock
+        # bookkeeping (e.g. CUDA-graph capture) is also skipped.  Revisit if
+        # CUDA graphs become required for the draft path.
         hidden_states = decoder_input_tensor
         context = None
         extra = extra_block_kwargs or {}
@@ -155,29 +172,40 @@ class EarlyExitGPTModel(nn.Module):
                 **extra,
             )
 
-        # ---- Final layer norm (shared with the full model) ----
+        # Final layer norm — shared with the full model.
         if fm.decoder.final_layernorm is not None:
             hidden_states = apply_module(fm.decoder.final_layernorm)(hidden_states)
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=False, keep_graph=False
             )
 
-        # ---- Output projection → logits ----
-        if fm.post_process:
-            # runtime_gather_output controls TP gather; mirror GPTModel behaviour.
-            gather = (
-                runtime_gather_output
-                if runtime_gather_output is not None
-                else not fm.parallel_output
-            )
-            logits, _ = fm.output_layer(hidden_states, runtime_gather_output=gather)
-            return logits
+        if not fm.post_process:
+            return hidden_states
 
-        return hidden_states
+        # Tied input/output embeddings: pass the shared weight through to
+        # ColumnParallelLinear.  Matches GPTModel._postprocess.
+        output_weight = None
+        if getattr(fm, "share_embeddings_and_output_weights", False):
+            output_weight = fm.shared_embedding_or_output_weight()
+
+        gather = (
+            runtime_gather_output
+            if runtime_gather_output is not None
+            else not fm.parallel_output
+        )
+        logits, _ = fm.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=gather
+        )
+
+        # MuP logit scaling, when configured on the full model.
+        logits = fm._scale_logits(logits)
+
+        # Logits arrive as [s, b, h]; downstream consumers expect [b, s, h].
+        return logits.transpose(0, 1).contiguous()
 
 
 # ---------------------------------------------------------------------------
-# Weight synchronisation (no-op for EarlyExitGPTModel)
+# Weight synchronisation helper for non-weight-sharing drafts
 # ---------------------------------------------------------------------------
 
 
@@ -186,24 +214,15 @@ def sync_draft_weights(
     full_model: GPTModel,
     num_layers: int,
 ) -> None:
-    """Copy the first ``num_layers`` transformer blocks from the full model to the draft.
+    """Copy the first ``num_layers`` transformer blocks from full to draft.
 
-    For :class:`EarlyExitGPTModel` this is a **no-op** because all parameters
-    are already shared by reference — the draft always reflects the live weights
-    of the full model.  The function is provided for API symmetry with draft
-    models that keep separate parameter copies (e.g. a distilled or quantised
-    draft).
-
-    Args:
-        draft_model: The draft model to update.
-        full_model: The full model providing the source weights.
-        num_layers: How many transformer layers to copy.
+    No-op for :class:`EarlyExitGPTModel` (parameters are shared by reference).
+    Provided for API symmetry with draft variants that hold separate
+    parameters (e.g. distilled or quantised drafts).
     """
     if isinstance(draft_model, EarlyExitGPTModel):
-        # Parameters are shared — nothing to do.
         return
 
-    # Generic path: explicit tensor copy.
     with torch.no_grad():
         src_params = dict(
             full_model.decoder.layers[:num_layers].named_parameters()
@@ -214,35 +233,3 @@ def sync_draft_weights(
         for name, src in src_params.items():
             if name in dst_params:
                 dst_params[name].copy_(src)
-
-
-# ---------------------------------------------------------------------------
-# Optional knowledge-distillation warm-up config
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class DraftDistillationConfig:
-    """Configuration for an optional KD warm-up of the early-exit draft model.
-
-    When ``num_warmup_steps > 0``, the draft is briefly trained to minimise
-    KL divergence between its output distribution and the full model's
-    output distribution on a representative dataset.  This is useful when the
-    early-exit distribution diverges significantly from the full model (common
-    when ``exit_layer`` is a small fraction of the total depth).
-
-    Args:
-        num_warmup_steps: Number of KD gradient steps.  Set to 0 to skip.
-        temperature: Softmax temperature applied to both distributions
-            (higher → softer, more informative targets).
-        kd_weight: Relative weight of the KD loss.
-    """
-
-    num_warmup_steps: int = 0
-    temperature: float = 1.0
-    kd_weight: float = 1.0
-
-    @property
-    def enabled(self) -> bool:
-        """Return True when distillation warm-up is active."""
-        return self.num_warmup_steps > 0
