@@ -123,7 +123,9 @@ def select_rollouts(
         List of ``k`` selected rollouts (order is not guaranteed).
     """
     if len(rollouts) <= k:
-        return rollouts
+        # Return a copy so callers can mutate the result without affecting
+        # the input pool.
+        return list(rollouts)
 
     rewards = [_scalar_reward(r) for r in rollouts]
 
