@@ -58,7 +58,6 @@ MODEL_OPTIONS="\
   --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
-  --moe-pad-experts-for-cuda-graph-inference \
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
   --inference-dynamic-batching-num-cuda-graphs 2 \
@@ -117,3 +116,6 @@ MODEL_OPTIONS="\
   --lr-decay-style constant \
   --lr-warmup-samples 640 \
   --lr-warmup-init 0.3e-7 "
+
+  # --moe-pad-experts-for-cuda-graph-inference \
+# 
