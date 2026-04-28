@@ -1932,7 +1932,10 @@ def training_log(
                               'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
                               'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
                               'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
-                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
+                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference',
+                              # Per-step prefill/decode breakdown accumulated by the
+                              # dynamic inference engine (see add_inference_prefill/decode_flops).
+                              'infer-prefill', 'infer-decode'])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -2138,6 +2141,10 @@ def training_log(
             training_flops = 0.0
             iter_inference_flops = 0.0
             effective_tokens = tokens_this_iter
+            iter_prefill_flops = 0.0
+            iter_prefill_time_s = 0.0
+            iter_decode_flops = 0.0
+            iter_decode_time_s = 0.0
 
             # Read compute_logprobs time from the existing Megatron timer
             # (created via nvtx_range("compute_logprobs", time=True) in rl_utils.py).
@@ -2162,6 +2169,13 @@ def training_log(
                     iter_inference_flops = tracker.get_iter_inference_flops() / total_iterations
                     iter_inference_tokens = tracker.get_iter_inference_tokens() / total_iterations
                     real_training_tokens = tracker.get_iter_real_training_tokens()
+                    # Read prefill/decode stats BEFORE reset_iter() zeroes them.
+                    iter_prefill_flops, iter_prefill_time_s, _ = tracker.get_iter_prefill_stats()
+                    iter_decode_flops, iter_decode_time_s, _ = tracker.get_iter_decode_stats()
+                    iter_prefill_flops /= total_iterations
+                    iter_prefill_time_s /= total_iterations
+                    iter_decode_flops /= total_iterations
+                    iter_decode_time_s /= total_iterations
                     if real_training_tokens > 0:
                         effective_tokens = real_training_tokens
                     training_only_time = max(
@@ -2191,6 +2205,19 @@ def training_log(
                     f', infer {inf_tps:.0f}'
                     f', total {total_tps:.0f}'
                     f', e2e {e2e_tps:.0f} |'
+                )
+                # Per-phase inference TFLOPS (prefill vs decode), per-GPU.
+                prefill_tflops_gpu = (
+                    iter_prefill_flops / 1e12 / iter_prefill_time_s
+                    if iter_prefill_time_s > 0 else 0.0
+                )
+                decode_tflops_gpu = (
+                    iter_decode_flops / 1e12 / iter_decode_time_s
+                    if iter_decode_time_s > 0 else 0.0
+                )
+                log_string += (
+                    f' infer TFLOPS/GPU: prefill {prefill_tflops_gpu:.1f}'
+                    f', decode {decode_tflops_gpu:.1f} |'
                 )
 
             # Per-iteration MFU breakdown

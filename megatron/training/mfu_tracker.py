@@ -37,6 +37,13 @@ class MFUTracker:
             self._iter_inference_tokens = 0
             self._iter_logprob_time = 0.0
             self._iter_real_training_tokens = 0
+            # Per-phase inference accumulators (prefill vs decode).
+            self._iter_prefill_flops = 0.0
+            self._iter_prefill_time = 0.0
+            self._iter_prefill_tokens = 0
+            self._iter_decode_flops = 0.0
+            self._iter_decode_time = 0.0
+            self._iter_decode_tokens = 0
 
     def add_inference_flops(self, flops: float, time_s: float, tokens: int = 0):
         """Called by the inference engine each step."""
@@ -47,6 +54,30 @@ class MFUTracker:
             self._iter_inference_flops += flops
             self._iter_inference_time += time_s
             self._iter_inference_tokens += tokens
+
+    def add_inference_prefill_flops(self, flops: float, time_s: float, tokens: int = 0):
+        """Accumulate prefill-phase inference FLOPs/time per iteration."""
+        with self._lock:
+            self._iter_prefill_flops += flops
+            self._iter_prefill_time += time_s
+            self._iter_prefill_tokens += tokens
+
+    def add_inference_decode_flops(self, flops: float, time_s: float, tokens: int = 0):
+        """Accumulate decode-phase inference FLOPs/time per iteration."""
+        with self._lock:
+            self._iter_decode_flops += flops
+            self._iter_decode_time += time_s
+            self._iter_decode_tokens += tokens
+
+    def get_iter_prefill_stats(self) -> tuple:
+        """Return (flops, time_s, tokens) for prefill since last reset_iter()."""
+        with self._lock:
+            return self._iter_prefill_flops, self._iter_prefill_time, self._iter_prefill_tokens
+
+    def get_iter_decode_stats(self) -> tuple:
+        """Return (flops, time_s, tokens) for decode since last reset_iter()."""
+        with self._lock:
+            return self._iter_decode_flops, self._iter_decode_time, self._iter_decode_tokens
 
     def add_training_flops(self, flops: float, time_s: float, tokens: int = 0):
         """Called by the training loop each iteration."""
@@ -96,6 +127,12 @@ class MFUTracker:
             self._iter_inference_tokens = 0
             self._iter_logprob_time = 0.0
             self._iter_real_training_tokens = 0
+            self._iter_prefill_flops = 0.0
+            self._iter_prefill_time = 0.0
+            self._iter_prefill_tokens = 0
+            self._iter_decode_flops = 0.0
+            self._iter_decode_time = 0.0
+            self._iter_decode_tokens = 0
 
     def save_iter(self) -> dict:
         """Snapshot per-iteration accumulators so they can be restored later.
@@ -110,6 +147,12 @@ class MFUTracker:
                 'inference_tokens': self._iter_inference_tokens,
                 'logprob_time': self._iter_logprob_time,
                 'real_training_tokens': self._iter_real_training_tokens,
+                'prefill_flops': self._iter_prefill_flops,
+                'prefill_time': self._iter_prefill_time,
+                'prefill_tokens': self._iter_prefill_tokens,
+                'decode_flops': self._iter_decode_flops,
+                'decode_time': self._iter_decode_time,
+                'decode_tokens': self._iter_decode_tokens,
             }
 
     def restore_iter(self, snapshot: dict):
@@ -120,6 +163,12 @@ class MFUTracker:
             self._iter_inference_tokens = snapshot['inference_tokens']
             self._iter_logprob_time = snapshot['logprob_time']
             self._iter_real_training_tokens = snapshot['real_training_tokens']
+            self._iter_prefill_flops = snapshot.get('prefill_flops', 0.0)
+            self._iter_prefill_time = snapshot.get('prefill_time', 0.0)
+            self._iter_prefill_tokens = snapshot.get('prefill_tokens', 0)
+            self._iter_decode_flops = snapshot.get('decode_flops', 0.0)
+            self._iter_decode_time = snapshot.get('decode_time', 0.0)
+            self._iter_decode_tokens = snapshot.get('decode_tokens', 0)
 
     def get_report(self, gpu_peak_tflops: float) -> dict:
         """Compute MFU breakdown.

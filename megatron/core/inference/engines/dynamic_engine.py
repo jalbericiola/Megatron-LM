@@ -1934,6 +1934,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 mfu = step_throughput / self.gpu_peak_tflops * 100.0
                 output += f", MFU: {mfu:.1f}%"
 
+            # Per-phase prefill/decode split (computed the same way as
+            # async_bookkeep accumulates them into Megatron timers).
+            tot_f = step_flops_info['total_flops']
+            if tot_f > 0:
+                prefill_time = step_time * step_flops_info['prefill_flops'] / tot_f
+                decode_time = step_time * step_flops_info['decode_flops'] / tot_f
+            elif context_state["is_decode_only"]:
+                prefill_time, decode_time = 0.0, step_time
+            else:
+                prefill_time, decode_time = step_time, 0.0
+            output += (
+                f" [prefill: {prefill_time * 1000:.1f}ms"
+                f", decode: {decode_time * 1000:.1f}ms]"
+            )
+
         if context_state["is_decode_only"]:
             sol = self._compute_sol_metrics(context_state, step_time)
             output += self._format_sol_log(sol)
@@ -2079,11 +2094,54 @@ class DynamicInferenceEngine(AbstractEngine):
             step_flops_info['prefill_flops'] /= self._inference_world_size
             self.cumulative_inference_flops += step_flops_info['total_flops']
             self.cumulative_inference_time += step_time
+
+        # Split step time into prefill/decode phases based on FLOPs proportion.
+        # For decode-only steps: all time is decode.  For mixed/prefill steps:
+        # split by FLOPs.  This gives a clean per-phase timing breakdown that
+        # we can both push into Megatron timers (`infer-prefill`, `infer-decode`)
+        # and report per-step / per-iteration TFLOPS for prefill vs decode.
+        if step_flops_info is not None and step_flops_info['total_flops'] > 0:
+            total_flops = step_flops_info['total_flops']
+            prefill_time = step_time * step_flops_info['prefill_flops'] / total_flops
+            decode_time = step_time * step_flops_info['decode_flops'] / total_flops
+        elif context_state["is_decode_only"]:
+            prefill_time = 0.0
+            decode_time = step_time
+        else:
+            prefill_time = step_time
+            decode_time = 0.0
+
+        # Accumulate into Megatron timers so prefill/decode appear in the
+        # per-RL-iteration timer log alongside forward-backward, rollout-collection,
+        # etc.  Timers.log() resets elapsed, so the accumulation is automatically
+        # per-iteration.  Stored in seconds (matching the rest of Megatron's
+        # internal Timer._elapsed convention).
+        try:
+            from megatron.training.global_vars import get_timers
+            _timers = get_timers()
+            _timers('infer-prefill', log_level=2)._elapsed += prefill_time
+            _timers('infer-decode', log_level=2)._elapsed += decode_time
+        except Exception:
+            pass
+
+        if step_flops_info is not None:
             try:
                 from megatron.training.mfu_tracker import get_mfu_tracker
 
-                get_mfu_tracker().add_inference_flops(
+                tracker = get_mfu_tracker()
+                tracker.add_inference_flops(
                     step_flops_info['total_flops'], step_time, tokens=total_tokens
+                )
+                # Per-phase accumulation for prefill vs decode TFLOPS reporting.
+                tracker.add_inference_prefill_flops(
+                    step_flops_info['prefill_flops'],
+                    prefill_time,
+                    tokens=prefill_tokens,
+                )
+                tracker.add_inference_decode_flops(
+                    step_flops_info['decode_flops'],
+                    decode_time,
+                    tokens=decode_tokens,
                 )
             except Exception:
                 pass
@@ -2125,6 +2183,19 @@ class DynamicInferenceEngine(AbstractEngine):
                     cumulative_mfu = cumulative_throughput / self.gpu_peak_tflops * 100.0
                     metrics['inference/mfu_percent'] = float(mfu)
                     metrics['inference/cumulative_mfu_percent'] = float(cumulative_mfu)
+
+            # Per-phase prefill/decode timing split (and per-phase TFLOPS).
+            metrics['inference/prefill_time_s'] = float(prefill_time)
+            metrics['inference/decode_time_s'] = float(decode_time)
+            if step_flops_info is not None:
+                if prefill_time > 0:
+                    metrics['inference/prefill_tflops_per_gpu'] = float(
+                        step_flops_info['prefill_flops'] / 1e12 / prefill_time
+                    )
+                if decode_time > 0:
+                    metrics['inference/decode_tflops_per_gpu'] = float(
+                        step_flops_info['decode_flops'] / 1e12 / decode_time
+                    )
 
             # Add KV stats with inference/ prefix
             # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
