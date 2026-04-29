@@ -10,6 +10,7 @@ import inspect
 import logging
 import math
 import operator
+import os
 import queue
 import socket
 import sys
@@ -2359,6 +2360,26 @@ def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = F
                 f"lifetime cnt: {cnt + 1}"
             )
 
+    def _fatal_async_exit(name: str, e: BaseException) -> None:
+        """Log an async-task fatal error, then HARD-kill the process.
+
+        `sys.exit(1)` raised from inside an asyncio task only marks the task
+        as failed -- the surrounding event loop captures `SystemExit` as a
+        regular exception and keeps running.  In a distributed RL job this
+        means rank 0 (which is the only rank making rollout HTTP calls)
+        silently rots while every other rank keeps stepping inference until
+        it hangs on the next collective.  Use os._exit so the process dies
+        immediately, propagating the failure to Slurm and the other ranks.
+        """
+        logger.error(f"Fatal exception in async function {name}: {e}")
+        traceback.print_exc()
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(1)
+
     def _decorate(fn: Callable):
         if asyncio.iscoroutinefunction(fn):
 
@@ -2369,9 +2390,7 @@ def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = F
                 try:
                     return await fn(*args, **kwargs)
                 except Exception as e:
-                    logger.error(f"Exception in async function {fn.__name__}: {e}")
-                    traceback.print_exc()
-                    sys.exit(1)
+                    _fatal_async_exit(fn.__name__, e)
                 finally:
                     if verbose:
                         _log_verbose(fn.__qualname__, start)
@@ -2387,9 +2406,7 @@ def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = F
                     async for item in agen:
                         yield item
                 except Exception as e:
-                    logger.error(f"Exception in async generator {fn.__name__}: {e}")
-                    traceback.print_exc()
-                    sys.exit(1)
+                    _fatal_async_exit(fn.__name__, e)
                 finally:
                     if verbose:
                         _log_verbose(fn.__qualname__, start)
