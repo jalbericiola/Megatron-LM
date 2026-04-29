@@ -1924,18 +1924,48 @@ def training_log(
             'forward-backward-send-forward-backward-recv',
         ])
     # Add timers from RL loop if needed.
+    #
+    # These names must match the strings passed to nvtx_range(name, time=True)
+    # in megatron/rl/* (those are the only mechanism that actually registers
+    # a Megatron timer for an RL phase on this branch).  Names not registered
+    # are silently dropped by timers.log(), so keep this in sync with rl_utils.
     if args.perform_rl_step:
-        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
-                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
-                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
-                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
-                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
-                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
-                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
-                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference',
-                              # Per-step prefill/decode breakdown accumulated by the
-                              # dynamic inference engine (see add_inference_prefill/decode_flops).
-                              'infer-prefill', 'infer-decode'])
+        timers_to_log.extend([
+            # Top-level RL phases.
+            'rollout-collection',
+            'prepare-data-for-update',
+            # Rollout collection breakdown.
+            'inference-setup',
+            'collect-rollouts',
+            'sync-rollouts',
+            'suspend-engine',
+            # Optimizer offload/restore.
+            'offload-optimizer-state-and-grad-buffers-before-inference',
+            'offload-optimizer-state-and-grad-buffers-during-inference',
+            'onload-optimizer-state-and-grad-buffers-after-inference',
+            'restore-optimizer-state-and-grad-buffers-after-inference',
+            # Weight prefetching (separate inference model).
+            'prefetch-inference-model-weights-to-gpu',
+            'prefetch-inference-model-weights-to-cpu',
+            # Data preparation.
+            'compute-group-stats',
+            'prepare_trajectories',
+            'get_ltor_masks_and_position_ids',
+            'create_dataloader',
+            'sequence_packing',
+            'pack_sequences',
+            'pack_logprobs',
+            'regather_trajectories',
+            'align_inference_logprobs',
+            # Logprobs computation.
+            'compute_logprobs',
+            'compute_old_logprobs',
+            'compute_ref_logprobs',
+            # Per-step prefill/decode breakdown accumulated by the
+            # dynamic inference engine (see add_inference_prefill/decode_flops).
+            'infer-prefill',
+            'infer-decode',
+        ])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
