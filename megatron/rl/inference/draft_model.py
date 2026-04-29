@@ -9,6 +9,8 @@ ever needed.
 
 from __future__ import annotations
 
+import inspect
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -21,6 +23,57 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
 
+@lru_cache(maxsize=None)
+def _layer_forward_param_names(layer_cls: type) -> frozenset[str]:
+    """Names of kwargs the layer's ``forward`` accepts.
+
+    Cached per class because ``inspect.signature`` is slow.  Returns a sentinel
+    ``frozenset({'**'})`` when the layer accepts arbitrary kwargs (``**kwargs``)
+    so the caller can pass everything.
+    """
+    sig = inspect.signature(layer_cls.forward)
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if has_var_keyword:
+        return frozenset({"**"})
+    return frozenset(
+        p.name for p in sig.parameters.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
+
+
+def _call_layer(layer: nn.Module, kwargs: dict) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Call one layer of a possibly-heterogeneous decoder stack.
+
+    Hybrid Mamba/Attention/MoE models put different layer classes in
+    ``decoder.layers``:
+
+    * ``TransformerBlock`` layer accepts ``context``, ``context_mask``,
+      ``rotary_pos_cos``, ``rotary_pos_sin``, ``rotary_pos_cos_sin``,
+      ``sequence_len_offset``, ``padding_mask`` and returns
+      ``(hidden_states, context)``.
+    * ``MambaLayer`` accepts only a small subset (``attention_mask``,
+      ``inference_context``, ``rotary_pos_emb``, ``packed_seq_params``)
+      and returns ``hidden_states`` (a Tensor, not a tuple).
+
+    This helper:
+      1. Drops kwargs the layer doesn't accept (so MambaLayer doesn't
+         TypeError on ``context``).
+      2. Normalises the return shape to ``(hidden_states, context_or_None)``.
+    """
+    accepted = _layer_forward_param_names(type(layer))
+    if "**" in accepted:
+        filtered = kwargs
+    else:
+        filtered = {k: v for k, v in kwargs.items() if k in accepted}
+    out = layer(**filtered)
+    if isinstance(out, tuple):
+        # TransformerBlock layer: (hidden_states, context)
+        return out[0], out[1] if len(out) > 1 else None
+    return out, None
+
+
 # Attributes the inference engine looks up via get_attr_wrapped_model().  Any
 # new attribute that the engine starts requiring must be added here so the
 # draft model continues to look like a GPTModel from the engine's perspective.
@@ -30,6 +83,13 @@ _FORWARDED_SCALAR_ATTRS = (
     "xattn_needed",
     "pg_collection",
     "share_embeddings_and_output_weights",
+    # Required by megatron.core.inference.text_generation_controllers.
+    # text_generation_controller.TextGenerationController.__init__:
+    "vocab_size",
+    # Various engine paths look these up too; harmless to forward
+    # `if hasattr(full_model, ...)` (the constructor guards each).
+    "padded_vocab_size",
+    "seq_length",
 )
 
 
@@ -152,11 +212,17 @@ class EarlyExitGPTModel(nn.Module):
         # inference.  Trade-off: any inference-specific TransformerBlock
         # bookkeeping (e.g. CUDA-graph capture) is also skipped.  Revisit if
         # CUDA graphs become required for the draft path.
+        #
+        # In hybrid Mamba/Attention/MoE stacks the layers in
+        # ``decoder.layers`` are heterogeneous and accept disjoint kwarg
+        # sets; ``_call_layer()`` filters per-layer so we don't
+        # ``TypeError`` on layers that don't accept ``context`` /
+        # ``rotary_pos_cos`` / etc.
         hidden_states = decoder_input_tensor
         context = None
         extra = extra_block_kwargs or {}
         for layer in fm.decoder.layers[: self.exit_layer]:
-            hidden_states, context = layer(
+            kwargs = dict(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 context=context,
@@ -171,6 +237,7 @@ class EarlyExitGPTModel(nn.Module):
                 padding_mask=padding_mask,
                 **extra,
             )
+            hidden_states, context = _call_layer(layer, kwargs)
 
         # Final layer norm — shared with the full model.
         if fm.decoder.final_layernorm is not None:
