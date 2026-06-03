@@ -493,6 +493,9 @@ def pack_inference_logprobs(
     packing_info: PackingInfo,
     generation_masks: torch.Tensor,
     bin_size: int,
+    old_logprobs: Optional[torch.Tensor] = None,
+    trajs: Optional[torch.Tensor] = None,
+    eod_token: Optional[int] = None,
 ) -> torch.Tensor:
     """Pack inference logprobs into bins aligned with packed sequences.
 
@@ -501,16 +504,30 @@ def pack_inference_logprobs(
         packing_info: PackingInfo object containing bin assignments and sequence positions
         generation_masks: Tensor indicating which tokens were generated
         bin_size: Size of each bin
+        old_logprobs: Packed policy logprobs [num_bins, bin_size - 1]. When provided, the
+            output is initialized from it so positions we do not overwrite (the train-side
+            EOD, prompt tokens, padding) keep the policy logprob -> IS weight == 1 there,
+            mirroring align_unpacked_inference_logprobs. Falls back to zeros if omitted.
+        trajs: Packed-source (global) token ids [num_seqs, seq_len], used only to detect
+            whether a trajectory ended in a generated EOD (which inference does not score).
+        eod_token: EOD token id, paired with ``trajs`` for the EOD detection above.
 
     Returns:
         Packed inference logprobs tensor of shape [num_bins, bin_size - 1]
     """
     num_bins = len(packing_info.bin_seq_indices)
 
-    # Create packed inference logprobs tensor (logprobs are 1 token shorter than sequences)
-    packed_inference_logprobs = torch.zeros(
-        (num_bins, bin_size - 1), dtype=torch.float32, device='cpu'
-    )
+    # Initialize from old_logprobs so untouched positions (EOD / prompt / pad) keep the
+    # policy logprob and therefore yield IS weight exp(old - old) == 1, matching the
+    # unpacked aligner. Only fall back to zeros when old_logprobs is missing/mis-shaped.
+    if old_logprobs is not None and tuple(old_logprobs.shape) == (num_bins, bin_size - 1):
+        packed_inference_logprobs = (
+            old_logprobs.detach().to(dtype=torch.float32, device='cpu').clone()
+        )
+    else:
+        packed_inference_logprobs = torch.zeros(
+            (num_bins, bin_size - 1), dtype=torch.float32, device='cpu'
+        )
 
     # Create mapping from global sequence index to local bin index
     # This is needed because seq_to_bin_idx uses global bin indices,
@@ -536,6 +553,13 @@ def pack_inference_logprobs(
         gen_mask = generation_masks[seq_idx]
         # Find first generation token (accounting for the shift in get_logprobs)
         first_gen_idx = gen_mask.int().argmax().item() - 1
+        if first_gen_idx < 0:
+            # All-False generation mask (a retained turn that generated nothing) or
+            # generation starting at token 0. Nothing to align; leave at old_logprobs
+            # (mirrors align_unpacked_inference_logprobs' `if first_gen_idx < 0: continue`).
+            # Also avoids a negative pack_start writing into the previous trajectory /
+            # producing an empty destination slice (a hard RuntimeError).
+            continue
 
         # Get the inference logprobs for this sequence
         if isinstance(inference_logprobs[seq_idx], torch.Tensor):
@@ -543,11 +567,27 @@ def pack_inference_logprobs(
         else:
             continue  # Skip if no inference logprobs
 
+        # Number of inference logprobs the engine actually scored: one per generated token,
+        # minus the train-side-appended EOD that inference does not return (mirrors the raw
+        # len used by align_unpacked_inference_logprobs). seq_inf_logprobs is zero-padded to
+        # seq_length, so bounding the write to this count (instead of the full trajectory
+        # span) avoids reading the zero tail and overwriting the EOD / post-generation
+        # positions with a spurious 0.0 -> exp(old - 0) IS weight.
+        gen_count = int(gen_mask.int().sum().item())
+        has_eod = (
+            eod_token is not None
+            and trajs is not None
+            and bool(((trajs[seq_idx].long() * gen_mask.long()) == eod_token).any().item())
+        )
+        raw_len = gen_count - (1 if has_eod else 0)
+        if raw_len <= 0:
+            continue
+
         # Calculate where to place inference logprobs in the packed tensor
         # The inference logprobs start at the first generated token position
         pack_start = seq_start + first_gen_idx
         pack_end = min(
-            pack_start + len(seq_inf_logprobs), seq_start + packing_info.seq_lengths[seq_idx] - 1
+            pack_start + raw_len, seq_start + packing_info.seq_lengths[seq_idx] - 1
         )
         actual_len = pack_end - pack_start
 

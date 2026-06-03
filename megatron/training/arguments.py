@@ -561,6 +561,16 @@ def validate_args(args, defaults={}):
         if args.rl_use_sequence_packing:
             assert args.micro_batch_size == 1, \
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
+            assert args.context_parallel_size == 1, \
+                "Sequence packing does not support context parallelism (--context-parallel-size > 1): " \
+                "the packed cu_seqlens and the CP token partition are not per-subsequence aligned " \
+                "(the CP path whole-bin-zigzags a packed bin while still passing per-subsequence " \
+                "cu_seqlens), which silently mis-trains. Disable one of the two."
+            assert args.calculate_per_token_loss, \
+                "Sequence packing requires --calculate-per-token-loss: otherwise the loss is normalized " \
+                "per bin (and averaged over the padded empty bins added for DP balance), which " \
+                "non-uniformly reweights trajectories by how densely their bin happened to be packed " \
+                "and dilutes the per-step gradient."
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '

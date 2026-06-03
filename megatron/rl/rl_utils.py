@@ -1717,6 +1717,32 @@ def prepare_data_for_update(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
 
+        # DP availability sync for inference logprobs (sequence-packing path).
+        #
+        # pack_all_trajectories() all-gathers inference_logprobs across the DP group, but
+        # only on ranks where inference_logprobs is not None. Whether logprobs are present
+        # is decided per-rank from local rollouts (prepare_trajectories, ~line 1574), so in
+        # multi-env / mixed-engine setups one rank can hold None while another holds a tensor
+        # -> the collective all_gather runs on some ranks and not others -> NCCL deadlock.
+        # Make the decision collective: if ANY rank has logprobs, every rank materializes a
+        # zero [N, seq_length] tensor (matching _pad_nonnull_with_zeros' shape/dtype) so the
+        # gather is uniform. The zero rows belong to rollouts that returned no logprobs; they
+        # are only consumed for logging stats (is-correction is disabled for such rows via the
+        # generation/loss mask) so the zeros never enter the training IS weights.
+        if sequence_packing and mpu.get_data_parallel_world_size() > 1:
+            have_lp = torch.tensor(
+                [1 if inference_logprobs is not None else 0],
+                device='cuda', dtype=torch.long,
+            )
+            torch.distributed.all_reduce(
+                have_lp, op=torch.distributed.ReduceOp.MAX,
+                group=mpu.get_data_parallel_group(),
+            )
+            if have_lp.item() > 0 and inference_logprobs is None:
+                inference_logprobs = torch.zeros(
+                    (trajs.shape[0], args.seq_length), dtype=torch.float, device='cpu',
+                )
+
         # DP-split divergence fix for multi-turn rollouts.
         #
         # The DP split above slices `rollouts` evenly across DP ranks, but multi-turn
@@ -1966,6 +1992,9 @@ def prepare_data_for_update(
                         packing_info=packing_context.packing_info,
                         generation_masks=packing_context.original_generation_masks,
                         bin_size=args.seq_length,
+                        old_logprobs=old_logprobs,
+                        trajs=packing_context.original_trajs,
+                        eod_token=tokenizer.eod,
                     )
 
                     # Compute statistics for logging using packed data
