@@ -134,6 +134,37 @@ def flex_mask_mod(layout: SharedPrefixLayout) -> Callable:
     return mask_mod
 
 
+def build_packed_group(prompt_ids, completion_ids_list, device=None):
+    """Pack one GRPO group ``[P, C_1, ..., C_G]`` for a single shared-prefix forward.
+
+    Args:
+        prompt_ids: 1-D LongTensor, the shared prompt P.
+        completion_ids_list: list of 1-D LongTensors, the per-rollout completions C_i.
+
+    Returns:
+        packed_tokens: ``[1, total_len]`` token ids.
+        layout: the :class:`SharedPrefixLayout` (carries ``position_ids`` to feed RoPE and
+            the fan-out indices for logprob extraction).
+        attn_mask: ``[1, 1, total_len, total_len]`` bool tree mask in MEGATRON convention
+            (``True`` == masked out), i.e. ``~allowed`` -- pass straight as the model's
+            ``attention_mask`` on the dense (non-THD) attention path.
+
+    IMPORTANT: the model must apply RoPE using ``layout.position_ids`` (prefix-continued:
+    P -> 0..Lp-1, each C_i -> Lp..Lp+Lc_i-1). Standard Megatron RoPE derives positions from
+    the packed sequence length (``get_rotary_seq_len``) and IGNORES ``position_ids``, which
+    would give C_i its packed index instead of Lp+t and break equivalence -- making RoPE
+    position-aware is the core Milestone-1b integration task.
+    """
+    device = device if device is not None else prompt_ids.device
+    prompt = prompt_ids.to(device)
+    comps = [c.to(device) for c in completion_ids_list]
+    layout = build_shared_prefix_layout(prompt.numel(), [c.numel() for c in comps], device)
+    packed_tokens = torch.cat([prompt] + comps).unsqueeze(0)              # [1, total]
+    allowed = dense_tree_mask(layout, device)                            # [T, T] True==allowed
+    attn_mask = (~allowed).unsqueeze(0).unsqueeze(0)                     # [1,1,T,T] True==masked
+    return packed_tokens, layout, attn_mask
+
+
 def extract_completion_logprobs(
     logits: torch.Tensor, packed_tokens: torch.Tensor, layout: SharedPrefixLayout
 ) -> torch.Tensor:
