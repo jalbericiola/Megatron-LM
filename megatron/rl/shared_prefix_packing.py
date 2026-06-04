@@ -167,6 +167,76 @@ def build_packed_group(prompt_ids, completion_ids_list, device=None):
     return packed_tokens, layout, attn_mask
 
 
+def plan_shared_prefix_bins(groups, bin_size, max_sequences_per_bin=16):
+    """Group-aware routing PLAN for shared-prefix packing (model-agnostic, lengths only).
+
+    Decides which GRPO groups become a single shared ``[P, C_1, ..., C_G]`` bin vs fall back
+    to today's block-diagonal ``[P + C_i]`` packing (when the group doesn't fit a bin), and
+    reports the speedup-observability metrics. This is the data-side routing that the live
+    forward integration consumes; it is intentionally torch-free arithmetic so the win is
+    measurable (and loggable) before the kernel exists.
+
+    Args:
+        groups: list of ``(prefix_len, [completion_len, ...])`` -- one per GRPO prompt; the
+            completions in a group share the prompt P.
+        bin_size: per-bin token budget (== args.seq_length).
+        max_sequences_per_bin: cap on completions packed behind one shared prefix.
+
+    Returns:
+        (plan, metrics):
+          plan: list of bins. A ``shared`` bin = the whole group as ``[P, C_1..C_G]``; a
+            ``blockdiag`` bin = one fallback ``[P + C_i]``.
+          metrics: ``shared_prefix/*`` dict (baseline vs effective tokens, dedup fraction,
+            predicted linear speedup, prompt fraction f, coverage, group stats).
+    """
+    plan = []
+    baseline_tokens = effective_tokens = 0
+    total_unique_tokens = shared_unique_tokens = 0
+    shared_groups = 0
+    f_sum = 0.0
+    G_sum = Lp_sum = 0
+    n_groups = len(groups)
+    for gi, (Lp, Lcs) in enumerate(groups):
+        Lp = int(Lp)
+        Lcs = [int(x) for x in Lcs]
+        G = len(Lcs)
+        sumLc = sum(Lcs)
+        grp_baseline = G * Lp + sumLc          # duplicated [P+C_i] token count
+        grp_unique = Lp + sumLc                # tokens with the prompt stored once
+        baseline_tokens += grp_baseline
+        total_unique_tokens += grp_unique
+        Lp_sum += Lp
+        G_sum += G
+        mean_Lc = (sumLc / G) if G else 0
+        f_sum += (Lp / (Lp + mean_Lc)) if (Lp + mean_Lc) > 0 else 0.0
+        fits = (Lp + sumLc) <= bin_size and 0 < G <= max_sequences_per_bin
+        if fits:
+            plan.append({"kind": "shared", "group_idx": gi, "prefix_len": Lp,
+                         "completion_lens": list(Lcs)})
+            effective_tokens += grp_unique
+            shared_groups += 1
+            shared_unique_tokens += grp_unique
+        else:
+            for Lc in Lcs:
+                plan.append({"kind": "blockdiag", "group_idx": gi, "prefix_len": Lp,
+                             "completion_lens": [Lc]})
+            effective_tokens += grp_baseline   # no dedup for an oversized/fallback group
+    metrics = {
+        "shared_prefix/baseline_tokens": baseline_tokens,
+        "shared_prefix/effective_tokens": effective_tokens,
+        "shared_prefix/tokens_saved": baseline_tokens - effective_tokens,
+        "shared_prefix/dedup_fraction": (1.0 - effective_tokens / baseline_tokens) if baseline_tokens else 0.0,
+        "shared_prefix/predicted_linear_speedup": (baseline_tokens / effective_tokens) if effective_tokens else 1.0,
+        "shared_prefix/prompt_fraction_f": (f_sum / n_groups) if n_groups else 0.0,
+        "shared_prefix/coverage_groups": (shared_groups / n_groups) if n_groups else 0.0,
+        "shared_prefix/coverage_tokens": (shared_unique_tokens / total_unique_tokens) if total_unique_tokens else 0.0,
+        "shared_prefix/num_groups": n_groups,
+        "shared_prefix/avg_group_size": (G_sum / n_groups) if n_groups else 0.0,
+        "shared_prefix/avg_prefix_len": (Lp_sum / n_groups) if n_groups else 0.0,
+    }
+    return plan, metrics
+
+
 def positionwise_rotary_emb(rotary_module, position_ids: torch.Tensor) -> torch.Tensor:
     """Per-token RoPE embedding for ARBITRARY (e.g. prefix-continued) positions.
 
