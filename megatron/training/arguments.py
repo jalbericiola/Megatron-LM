@@ -571,6 +571,15 @@ def validate_args(args, defaults={}):
                 "per bin (and averaged over the padded empty bins added for DP balance), which " \
                 "non-uniformly reweights trajectories by how densely their bin happened to be packed " \
                 "and dilutes the per-step gradient."
+        if getattr(args, 'rl_sequence_packing_shared_prefix', False):
+            assert args.rl_use_sequence_packing, \
+                "--rl-sequence-packing-shared-prefix requires --rl-use-sequence-packing."
+            raise NotImplementedError(
+                "--rl-sequence-packing-shared-prefix is Milestone 1 only: the packing-layout "
+                "helpers and the numerical oracle exist, but the shared-prefix attention forward "
+                "is not yet wired into get_logprobs. Validate the oracle on GPU first "
+                "(python -m test.test_shared_prefix_equivalence), then complete Milestone 1b "
+                "before enabling this flag. See docs/sequence_packing_prefix_sharing.md.")
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '
@@ -2478,6 +2487,16 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--rl-sequence-packing-shared-prefix', action=argparse.BooleanOptionalAction,
+                       type=bool, default=False,
+                       help='[EXPERIMENTAL, Milestone 1 / not yet wired into the training forward] '
+                            'Share the common GRPO prompt (and, generally, common prefixes) once per '
+                            'group instead of duplicating it per completion (see '
+                            'docs/sequence_packing_prefix_sharing.md). The packing-layout helpers '
+                            '(megatron/rl/shared_prefix_packing.py) and the numerical oracle '
+                            '(mrl_extras/test/test_shared_prefix_equivalence.py) exist; the '
+                            'shared-prefix attention forward is NOT yet integrated, so enabling this '
+                            'flag currently raises until that oracle passes on GPU (Milestone 1b).')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
                        help='If set, do not toggle CUDA graphs on/off between inference and training phases.')

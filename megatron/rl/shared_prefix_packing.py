@@ -1,0 +1,154 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Pure-tensor layout helpers for shared-prefix ("tree") packing of a GRPO group.
+
+Milestone 1 (oracle stage) of the shared-prefix-packing optimization described in
+``docs/sequence_packing_prefix_sharing.md``. In a GRPO group of size G the prompt P is
+shared by all G completions C_i; today the packer duplicates P into G separate
+``[P + C_i]`` blocks. These helpers instead describe a single ``[P, C_1, ..., C_G]``
+layout plus:
+
+  * prefix-continued ``position_ids`` (P -> 0..Lp-1, each C_i -> Lp..Lp+Lc_i-1),
+  * a tree attention mask (FlexAttention ``mask_mod`` + a dense boolean fallback) where
+    each C_i attends to all of P and causally within itself, and never to a sibling C_j,
+  * the fanned-out ``(prev_position, target_position)`` index pairs that make the shared
+    forward's logprob extraction equivalent to the contiguous ``[P + C_i]`` shift -- in
+    particular each branch's FIRST completion token is scored from the shared prefix's
+    last-position logit (the same logit for all branches), not from the preceding branch.
+
+NOTHING HERE IS WIRED INTO THE LIVE TRAINING FORWARD. It is exercised by
+``mrl_extras/test/test_shared_prefix_equivalence.py`` (the numerical oracle), which must
+pass on GPU before the forward integration (Milestone 1b). Keeping these as pure functions
+(torch + stdlib only, no megatron-core/TE imports) lets the oracle run standalone.
+"""
+
+from dataclasses import dataclass, field
+from typing import Callable, List
+
+import torch
+
+
+@dataclass
+class SharedPrefixLayout:
+    """Describes one ``[P, C_1, ..., C_G]`` shared-prefix bin (single group).
+
+    All index tensors are 1-D and live on ``device``. ``comp_*`` tensors have one entry
+    per completion token, concatenated branch-by-branch in order C_0, C_1, ... .
+    """
+
+    prefix_len: int
+    completion_lens: List[int]
+    total_len: int
+    branch_starts: List[int]          # absolute packed start offset of each completion
+    position_ids: torch.Tensor        # [total_len]  long; prefix-continued positions
+    segment_ids: torch.Tensor         # [total_len]  long; 0 = prefix, i+1 = completion i
+    comp_positions: torch.Tensor      # [n_comp_tok] packed index of each completion token
+    prev_positions: torch.Tensor      # [n_comp_tok] packed index whose logit predicts it
+    branch_of_token: torch.Tensor     # [n_comp_tok] which completion each token belongs to
+    n_completion_tokens: int = field(default=0)
+
+
+def build_shared_prefix_layout(
+    prefix_len: int, completion_lens: List[int], device="cpu"
+) -> SharedPrefixLayout:
+    """Build the layout for a single group from its prefix length and completion lengths.
+
+    The crux is the logprob fan-out: for the first token of each completion (local t == 0)
+    the predicting position is the prefix's last token ``Lp - 1`` -- the same shared logit
+    for every branch. For t >= 1 it is the immediately preceding (same-branch) token.
+    """
+    Lp = int(prefix_len)
+    Lc = [int(x) for x in completion_lens]
+    assert Lp >= 1, "prefix must be non-empty (need a last-prefix logit to score C_i[0])"
+
+    positions: List[int] = list(range(Lp))   # prefix: 0..Lp-1
+    segments: List[int] = [0] * Lp            # prefix segment id = 0
+    branch_starts: List[int] = []
+    comp_positions: List[int] = []
+    prev_positions: List[int] = []
+    branch_of_token: List[int] = []
+
+    cursor = Lp
+    for i, lc in enumerate(Lc):
+        branch_starts.append(cursor)
+        positions.extend(range(Lp, Lp + lc))  # completion continues from Lp
+        segments.extend([i + 1] * lc)
+        for t in range(lc):
+            p = cursor + t
+            comp_positions.append(p)
+            prev_positions.append(Lp - 1 if t == 0 else p - 1)
+            branch_of_token.append(i)
+        cursor += lc
+
+    total = cursor
+
+    def _t(xs):
+        return torch.tensor(xs, dtype=torch.long, device=device)
+
+    return SharedPrefixLayout(
+        prefix_len=Lp,
+        completion_lens=Lc,
+        total_len=total,
+        branch_starts=branch_starts,
+        position_ids=_t(positions),
+        segment_ids=_t(segments),
+        comp_positions=_t(comp_positions),
+        prev_positions=_t(prev_positions),
+        branch_of_token=_t(branch_of_token),
+        n_completion_tokens=len(comp_positions),
+    )
+
+
+def dense_tree_mask(layout: SharedPrefixLayout, device=None) -> torch.Tensor:
+    """Return a ``[total_len, total_len]`` boolean ``allowed[q, k]`` mask.
+
+    ``allowed`` iff k is causally before q (by packed index) AND (k is in the prefix OR k
+    is in the same completion branch as q). This is the reference (dense-SDPA) realization
+    of the tree mask; the kernel realization is ``flex_mask_mod`` below.
+    """
+    device = device if device is not None else layout.segment_ids.device
+    seg = layout.segment_ids.to(device)
+    n = layout.total_len
+    idx = torch.arange(n, device=device)
+    causal = idx[None, :] <= idx[:, None]                  # [q, k]: k <= q
+    k_is_prefix = seg[None, :] == 0                        # [1, k]
+    same_branch = seg[None, :] == seg[:, None]             # [q, k]
+    return causal & (k_is_prefix | same_branch)
+
+
+def flex_mask_mod(layout: SharedPrefixLayout) -> Callable:
+    """Return a FlexAttention ``mask_mod(b, h, q_idx, kv_idx) -> bool`` for this layout.
+
+    Captures ``segment_ids`` by closure; index it on the same device the kernel runs on.
+    Use with ``torch.nn.attention.flex_attention.create_block_mask``.
+    """
+    seg = layout.segment_ids
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        s = seg.to(q_idx.device)
+        causal = kv_idx <= q_idx
+        k_is_prefix = s[kv_idx] == 0
+        same_branch = s[kv_idx] == s[q_idx]
+        return causal & (k_is_prefix | same_branch)
+
+    return mask_mod
+
+
+def extract_completion_logprobs(
+    logits: torch.Tensor, packed_tokens: torch.Tensor, layout: SharedPrefixLayout
+) -> torch.Tensor:
+    """Gather per-completion-token logprobs from a shared-prefix forward.
+
+    Args:
+        logits: ``[total_len, vocab]`` (single packed sequence, batch dim already removed).
+        packed_tokens: ``[total_len]`` token ids of the packed ``[P, C_1, ..., C_G]`` seq.
+        layout: the layout used to build the packed sequence.
+
+    Returns:
+        ``[n_completion_tokens]`` logprobs, ordered branch-by-branch (see
+        ``layout.branch_of_token``). Each branch's first token is scored from the shared
+        ``logits[Lp - 1]``; the rest from the preceding same-branch position.
+    """
+    logp = torch.log_softmax(logits[layout.prev_positions], dim=-1)   # [n_tok, vocab]
+    targets = packed_tokens[layout.comp_positions].unsqueeze(-1)      # [n_tok, 1]
+    return logp.gather(-1, targets).squeeze(-1)                        # [n_tok]
