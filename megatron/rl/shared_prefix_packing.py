@@ -22,6 +22,8 @@ pass on GPU before the forward integration (Milestone 1b). Keeping these as pure
 (torch + stdlib only, no megatron-core/TE imports) lets the oracle run standalone.
 """
 
+import contextlib
+import types
 from dataclasses import dataclass, field
 from typing import Callable, List
 
@@ -163,6 +165,67 @@ def build_packed_group(prompt_ids, completion_ids_list, device=None):
     allowed = dense_tree_mask(layout, device)                            # [T, T] True==allowed
     attn_mask = (~allowed).unsqueeze(0).unsqueeze(0)                     # [1,1,T,T] True==masked
     return packed_tokens, layout, attn_mask
+
+
+def positionwise_rotary_emb(rotary_module, position_ids: torch.Tensor) -> torch.Tensor:
+    """Per-token RoPE embedding for ARBITRARY (e.g. prefix-continued) positions.
+
+    Megatron's ``RotaryEmbedding`` indexes the rotary table by absolute sequence position
+    (``get_emb(max_seq_len)`` -> ``[max_seq_len, 1, 1, dim]``, applied positionally by the
+    decoder). For a shared-prefix bin ``[P, C_1, ..., C_G]`` we instead want token i to use
+    the rotary for ``position_ids[i]`` (P -> 0..Lp-1, each C_i -> Lp..). This computes the
+    table up to ``max(position_ids)+1`` and gathers, returning the same ``[T, 1, 1, dim]``
+    shape the decoder expects.
+    """
+    max_pos = int(position_ids.max().item()) + 1
+    emb = rotary_module.get_emb(max_pos)                       # [max_pos, 1, 1, dim]
+    return emb.index_select(0, position_ids.to(emb.device))   # [T, 1, 1, dim]
+
+
+def _find_rotary_module(model):
+    """Locate the ``rotary_pos_emb`` module, unwrapping Float16Module/DDP wrappers."""
+    m = model
+    for _ in range(5):
+        rot = getattr(m, 'rotary_pos_emb', None)
+        if rot is not None:
+            return rot
+        m = getattr(m, 'module', None)
+        if m is None:
+            break
+    raise AttributeError("model has no rotary_pos_emb (is RoPE enabled?)")
+
+
+@contextlib.contextmanager
+def rotary_position_aware(model, position_ids: torch.Tensor):
+    """Temporarily make the model's RoPE honor ``position_ids`` instead of packed-index.
+
+    Standard Megatron RoPE derives positions from the sequence length and ignores the
+    ``position_ids`` argument, which is wrong for a shared-prefix bin (every branch after
+    the first would be mis-phased -- see the oracle's ``[rope]`` check). This context
+    manager monkeypatches the rotary module's ``forward`` to return
+    ``positionwise_rotary_emb(..., position_ids)`` for the duration of one forward, then
+    restores the original. Intended for the shared-prefix forward (Milestone 1b); a
+    production path would thread positions through instead of patching.
+    """
+    rot = _find_rotary_module(model)
+    pos = position_ids
+
+    def _patched(self, max_seq_len, offset=0, packed_seq=False, cp_group=None):
+        return positionwise_rotary_emb(self, pos)
+
+    had_own = 'forward' in rot.__dict__
+    saved = rot.__dict__.get('forward', None)
+    object.__setattr__(rot, 'forward', types.MethodType(_patched, rot))
+    try:
+        yield
+    finally:
+        if had_own:
+            object.__setattr__(rot, 'forward', saved)
+        else:
+            try:
+                object.__delattr__(rot, 'forward')
+            except AttributeError:
+                pass
 
 
 def extract_completion_logprobs(
