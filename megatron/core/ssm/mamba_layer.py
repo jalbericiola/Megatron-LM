@@ -124,6 +124,7 @@ class MambaLayer(GraphableMegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        shared_prefix_context=None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -152,9 +153,27 @@ class MambaLayer(GraphableMegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
 
-        mixer_out_with_bias = self.mixer(
-            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
-        )
+        if shared_prefix_context is not None and shared_prefix_context.active:
+            # Shared-prefix two-pass: PASS 1 scans the prefix once and captures this layer's conv
+            # + SSM end-state; PASS 2 forks each completion from that captured state. Equivalent
+            # (fwd + bwd) to the dense [P + C_i] mixer forward (see MambaMixer.fork_segment).
+            if shared_prefix_context.capturing:
+                out, out_bias, conv_ctx, ssm_final = self.mixer.fork_segment(
+                    hidden_states, capture=True
+                )
+                shared_prefix_context.capture_mamba(self.layer_number, conv_ctx, ssm_final)
+            else:  # inject
+                conv_ctx, ssm_final = shared_prefix_context.mamba_state(self.layer_number)
+                out, out_bias, _, _ = self.mixer.fork_segment(
+                    hidden_states, conv_ctx=conv_ctx, ssm_init=ssm_final
+                )
+            mixer_out_with_bias = (out, out_bias)
+        else:
+            mixer_out_with_bias = self.mixer(
+                hidden_states,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
 
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mamba_bda(
