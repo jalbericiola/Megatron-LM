@@ -21,7 +21,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.models.hybrid.shared_prefix import CAPTURE, INJECT, SharedPrefixContext
+from megatron.core.models.hybrid.shared_prefix import SharedPrefixContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -363,38 +363,71 @@ class HybridStack(MegatronModule):
 
         return hidden_states
 
-    def _shared_prefix_layer_loop(self, hidden_states, ctx, attention_mask, rotary_pos_emb):
-        """Run the stack once under a SharedPrefixContext (PASS 1 capture or PASS 2 inject).
+    def forward_shared_prefix(
+        self,
+        hidden_states: Tensor,
+        prefix_len: int,
+        completion_lens,
+        attention_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+    ):
+        """Shared-prefix ("tree") packed forward for a GRPO group.
 
-        Mamba layers route through ``MambaMixer.fork_segment`` (capture/inject) via ``ctx``;
-        stateless layers (MLP / MoE expert) run normally. Attention is the remaining piece
-        (Phase B-attention): a TransformerLayer here must cross-attend PASS-2 completion queries
-        to the cached PASS-1 prefix KV, which is not yet wired -- so we fail loudly rather than
-        silently produce a wrong (prefix-blind) result.
+        Runs a SINGLE forward over the packed sequence ``[P, C_1, ..., C_G]`` (the shared prompt P
+        stored once). Equivalent (fwd + bwd) to running the stack on the G duplicated ``[P + C_i]``
+        sequences, but without re-computing P for every completion. The shared prompt receives the
+        summed gradient of all its completions (autograd, via the per-layer state/KV that fans out
+        to every branch).
+
+        Layer handling:
+          * MambaLayer: forks internally -- scans P once, then each C_i from P's captured conv +
+            SSM end-state, reassembling the packed output (a mask cannot isolate branches in a
+            sequential scan).
+          * Attention TransformerLayer: runs normally on the packed sequence with the TREE mask
+            (each token attends causally to the prefix + its own branch) and position-aware RoPE
+            (``rotary_pos_emb`` built from the layout's prefix-continued positions). Mask + RoPE
+            express the sharing; no attention-module surgery.
+          * MLP / MoE TransformerLayer (IdentityOp self-attention): stateless, runs normally.
+          * GatedDeltaNet / other recurrence: not yet wired (own state fork needed).
+
+        Args:
+            hidden_states: (total_len, 1, D) packed embedded ``[P, C_1, ..., C_G]``.
+            prefix_len: Lp (length of the shared prefix P).
+            completion_lens: list of per-completion lengths [Lc_1, ..., Lc_G].
+            attention_mask: the tree mask (Megatron convention, True == masked), e.g.
+                ``shared_prefix_packing.build_packed_group``'s ``attn_mask``.
+            rotary_pos_emb: position-aware RoPE built from the layout's ``position_ids``.
+
+        Returns:
+            (total_len, 1, D) packed output (post final-norm); slice per the layout to recover each
+            completion's hidden states / logits.
         """
+        ctx = SharedPrefixContext(prefix_len, completion_lens)
+        assert hidden_states.shape[0] == ctx.total_len, (
+            f"packed length {hidden_states.shape[0]} != Lp+sum(Lc) {ctx.total_len}"
+        )
         for layer in self.layers:
             if isinstance(layer, MambaLayer):
-                # stateful: fork conv + SSM state from the captured prefix
                 hidden_states = layer(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     shared_prefix_context=ctx,
                 )
             elif isinstance(layer, TransformerLayer):
-                # In the hybrid stack the "-"/"E" (MLP / MoE) layers are TransformerLayers whose
-                # self-attention is an IdentityOp -- those are stateless and run normally. A layer
-                # with REAL self-attention needs PASS-2 queries to cross-attend the cached PASS-1
-                # prefix KV, which is not yet wired (Phase B-attention) -- fail loudly there.
-                if not isinstance(layer.self_attention, IdentityOp):
-                    raise NotImplementedError(
-                        "shared-prefix attention cross-attend is not yet wired "
-                        "(Phase B-attention): PASS-2 completion queries must attend the cached "
-                        "PASS-1 prefix KV. Use a Mamba/MLP-only stack until then."
+                if isinstance(layer.self_attention, IdentityOp):
+                    # MLP / MoE (stateless)
+                    hidden_states = layer(
+                        hidden_states=hidden_states, attention_mask=attention_mask
                     )
-                hidden_states = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+                else:
+                    # real attention: tree mask + position-aware RoPE express the prefix sharing
+                    hidden_states = layer(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                    )
             else:
-                # GatedDeltaNet (and any other stateful recurrence) needs its own state fork,
-                # not yet wired.
+                # GatedDeltaNet (and any other stateful recurrence) needs its own state fork.
                 raise NotImplementedError(
                     f"shared-prefix not wired for layer type {type(layer).__name__}"
                 )
@@ -406,47 +439,6 @@ class HybridStack(MegatronModule):
         return make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
-
-    def forward_shared_prefix(
-        self,
-        prefix_hidden_states: Tensor,
-        completion_hidden_states,
-        attention_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-    ):
-        """Shared-prefix ("tree") two-pass forward for a GRPO group.
-
-        Scans the shared prompt ``P`` ONCE (PASS 1, capturing each stateful layer's end-state)
-        then forks each completion ``C_i`` from that captured state (PASS 2) -- equivalent
-        (fwd + bwd) to running the stack on the duplicated ``[P + C_i]`` sequences and slicing
-        the completion part, but without re-scanning P for every completion. The shared prompt's
-        gradient is the sum of its completions' contributions (autograd handles this via the
-        captured-state nodes that fan out to every completion).
-
-        Args:
-            prefix_hidden_states: (Lp, 1, D) embedded shared prefix.
-            completion_hidden_states: list of (Lc_i, 1, D) embedded completions, OR a single such
-                tensor.
-            attention_mask, rotary_pos_emb: passed through (unused by Mamba/MLP; required once
-                attention is wired).
-
-        Returns:
-            list of (Lc_i, 1, D) completion outputs (post final-norm), aligned with the input list.
-        """
-        ctx = SharedPrefixContext(mode=CAPTURE)
-        # PASS 1: scan the prefix, capturing per-layer state. Output discarded; the captured
-        # states (held in ctx, in the autograd graph) are the only thing PASS 2 needs.
-        self._shared_prefix_layer_loop(prefix_hidden_states, ctx, attention_mask, rotary_pos_emb)
-
-        if isinstance(completion_hidden_states, Tensor):
-            completion_hidden_states = [completion_hidden_states]
-        ctx.mode = INJECT
-        outputs = []
-        for completion in completion_hidden_states:
-            outputs.append(
-                self._shared_prefix_layer_loop(completion, ctx, attention_mask, rotary_pos_emb)
-            )
-        return outputs
 
     def sharded_state_dict(
         self,

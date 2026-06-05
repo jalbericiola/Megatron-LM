@@ -153,21 +153,28 @@ class MambaLayer(GraphableMegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
 
-        if shared_prefix_context is not None and shared_prefix_context.active:
-            # Shared-prefix two-pass: PASS 1 scans the prefix once and captures this layer's conv
-            # + SSM end-state; PASS 2 forks each completion from that captured state. Equivalent
-            # (fwd + bwd) to the dense [P + C_i] mixer forward (see MambaMixer.fork_segment).
-            if shared_prefix_context.capturing:
-                out, out_bias, conv_ctx, ssm_final = self.mixer.fork_segment(
-                    hidden_states, capture=True
+        if shared_prefix_context is not None:
+            # Shared-prefix packed forward: hidden_states is the packed [P, C_1, ..., C_G]
+            # (normed). A mask cannot isolate completion branches in a sequential scan, so we fork
+            # INTERNALLY: scan the prefix once (capturing this layer's conv + SSM end-state), then
+            # scan each completion from that captured state, and reassemble the packed output.
+            # Equivalent (fwd + bwd) to the dense [P + C_i] mixer forward; the shared prefix gets
+            # the summed gradient of all completions (see MambaMixer.fork_segment).
+            ctx = shared_prefix_context
+            Lp = ctx.prefix_len
+            y_p, out_bias, conv_ctx, ssm_final = self.mixer.fork_segment(
+                hidden_states[:Lp], capture=True
+            )
+            parts = [y_p]
+            cursor = Lp
+            for lc in ctx.completion_lens:
+                y_c, _, _, _ = self.mixer.fork_segment(
+                    hidden_states[cursor:cursor + lc], conv_ctx=conv_ctx, ssm_init=ssm_final
                 )
-                shared_prefix_context.capture_mamba(self.layer_number, conv_ctx, ssm_final)
-            else:  # inject
-                conv_ctx, ssm_final = shared_prefix_context.mamba_state(self.layer_number)
-                out, out_bias, _, _ = self.mixer.fork_segment(
-                    hidden_states, conv_ctx=conv_ctx, ssm_init=ssm_final
-                )
-            mixer_out_with_bias = (out, out_bias)
+                parts.append(y_c)
+                cursor += lc
+            # out_bias is the (y-independent) out_proj bias -- identical for every segment.
+            mixer_out_with_bias = (torch.cat(parts, dim=0), out_bias)
         else:
             mixer_out_with_bias = self.mixer(
                 hidden_states,
