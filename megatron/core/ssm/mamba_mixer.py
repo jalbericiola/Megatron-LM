@@ -1079,6 +1079,99 @@ class MambaMixer(MegatronModule):
 
         return y
 
+    def fork_segment(
+        self,
+        hidden_states: torch.Tensor,
+        conv_ctx: Optional[torch.Tensor] = None,
+        ssm_init: Optional[torch.Tensor] = None,
+        capture: bool = False,
+    ):
+        """Shared-prefix ("tree") two-pass SSM segment: scan one segment of a sequence with the
+        conv + SSM state forked from a prefix, and (optionally) capture this segment's end-states.
+
+        This is the production, gradient-preserving primitive for shared-prefix GRPO packing: a
+        prompt P shared by a group of G completions is scanned ONCE (capture=True) and each
+        completion C_i is then scanned from P's captured (conv_ctx, ssm_final) -- equivalent
+        (fwd + bwd) to the standard forward on the duplicated ``[P + C_i]`` but without re-scanning
+        P for every completion.
+
+        Mirrors the static (non-dynamic-batching) branch of ``_ssm_prefill``: in_proj -> split
+        z/xBC/dt -> causal_conv1d_fn (silu) -> split x/B/C -> mamba_chunk_scan_combined (with
+        ``initial_states`` / ``return_final_states``) -> gated RMSNorm -> out_proj. Conv state is
+        threaded by prepending P's last ``d_conv-1`` conv-input columns; SSM state via the kernel's
+        differentiable ``initial_states``. Both are kept in the autograd graph so the branch's
+        gradient flows back into P.
+
+        Validated equivalent to the dense forward (fwd exact in fp32, weight-grad cos 0.9999) by
+        mrl_extras/test/test_mamba_mixer_fork.py and test_hybrid_stack_mamba_fork.py.
+
+        Args:
+            hidden_states: (L, 1, d_model) one segment (prefix P, or one completion C_i).
+            conv_ctx: (b, conv_dim, d_conv-1) prefix conv-input columns to prepend (branch pass),
+                or None (prefix pass / no fork).
+            ssm_init: (b, nheads, headdim, d_state) forked SSM initial state, or None.
+            capture: if True, also return this segment's (conv_ctx_out, ssm_final) end-states.
+
+        Returns:
+            (out, out_bias, conv_ctx_out, ssm_final). ``out``/``out_bias`` are the out_proj results
+            (out_bias is the y-independent bias, consumed by MambaLayer's mamba_bda);
+            ``conv_ctx_out``/``ssm_final`` are None unless ``capture``.
+
+        NOTE (Phase D): this CP=1 path uses ``self.cp.get_*`` accessors but does NOT route through
+        ``self.cp.pre_conv_ssm``/``post_conv_ssm``; context-parallel forking (P split across CP
+        ranks) is the remaining generalization. Asserts cp_size==1 to fail loudly until then.
+        """
+        assert self.cp.cp_size == 1, "fork_segment: CP>1 shared-prefix not yet wired (Phase D)"
+        assert self.rmsnorm, "fork_segment requires rmsnorm (gated-norm applied after the scan)"
+        cp = self.cp
+        ng, ds, nh, hd, dconv = (self.ngroups, self.d_state, self.nheads, self.headdim, self.d_conv)
+        d_inner = self.d_inner
+
+        zxBCdt, _ = self.in_proj(hidden_states)                       # (L,1,pd)
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+        A = -torch.exp(cp.get_A_log().float())
+        z, xBC, dt = torch.split(zxBCdt, [d_inner, d_inner + 2 * ng * ds, nh], dim=-1)
+
+        # --- conv (silu) with prefix-context prepended (== causal_conv1d initial_states) ---
+        xBC = rearrange(xBC, "b l d -> b d l").contiguous()           # (b, conv_dim, l)
+        # NOT detached: the branch's conv sees P's last conv-input columns, so gradient must flow
+        # back through them to P -- exactly as the SSM initial_states path does.
+        conv_ctx_out = xBC[:, :, -(dconv - 1):].clone() if capture else None
+        w = rearrange(cp.get_conv1d_weight(), "d 1 w -> d w")
+        b = cp.get_conv1d_bias()
+        if conv_ctx is not None:
+            xin = torch.cat([conv_ctx.to(xBC.dtype), xBC], dim=-1)
+            conv = causal_conv1d_fn(xin, w, b, activation=self.activation)[:, :, conv_ctx.shape[-1]:]
+        else:
+            conv = causal_conv1d_fn(xBC, w, b, activation=self.activation)
+        xBC = rearrange(conv, "b d l -> b l d").contiguous()
+
+        x, B, C = torch.split(xBC, [d_inner, ng * ds, ng * ds], dim=-1)
+        x = rearrange(x, "b l (h p) -> b l h p", p=hd).contiguous()
+        B = rearrange(B, "b l (g n) -> b l g n", n=ds).contiguous()
+        C = rearrange(C, "b l (g n) -> b l g n", n=ds).contiguous()
+        z4 = rearrange(z, "b l (h p) -> b l h p", p=hd).contiguous()
+
+        scan = mamba_chunk_scan_combined(
+            x, dt.contiguous(), A, B, C, self.chunk_size,
+            D=(rearrange(cp.get_D().float(), "(h p) -> h p", p=hd) if self.D_has_hdim
+               else cp.get_D()),
+            z=None, dt_bias=cp.get_dt_bias().float(), dt_softplus=True,
+            initial_states=ssm_init, return_final_states=capture,
+            **({} if self.mamba_training_ssm_states_dtype is None
+               else {"state_dtype": self.mamba_training_ssm_states_dtype}),
+        )
+        if capture:
+            y, ssm_final = scan
+        else:
+            y, ssm_final = scan, None
+
+        y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+        zr = rearrange(z4, "b l h p -> l b (h p)").contiguous()
+        y = self.norm(y, zr)                                          # gated RMSNorm
+        out, out_bias = self.out_proj(y)
+        return out, out_bias, conv_ctx_out, ssm_final
+
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
         """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
 
