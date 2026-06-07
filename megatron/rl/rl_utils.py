@@ -553,6 +553,12 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
 _INFERENCE_INTERFACE = None
 
 
+@contextmanager
+def rollout_quant_disabled(model):
+    """Compatibility no-op expected by train_rl.py."""
+    yield
+
+
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
@@ -614,6 +620,8 @@ async def _speculative_select_generator(base_generator, k, strategy):
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
+    from megatron.rl.dynamic_maxlen import configure_from_args
+    configure_from_args(args)
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         agent = get_agent(
             args,
@@ -657,6 +665,117 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         else:
             _ROLLOUT_GENERATOR = base_gen
     return _ROLLOUT_GENERATOR
+
+
+def _longest_common_prefix_len(seqs: list) -> int:
+    """Number of leading tokens shared by ALL sequences in ``seqs`` (token-id lists)."""
+    if not seqs:
+        return 0
+    n = min(len(s) for s in seqs)
+    first = seqs[0]
+    for i in range(n):
+        tok = first[i]
+        for s in seqs[1:]:
+            if s[i] != tok:
+                return i
+    return n
+
+
+def _log_shared_prefix_metrics(rollouts: 'GroupedRollouts', iteration: int) -> None:
+    """OBSERVATIONAL shared-prefix speedup measurement (Phase A go/no-go), no behavior change.
+
+    From the INTACT grouped rollouts (must run before the group->flat expansion), compute each
+    group's longest-common-prefix (the genuinely shared tokens -- the GRPO prompt for single-turn,
+    the shared initial context for multi-turn) and the per-completion suffix lengths, then report
+    the shared-prefix planner's lengths-only metrics: prompt_fraction_f, dedup_fraction,
+    predicted_linear_speedup, coverage. The shared-prefix win is ~1/((1-f)+f/G); it is large only
+    when prompts are a big fraction of the sequence (agentic / multi-turn), ~0 for short-prompt /
+    long-CoT -- so we log overall AND per-env to see where the win lives.
+    """
+    from megatron.rl.shared_prefix_packing import plan_shared_prefix_bins
+
+    args = get_args()
+    max_per_bin = getattr(args, 'rl_sequence_packing_max_sequences_per_bin', 50)
+    groups, per_env = [], {}
+    for g in rollouts:
+        seqs = [
+            [t for turn in r.trajectory for t in turn]
+            for r in g
+            if isinstance(r, TokenRollout) and r.trajectory
+        ]
+        seqs = [s for s in seqs if s]
+        if len(seqs) < 2:
+            continue
+        lcp = _longest_common_prefix_len(seqs)
+        comp_lens = [len(s) - lcp for s in seqs]
+        if lcp >= 1 and all(c > 0 for c in comp_lens):
+            groups.append((lcp, comp_lens))
+            per_env.setdefault(g[0].env_id, []).append((lcp, comp_lens))
+    if not groups:
+        return
+
+    _, m = plan_shared_prefix_bins(groups, args.seq_length, max_per_bin)
+    print(
+        f"[shared-prefix-f] iter={iteration} groups={int(m['shared_prefix/num_groups'])} "
+        f"f={m['shared_prefix/prompt_fraction_f']:.3f} "
+        f"dedup={m['shared_prefix/dedup_fraction']:.3f} "
+        f"predicted_speedup={m['shared_prefix/predicted_linear_speedup']:.3f} "
+        f"coverage_groups={m['shared_prefix/coverage_groups']:.3f} "
+        f"avg_prefix={m['shared_prefix/avg_prefix_len']:.0f} "
+        f"avg_G={m['shared_prefix/avg_group_size']:.1f}",
+        flush=True,
+    )
+    for env, gs in sorted(per_env.items()):
+        _, me = plan_shared_prefix_bins(gs, args.seq_length, max_per_bin)
+        print(
+            f"[shared-prefix-f]   env={env} groups={int(me['shared_prefix/num_groups'])} "
+            f"f={me['shared_prefix/prompt_fraction_f']:.3f} "
+            f"predicted_speedup={me['shared_prefix/predicted_linear_speedup']:.3f} "
+            f"avg_prefix={me['shared_prefix/avg_prefix_len']:.0f}",
+            flush=True,
+        )
+    writer = get_tensorboard_writer()
+    wandb_writer = get_wandb_writer()
+    if writer:
+        for k, v in m.items():
+            writer.add_scalar(k, v, iteration)
+    if wandb_writer:
+        wandb_writer.log(m, step=iteration)
+
+
+def _update_dynamic_maxlen_from_rollouts(rollouts: Rollouts, ceiling: int, iteration: int) -> None:
+    from megatron.rl.dynamic_maxlen import get_instance as _get_dynamic_maxlen
+
+    dml = _get_dynamic_maxlen()
+    if dml is None:
+        return
+    for group in rollouts:
+        if not group:
+            continue
+        for rollout in group:
+            if not isinstance(rollout, TokenRollout) or not rollout.generation_mask:
+                continue
+            gen_len = sum(int(b) for turn in rollout.generation_mask for b in turn)
+            reward = rollout.reward
+            if isinstance(reward, list):
+                reward = sum(float(r) for r in reward) / max(1, len(reward))
+            dml.update(
+                rollout.env_id,
+                gen_len,
+                reward=float(reward) if reward is not None else None,
+                metadata=getattr(rollout, 'dynamic_maxlen', None),
+                ceiling=ceiling,
+            )
+    metrics = dml.metrics()
+    if metrics:
+        writer = get_tensorboard_writer()
+        if writer:
+            for key, value in metrics.items():
+                writer.add_scalar(key, value, iteration)
+        wandb_writer = get_wandb_writer()
+        if wandb_writer:
+            wandb_writer.log(metrics, step=iteration)
+    dml.save_state()
 
 
 def get_environment_rollouts(
@@ -742,6 +861,14 @@ def get_environment_rollouts(
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
+                    _update_dynamic_maxlen_from_rollouts(
+                        rollouts, args.inference_max_seq_length, args.curr_iteration
+                    )
+                    if getattr(args, "rl_shared_prefix_log_metrics", False):
+                        # observational: measure the shared-prefix speedup opportunity (f) on the
+                        # live workload here, where rollouts are still GROUPED (before the flatten
+                        # in prepare_data_for_update). No behavior change.
+                        _log_shared_prefix_metrics(rollouts, args.curr_iteration)
                     if not args.rl_partial_rollouts:
                         while True:
                             try:

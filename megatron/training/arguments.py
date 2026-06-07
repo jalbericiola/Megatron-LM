@@ -2465,6 +2465,50 @@ def _add_rl_args(parser):
                             'persist: leave KV cache in GPU memory (default), '
                             'offload: offload KV cache to CPU during training, '
                             'recompute: deallocate KV cache and recompute from scratch each cycle')
+    group.add_argument('--rl-dynamic-maxlen-alpha', type=float, default=None,
+                       help='Enable per-environment dynamic generation max length.')
+    group.add_argument('--rl-dynamic-maxlen-alpha-min', type=float, default=None,
+                       help='Lower asymptote for length-dependent alpha.')
+    group.add_argument('--rl-dynamic-maxlen-alpha-scale', type=float, default=4096.0,
+                       help='Length scale for alpha decay.')
+    group.add_argument('--rl-dynamic-maxlen-ema-decay', type=float, default=0.9,
+                       help='EMA decay for length/reward estimates.')
+    group.add_argument('--rl-dynamic-maxlen-warmup-frac', type=float, default=0.5,
+                       help='Warmup cap fraction of inference max sequence length.')
+    group.add_argument('--rl-dynamic-maxlen-controller', type=str, default='length',
+                       choices=['length', 'bandit', 'reward'],
+                       help='Dynamic max-len controller. "reward": generate UNCAPPED during a '
+                            'per-env warmup, then set the cap to the length that captures the '
+                            'reward (a percentile of the reward-weighted length distribution) '
+                            'rather than the global max.')
+    group.add_argument('--rl-dynamic-maxlen-reward-warmup-samples', type=int, default=512,
+                       help='reward controller: per-env rollouts observed UNCAPPED before a cap '
+                            'is established.')
+    group.add_argument('--rl-dynamic-maxlen-reward-percentile', type=float, default=0.9,
+                       help='reward controller: fraction of reward MASS the cap must retain '
+                            '(cap = smallest length below which this much reward was earned).')
+    group.add_argument('--rl-dynamic-maxlen-reward-cap-margin', type=float, default=1.1,
+                       help='reward controller: safety multiplier applied to the reward-percentile '
+                            'length before capping.')
+    group.add_argument('--rl-dynamic-maxlen-reward-min-cap', type=int, default=256,
+                       help='reward controller: never cap below this many tokens.')
+    group.add_argument('--rl-dynamic-maxlen-reward-window', type=int, default=4096,
+                       help='reward controller: per-env sliding window of (length, reward) '
+                            'observations used to (re)estimate the cap.')
+    group.add_argument('--rl-dynamic-maxlen-reward-refresh-frac', type=float, default=0.05,
+                       help='reward controller: probability of generating UNCAPPED post-warmup, to '
+                            'keep observing the true (uncensored) length tail as the policy drifts.')
+    group.add_argument('--rl-dynamic-maxlen-bandit-arms', type=str,
+                       default='0.75,1.0,1.25,1.5,2.0,3.0',
+                       help='Comma-separated cap multiplier arms for bandit controller.')
+    group.add_argument('--rl-dynamic-maxlen-bandit-token-cost', type=float, default=0.0,
+                       help='Bandit token cost in reward - cost * generated_tokens / ceiling.')
+    group.add_argument('--rl-dynamic-maxlen-bandit-exploration', type=float, default=0.25,
+                       help='Bandit Gaussian exploration scale.')
+    group.add_argument('--rl-dynamic-maxlen-bandit-min-samples-per-arm', type=int, default=1,
+                       help='Round-robin samples per arm before exploitation.')
+    group.add_argument('--rl-dynamic-maxlen-state-path', type=str, default=None,
+                       help='Optional JSON path for dynamic max-len controller state.')
     group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Persist CUDA graphs when the inference engine is suspended. '
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
@@ -2497,6 +2541,15 @@ def _add_rl_args(parser):
                             '(mrl_extras/test/test_shared_prefix_equivalence.py) exist; the '
                             'shared-prefix attention forward is NOT yet integrated, so enabling this '
                             'flag currently raises until that oracle passes on GPU (Milestone 1b).')
+    group.add_argument('--rl-shared-prefix-log-metrics', action=argparse.BooleanOptionalAction,
+                       type=bool, default=False,
+                       help='OBSERVATIONAL ONLY (no behavior change): each update step, compute the '
+                            'per-group longest-common-prefix and log the shared-prefix planner '
+                            'metrics (prompt_fraction_f, dedup_fraction, predicted_linear_speedup, '
+                            'coverage). Measures the shared-prefix speedup OPPORTUNITY on the live '
+                            'workload (go/no-go for the feature) without packing or routing the '
+                            'forward. Safe to combine with any config; not gated by the '
+                            '--rl-sequence-packing-shared-prefix NotImplementedError.')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
                        help='If set, do not toggle CUDA graphs on/off between inference and training phases.')
