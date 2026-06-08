@@ -21,7 +21,34 @@ shared between ``megatron/core/ssm`` (MambaLayer) and ``megatron/core/models/hyb
 without an import cycle.
 """
 
-from typing import Iterator, List, Tuple
+from dataclasses import dataclass
+from typing import Iterator, List, Optional, Tuple
+
+import torch
+
+
+@dataclass
+class SharedPrefixParams:
+    """Model-forward input describing one packed shared-prefix group ``[P, C_1, ..., C_G]``.
+
+    Analogous to ``PackedSeqParams`` for THD packing: the RL/data layer builds it (lengths + the
+    tree mask + prefix-continued position_ids from ``shared_prefix_packing``), threads it into
+    ``HybridModel.forward``, which routes to ``HybridStack.forward_shared_prefix`` (instead of the
+    dense decoder) and makes RoPE position-aware from ``position_ids``.
+    """
+
+    prefix_len: int
+    completion_lens: List[int]
+    # tree attention mask (Megatron convention, True == masked): prefix causal + each completion
+    # attends the prefix and its own branch only. None is allowed for Mamba/MLP-only stacks.
+    attention_mask: Optional[torch.Tensor] = None
+    # prefix-continued positions [total_len] (P -> 0..Lp-1, each C_i -> Lp..Lp+Lc_i-1) for
+    # position-aware RoPE; None falls back to packed-index RoPE (only correct without attention).
+    position_ids: Optional[torch.Tensor] = None
+
+    @property
+    def total_len(self) -> int:
+        return self.prefix_len + sum(self.completion_lens)
 
 
 class SharedPrefixContext:
