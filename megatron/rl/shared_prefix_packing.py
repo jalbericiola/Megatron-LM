@@ -209,18 +209,52 @@ def plan_shared_prefix_bins(groups, bin_size, max_sequences_per_bin=16):
         G_sum += G
         mean_Lc = (sumLc / G) if G else 0
         f_sum += (Lp / (Lp + mean_Lc)) if (Lp + mean_Lc) > 0 else 0.0
-        fits = (Lp + sumLc) <= bin_size and 0 < G <= max_sequences_per_bin
-        if fits:
-            plan.append({"kind": "shared", "group_idx": gi, "prefix_len": Lp,
-                         "completion_lens": list(Lcs)})
-            effective_tokens += grp_unique
-            shared_groups += 1
-            shared_unique_tokens += grp_unique
-        else:
-            for Lc in Lcs:
+
+        # SUB-GROUPING: a group whose [P + all C_i] exceeds the bin (large prefix and/or long
+        # completions, e.g. workplace_assistant) is NOT dropped to full block-diagonal. Instead
+        # greedily pack its completions into multiple SHARED sub-bins [P, subset] that each fit
+        # (Lp + sum(subset) <= bin_size, |subset| <= max_sequences_per_bin). The prefix is shared
+        # within each sub-bin (recomputed once per sub-bin instead of once per completion), so a
+        # group splits into ceil-ish sub-bins rather than G block-diagonal sequences. A completion
+        # so long that even [P + C_i] alone overflows the bin falls back to block-diagonal.
+        cur, cur_tokens, group_emitted_shared = [], Lp, False
+        n_shared_subbins = 0
+
+        def _flush_subbin():
+            nonlocal cur, cur_tokens, group_emitted_shared, n_shared_subbins, effective_tokens
+            if not cur:
+                return
+            sub_lens = [Lcs[j] for j in cur]
+            # a sub-bin with a single completion is just a block-diagonal [P+C_i] -- no actual
+            # prefix sharing -- so label it as such (routes to the normal forward, not the
+            # shared-prefix two-pass).
+            kind = "shared" if len(cur) >= 2 else "blockdiag"
+            plan.append({"kind": kind, "group_idx": gi, "prefix_len": Lp,
+                         "completion_lens": sub_lens, "completion_indices": list(cur)})
+            effective_tokens += Lp + sum(sub_lens)     # prefix stored once for this (sub-)bin
+            if kind == "shared":
+                group_emitted_shared = True
+                n_shared_subbins += 1
+            cur, cur_tokens = [], Lp
+
+        for j, Lc in enumerate(Lcs):
+            if Lp + Lc > bin_size:                     # this completion can't even share alone
+                _flush_subbin()
                 plan.append({"kind": "blockdiag", "group_idx": gi, "prefix_len": Lp,
-                             "completion_lens": [Lc]})
-            effective_tokens += grp_baseline   # no dedup for an oversized/fallback group
+                             "completion_lens": [Lc], "completion_indices": [j]})
+                effective_tokens += Lp + Lc            # no dedup for this oversized completion
+                continue
+            if cur and (cur_tokens + Lc > bin_size or len(cur) >= max_sequences_per_bin):
+                _flush_subbin()
+            cur.append(j)
+            cur_tokens += Lc
+        _flush_subbin()
+
+        # a group counts toward "shared coverage" if any sub-bin actually shared a prefix
+        # (held >=2 completions).
+        if group_emitted_shared:
+            shared_groups += 1
+            shared_unique_tokens += grp_unique        # group's unique tokens (prefix once)
     metrics = {
         "shared_prefix/baseline_tokens": baseline_tokens,
         "shared_prefix/effective_tokens": effective_tokens,
