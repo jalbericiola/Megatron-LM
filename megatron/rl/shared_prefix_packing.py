@@ -332,6 +332,118 @@ def rotary_position_aware(model, position_ids: torch.Tensor):
                 pass
 
 
+@dataclass
+class SharedBin:
+    """One built shared-prefix bin ``[P, C_1, ..., C_k]`` ready for the packed forward.
+
+    ``tokens``/``position_ids``/``loss_mask`` are padded to ``bin_size`` (the THD packer's bin
+    width) so shared bins live in the same [num_bins, bin_size] tensors as block-diagonal bins.
+    ``traj_indices`` maps each completion (branch order) back to its global trajectory index, so
+    advantages / old- & inference-logprobs can be gathered for the loss. The tree attention mask is
+    NOT stored (dense [T,T] is infeasible at 49k); it is built at forward time from ``layout``.
+    """
+
+    tokens: 'torch.Tensor'           # [bin_size] padded [P, C_1..C_k]
+    position_ids: 'torch.Tensor'     # [bin_size] prefix-continued positions (+ pad)
+    loss_mask: 'torch.Tensor'        # [bin_size] 0 on prefix/pad, 1 on completion tokens
+    layout: SharedPrefixLayout
+    traj_indices: List[int]          # global trajectory index per completion (branch order)
+    prefix_len: int
+    completion_lens: List[int]
+
+
+def build_shared_prefix_bins(
+    trajs: torch.Tensor,
+    generation_masks: torch.Tensor,
+    group_ids,
+    bin_size: int,
+    max_sequences_per_bin: int = 16,
+    pad_token: int = 0,
+):
+    """Construct shared-prefix bins from padded per-trajectory tokens + generation masks.
+
+    Trajectories that share the SAME (group_id, prompt prefix) -- the GRPO group's completions of
+    one prompt -- and number >= 2 are packed into one or more ``[P, C_subset]`` bins (sub-grouped
+    by ``plan_shared_prefix_bins`` to fit ``bin_size``). The shared prompt P is the trajectory's
+    PROMPT (the leading non-generated tokens, identical across the bucket -- NOT the longest common
+    prefix, which could reach into the generated region and mis-mask the loss). Everything else --
+    singletons, prompt-mismatched, no-generation, non-contiguous-generation, or oversized
+    completions -- is returned in ``blockdiag_traj_indices`` for the existing THD packer.
+
+    Args:
+        trajs: ``[N, S]`` padded token ids.
+        generation_masks: ``[N, S]`` bool; True where the token was generated (gets loss).
+        group_ids: length-N int (a global GRPO-group id per trajectory; < 0 == padding/ignore).
+        bin_size: per-bin token budget (== seq_length).
+        max_sequences_per_bin: cap on completions behind one shared prefix.
+        pad_token: id to pad each bin to ``bin_size``.
+
+    Returns:
+        (bins, blockdiag_traj_indices): ``bins`` is a list of :class:`SharedBin`;
+        ``blockdiag_traj_indices`` is a sorted list of global trajectory indices to pack normally.
+    """
+    from collections import defaultdict
+
+    device = trajs.device
+    N, S = trajs.shape
+    group_ids = [int(g) for g in (group_ids.tolist() if torch.is_tensor(group_ids) else group_ids)]
+
+    buckets = defaultdict(list)          # (gid, prompt_tuple) -> [traj_idx]
+    prompt_of, comp_of = {}, {}
+    blockdiag = []
+    for i in range(N):
+        gid = group_ids[i]
+        if gid < 0:
+            continue                     # padding trajectory -- not trained, not packed here
+        gm = generation_masks[i].bool()
+        nz = torch.nonzero(gm, as_tuple=False)
+        if nz.numel() == 0:
+            blockdiag.append(i)          # real traj with no generated tokens -> normal path
+            continue
+        first, last = int(nz[0]), int(nz[-1])
+        if (last - first + 1) != int(gm.sum()):
+            blockdiag.append(i)          # non-contiguous generation (rare) -> normal path
+            continue
+        prompt = trajs[i, :first]
+        comp_of[i] = trajs[i, first:last + 1]
+        prompt_of[i] = prompt
+        buckets[(gid, tuple(prompt.tolist()))].append(i)
+
+    bins = []
+    for (gid, _prompt_key), idxs in buckets.items():
+        if len(idxs) < 2:
+            blockdiag.extend(idxs)
+            continue
+        prompt = prompt_of[idxs[0]]
+        Lp = int(prompt.numel())
+        Lcs = [int(comp_of[i].numel()) for i in idxs]
+        plan, _ = plan_shared_prefix_bins([(Lp, Lcs)], bin_size, max_sequences_per_bin)
+        for entry in plan:
+            ci = entry["completion_indices"]
+            if entry["kind"] != "shared":            # single completion -> normal path
+                blockdiag.extend(idxs[j] for j in ci)
+                continue
+            sub_comps = [comp_of[idxs[j]] for j in ci]
+            sub_lcs = [int(c.numel()) for c in sub_comps]
+            layout = build_shared_prefix_layout(Lp, sub_lcs, device=device)
+            total = layout.total_len
+            tokens = torch.full((bin_size,), int(pad_token), dtype=trajs.dtype, device=device)
+            tokens[:Lp] = prompt
+            cur = Lp
+            for c in sub_comps:
+                tokens[cur:cur + c.numel()] = c
+                cur += c.numel()
+            position_ids = torch.zeros(bin_size, dtype=torch.long, device=device)
+            position_ids[:total] = layout.position_ids
+            loss_mask = torch.zeros(bin_size, dtype=torch.float, device=device)
+            loss_mask[Lp:total] = 1.0                # only completion tokens are trained
+            bins.append(SharedBin(
+                tokens=tokens, position_ids=position_ids, loss_mask=loss_mask, layout=layout,
+                traj_indices=[idxs[j] for j in ci], prefix_len=Lp, completion_lens=sub_lcs,
+            ))
+    return bins, sorted(blockdiag)
+
+
 def extract_completion_logprobs(
     logits: torch.Tensor, packed_tokens: torch.Tensor, layout: SharedPrefixLayout
 ) -> torch.Tensor:
