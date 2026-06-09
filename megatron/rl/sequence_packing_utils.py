@@ -961,7 +961,7 @@ def distribute_packed_bins(
     return packed_trajs, packed_position_ids, packed_loss_mask, new_packing_info
 
 
-def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
+def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo, group_ids=None):
     tokenizer = get_tokenizer()
     data_parallel_world_size = mpu.get_data_parallel_world_size()
     data_parallel_group = mpu.get_data_parallel_group()
@@ -978,6 +978,27 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         generation_masks = _gather(generation_masks)
         if inference_logprobs is not None:
             inference_logprobs = _gather(inference_logprobs)
+        if group_ids is not None:
+            group_ids = _gather(group_ids)        # global group id per globally-gathered trajectory
+
+    # Phase A (shared-prefix): on the globally-gathered trajectories, reconstruct GRPO groups and
+    # build the [P, C_subset] shared-prefix bins. For now this only BUILDS + LOGS the predicted
+    # speedup (forward still uses the block-diagonal packing below) -- merging the shared bins into
+    # the packed forward + loss is the next step (Phase A merge + Phase C). Safe no-op on results.
+    if group_ids is not None and getattr(get_args(), "rl_sequence_packing_shared_prefix", False):
+        from megatron.rl.shared_prefix_packing import build_shared_prefix_bins
+        sp_bins, sp_blockdiag = build_shared_prefix_bins(
+            trajs, generation_masks, group_ids, bin_size, max_sequences_per_bin,
+            pad_token=get_tokenizer().pad,
+        )
+        n_shared_comp = sum(len(b.completion_lens) for b in sp_bins)
+        n_total = int((group_ids >= 0).sum())
+        log_single_rank(
+            logger, logging.INFO,
+            f"[shared-prefix-pack] built {len(sp_bins)} shared bins covering {n_shared_comp} "
+            f"completions ({n_shared_comp}/{n_total} trajs), {len(sp_blockdiag)} -> blockdiag "
+            f"(NOT yet routed to forward; building Phase A)",
+        )
 
     with nvtx_range("rl/pack-sequences", time=True):
         # Create packer with max sequences per bin limit to prevent extreme imbalance

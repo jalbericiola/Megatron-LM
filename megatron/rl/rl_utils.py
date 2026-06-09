@@ -1822,6 +1822,20 @@ def prepare_data_for_update(
         num_turns = [nt for g in group_stats.num_turns for nt in g]
         total_turns_sampled = len(rollouts)
 
+        # Phase A (shared-prefix packing): per-trajectory GLOBAL group id, aligned 1:1 with
+        # `advantages` (group_stats.advantages). The group structure is destroyed by the flatten
+        # above and the DP-split below, so capture it here from group_stats.num_turns and carry it
+        # through the SAME DP-slice / pad / all-gather as advantages -- it then stays aligned with
+        # the globally-gathered trajectories in pack_all_trajectories, which can reconstruct each
+        # GRPO group (completions sharing a prompt) to build shared-prefix bins.
+        group_ids = None
+        if getattr(args, "rl_sequence_packing_shared_prefix", False):
+            group_ids = torch.tensor(
+                [gi for gi, grp in enumerate(group_stats.num_turns)
+                 for nt in grp for _ in range(int(nt))],
+                dtype=torch.long, device='cuda',
+            )
+
         # We might sample more than we consume in one step.
         samples_ratio_per_step = args.global_batch_size / (args.grpo_prompts_per_step * args.grpo_group_size)
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
@@ -1836,6 +1850,8 @@ def prepare_data_for_update(
             local_num_turns = sum(num_turns[data_split_range[0] : data_split_range[1]])
             steps_before = sum(num_turns[:data_split_range[0]])
             advantages = advantages[steps_before:steps_before+local_num_turns]
+            if group_ids is not None:
+                group_ids = group_ids[steps_before:steps_before+local_num_turns]
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
@@ -1914,6 +1930,13 @@ def prepare_data_for_update(
                     pad_n, dtype=advantages.dtype, device=advantages.device,
                 )
                 advantages = torch.cat([advantages, pad_adv])
+                # group_ids likewise: pad with -1 (a sentinel for "padding trajectory, no group")
+                # so build_shared_prefix_bins ignores the dummy rows.
+                if group_ids is not None:
+                    group_ids = torch.cat([
+                        group_ids,
+                        torch.full((pad_n,), -1, dtype=group_ids.dtype, device=group_ids.device),
+                    ])
                 # inference_logprobs is None, OR a list of per-traj tensors (no-packing path),
                 # OR a [N, S] padded tensor (sequence-packing path — `_pad_nonnull_with_zeros`
                 # at ~prepare_trajectories line 1376 returns a 2D tensor).
@@ -1954,6 +1977,9 @@ def prepare_data_for_update(
                 group=mpu.get_data_parallel_group(),
             )
             global_advantages = torch.cat(gathered_adv, dim=0)
+            # NOTE: group_ids stays LOCAL (post-pad) here and is gathered INSIDE
+            # pack_all_trajectories alongside trajs (the _gather there), so it lands in the exact
+            # same rank-concatenated global order as the globally-gathered trajectories.
 
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
@@ -1962,11 +1988,12 @@ def prepare_data_for_update(
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
                     trajs, 
                     generation_masks, 
-                    inference_logprobs, 
-                    global_advantages, 
-                    args.seq_length, 
+                    inference_logprobs,
+                    global_advantages,
+                    args.seq_length,
                     args.rl_sequence_packing_max_sequences_per_bin,
-                    args.rl_sequence_packing_algo
+                    args.rl_sequence_packing_algo,
+                    group_ids=group_ids,
                     )
     
                 compute_trajs = packing_context.packed_trajs
