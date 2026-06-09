@@ -394,7 +394,8 @@ def build_shared_prefix_bins(
     for i in range(N):
         gid = group_ids[i]
         if gid < 0:
-            continue                     # padding trajectory -- not trained, not packed here
+            blockdiag.append(i)          # padding trajectory (zero-loss) -> normal packer path
+            continue
         gm = generation_masks[i].bool()
         nz = torch.nonzero(gm, as_tuple=False)
         if nz.numel() == 0:

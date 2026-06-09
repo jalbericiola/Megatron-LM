@@ -67,6 +67,10 @@ class PackingContext:
     original_inference_logprobs: Optional[torch.Tensor] = None
     bin_advantages: List[torch.Tensor] = field(default_factory=list)
     cached_packed_seq_params: List[Optional[PackedSeqParams]] = field(default_factory=list)
+    # shared-prefix: per local bin, the SharedPrefixLayout if it is a shared [P, C_1..C_G] bin,
+    # else None (a normal block-diagonal bin). Indexed in lockstep with packed_trajs / bin_seq_indices
+    # (kept in sync through distribute_packed_bins). Drives the forward routing + logprob fan-out.
+    shared_prefix_layouts: List[Optional[object]] = field(default_factory=list)
 
 
 def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext, logprobs_is_correction: bool):
@@ -1071,6 +1075,73 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
     log_packing_efficiency(packing_context)
 
     return packing_context
+
+def merge_shared_and_blockdiag_bins(sp_bins, blockdiag_indices, trajs, generation_masks,
+                                    packer, packing_algo):
+    """Merge shared-prefix bins with block-diagonally-packed leftover trajectories into one set of
+    packed tensors + a global PackingInfo + a per-bin shared_prefix_layouts list.
+
+    The leftover (block-diagonal) trajectories are packed by the existing SequencePacker; the
+    shared bins (already complete [bin_size] sequences from build_shared_prefix_bins) are appended.
+    All bin_seq_indices are remapped to GLOBAL trajectory indices. For a block-diagonal bin a
+    sequence's (start, length) is the packer's; for a shared bin each completion's start is its
+    branch start in [P, C_1..C_G] and its length is the completion length -- which is exactly what
+    the GRPO advantage scatter consumes (loss_mask already zeroes the shared prefix).
+
+    Returns (packed_trajs, packed_position_ids, packed_loss_mask, packing_info, layouts), with
+    layouts[i] the SharedPrefixLayout for shared bin i or None for a block-diagonal bin.
+    """
+    N = trajs.shape[0]
+    device = trajs.device
+    bd_info = bd_packed = bd_pos = bd_loss = None
+    if blockdiag_indices:
+        bd_idx = torch.tensor(blockdiag_indices, device=device, dtype=torch.long)
+        bd_packed, bd_pos, bd_loss, bd_info = packer.pack_sequences(
+            trajs[bd_idx], generation_masks[bd_idx]
+        )
+
+    # global per-trajectory length: block-diagonal -> full [P+C] length (packer); shared -> the
+    # COMPLETION length (the prefix is shared and loss-masked, scored separately via the layout).
+    seq_lengths = [0] * N
+    if bd_info is not None:
+        for sub_j, L in enumerate(bd_info.seq_lengths):
+            seq_lengths[blockdiag_indices[sub_j]] = int(L)
+    for b in sp_bins:
+        for ti, lc in zip(b.traj_indices, b.completion_lens):
+            seq_lengths[int(ti)] = int(lc)
+
+    bin_seq_indices, seq_starts, layouts = [], {}, []
+    packed_list, pos_list, loss_list = [], [], []
+    if bd_info is not None:
+        for bi in range(len(bd_info.bin_seq_indices)):
+            bin_seq_indices.append([blockdiag_indices[j] for j in bd_info.bin_seq_indices[bi]])
+            seq_starts[len(bin_seq_indices) - 1] = list(bd_info.seq_starts[bi])
+            layouts.append(None)
+            packed_list.append(bd_packed[bi])
+            pos_list.append(bd_pos[bi])
+            loss_list.append(bd_loss[bi])
+    for b in sp_bins:
+        bi = len(bin_seq_indices)
+        bin_seq_indices.append([int(t) for t in b.traj_indices])
+        seq_starts[bi] = list(b.layout.branch_starts)
+        layouts.append(b.layout)
+        packed_list.append(b.tokens)
+        pos_list.append(b.position_ids.to(bd_pos.dtype) if bd_pos is not None else b.position_ids)
+        loss_list.append(b.loss_mask.to(bd_loss.dtype) if bd_loss is not None else b.loss_mask)
+
+    packed_trajs = torch.stack(packed_list)
+    packed_position_ids = torch.stack(pos_list)
+    packed_loss_mask = torch.stack(loss_list)
+    seq_to_bin_idx = [None] * N
+    for bi, idxs in enumerate(bin_seq_indices):
+        for ti in idxs:
+            seq_to_bin_idx[ti] = bi
+    info = PackingInfo(
+        bin_seq_indices=bin_seq_indices, seq_starts=seq_starts, seq_lengths=seq_lengths,
+        seq_to_bin_idx=seq_to_bin_idx, packing_algo=packing_algo,
+    )
+    return packed_trajs, packed_position_ids, packed_loss_mask, info, layouts
+
 
 def update_microbatch_calculator(
     samples_ratio_per_step: float,
