@@ -2481,6 +2481,7 @@ def calculate_grpo_loss(
     is_truncation_coef: float | None = None,
     seq_starts: list | None = None,
     seq_lengths: list | None = None,
+    is_shared_prefix: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Get GRPO loss, the kl term of the loss and the pi/pi_{old} ratios.
 
@@ -2529,10 +2530,22 @@ def calculate_grpo_loss(
         )
 
         for seq_idx, (start, seq_len) in enumerate(zip(seq_starts, seq_lengths)):
-            # Logprobs are 1 token shorter than sequences
-            end = min(start + seq_len - 1, bin_size)
-            if end > start:
-                packed_advantages[0, start:end] = advantages[seq_idx].item()
+            if is_shared_prefix:
+                # Shared-prefix bin: a completion of length Lc occupies packed positions
+                # [start : start+Lc] (start == its branch start), and its fan-out logprobs were
+                # scattered at comp_positions-1 == [start-1 : start-1+Lc]. So its advantage must
+                # land at the SAME indices (one LEFT of the block-diagonal convention, and the
+                # FULL Lc tokens -- the branch's first token is scored from the shared prefix logit
+                # and is a trained token too).
+                s = max(0, start - 1)
+                end = min(start - 1 + seq_len, bin_size)
+            else:
+                # Block-diagonal bin (established, correct convention): advantage index j <-> token
+                # j+1; logprobs are 1 token shorter than sequences.
+                s = start
+                end = min(start + seq_len - 1, bin_size)
+            if end > s:
+                packed_advantages[0, s:end] = advantages[seq_idx].item()
 
         advantages = packed_advantages
     else:

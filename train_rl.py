@@ -20,6 +20,7 @@ from megatron.rl.rl_utils import (
     get_logprobs,
     get_rl_runtime_state,
     load_packed_data_by_index,
+    rollout_quant_disabled,
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
@@ -228,6 +229,12 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, args.rl_inference_logprobs_is_correction)
 
         runtime_state.increment_sequences(len(seq_indices))
+        # Shared-prefix bin: route the TRAINING (current-policy) forward through the two-pass +
+        # fan-out, same as the reference path (logprobs_forward_step). Without this the current
+        # logprobs would use the dense forward with the wrong cu_seqlens -> silent mis-train.
+        _layouts = getattr(runtime_state.packing_context, "shared_prefix_layouts", None)
+        _bin = bin_tensor.item()
+        shared_prefix_layout = _layouts[_bin] if (_layouts and _bin < len(_layouts)) else None
     else:
         # Extract unpacked data
         (
@@ -243,6 +250,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         seq_starts = None
         seq_lengths = None
         packed_seq_params = None
+        shared_prefix_layout = None
 
         # Move to CUDA
         tokens = tokens.cuda()
@@ -288,12 +296,17 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     except:
         pass
 
-    # Get current logprobs and calculate loss with straggler detection
+    # Get current logprobs and calculate loss with straggler detection.
+    # rollout_quant_disabled: if the rollout model was modelopt-quantized for fast generation,
+    # the TRAINING forward runs in bf16 (quantizers off) so the gradient targets the bf16 policy;
+    # the quant rollout's behavior logprobs are IS-corrected separately. No-op without quant.
     with stimer:
-        logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, no_grad=False,
-            packed_seq_params=packed_seq_params
-        )
+        with rollout_quant_disabled(model_to_use):
+            logprobs_or_hidden_states = get_logprobs(
+                model_to_use, tokens, position_ids, no_grad=False,
+                packed_seq_params=packed_seq_params,
+                shared_prefix_layout=shared_prefix_layout,
+            )
 
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states
@@ -321,6 +334,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                     is_truncation_coef=args.rl_importance_sampling_truncation_coef,
                     seq_starts=seq_starts,
                     seq_lengths=seq_lengths,
+                    is_shared_prefix=shared_prefix_layout is not None,
                 )
             )
             output_tensor = loss
