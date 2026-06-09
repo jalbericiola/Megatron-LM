@@ -811,8 +811,13 @@ def distribute_packed_bins(
     packed_position_ids: torch.Tensor,
     packed_loss_mask: torch.Tensor,
     packing_info: PackingInfo,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
-    """Distribute packed bins across the data parallel ranks."""
+    shared_prefix_layouts: Optional[List[Optional[object]]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo, List[Optional[object]]]:
+    """Distribute packed bins across the data parallel ranks.
+
+    ``shared_prefix_layouts`` (per global bin: a SharedPrefixLayout or None) is reordered in
+    lockstep with the bins and padded with None for the empty bins, so the returned list stays
+    aligned with the per-rank packed_trajs (indexed by local bin index)."""
     rank = mpu.get_data_parallel_rank()
     world_size = mpu.get_data_parallel_world_size()
     tokenizer = get_tokenizer()
@@ -851,6 +856,7 @@ def distribute_packed_bins(
     my_packed_loss_mask = []
     my_bin_seq_indices = []
     my_seq_starts = {}
+    my_shared_prefix_layouts = []
 
 
     # Build the local data from the global indices
@@ -860,6 +866,9 @@ def distribute_packed_bins(
         my_packed_loss_mask.append(packed_loss_mask[old_idx])
         my_bin_seq_indices.append(packing_info.bin_seq_indices[old_idx])
         my_seq_starts[new_idx] = packing_info.seq_starts[old_idx]
+        my_shared_prefix_layouts.append(
+            shared_prefix_layouts[old_idx] if shared_prefix_layouts is not None else None
+        )
 
     # Stack the selected bins
     packed_trajs = (
@@ -961,8 +970,10 @@ def distribute_packed_bins(
             bin_idx = current_bins + i
             new_packing_info.bin_seq_indices.append(entry['bin_seq_indices'])
             new_packing_info.seq_starts[bin_idx] = entry['seq_starts']
+            my_shared_prefix_layouts.append(None)   # empty padding bins are never shared-prefix
 
-    return packed_trajs, packed_position_ids, packed_loss_mask, new_packing_info
+    return (packed_trajs, packed_position_ids, packed_loss_mask, new_packing_info,
+            my_shared_prefix_layouts)
 
 
 def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo, group_ids=None):
@@ -985,25 +996,6 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         if group_ids is not None:
             group_ids = _gather(group_ids)        # global group id per globally-gathered trajectory
 
-    # Phase A (shared-prefix): on the globally-gathered trajectories, reconstruct GRPO groups and
-    # build the [P, C_subset] shared-prefix bins. For now this only BUILDS + LOGS the predicted
-    # speedup (forward still uses the block-diagonal packing below) -- merging the shared bins into
-    # the packed forward + loss is the next step (Phase A merge + Phase C). Safe no-op on results.
-    if group_ids is not None and getattr(get_args(), "rl_sequence_packing_shared_prefix", False):
-        from megatron.rl.shared_prefix_packing import build_shared_prefix_bins
-        sp_bins, sp_blockdiag = build_shared_prefix_bins(
-            trajs, generation_masks, group_ids, bin_size, max_sequences_per_bin,
-            pad_token=get_tokenizer().pad,
-        )
-        n_shared_comp = sum(len(b.completion_lens) for b in sp_bins)
-        n_total = int((group_ids >= 0).sum())
-        log_single_rank(
-            logger, logging.INFO,
-            f"[shared-prefix-pack] built {len(sp_bins)} shared bins covering {n_shared_comp} "
-            f"completions ({n_shared_comp}/{n_total} trajs), {len(sp_blockdiag)} -> blockdiag "
-            f"(NOT yet routed to forward; building Phase A)",
-        )
-
     with nvtx_range("rl/pack-sequences", time=True):
         # Create packer with max sequences per bin limit to prevent extreme imbalance
         packer = SequencePacker(
@@ -1012,26 +1004,46 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             max_sequences_per_bin=max_sequences_per_bin,
         )
 
-        # Pack sequences with generation masks
-        (
-            packed_trajs,
-            packed_position_ids,
-            packed_loss_mask,
-            packing_info,
-        ) = packer.pack_sequences(trajs, generation_masks)
-        packing_info.packing_algo = packing_algo
+        shared_prefix = (
+            group_ids is not None
+            and getattr(get_args(), "rl_sequence_packing_shared_prefix", False)
+        )
+        if shared_prefix:
+            # Shared-prefix packing: reconstruct GRPO groups on the globally-gathered trajectories
+            # and pack each shared prompt ONCE ([P, C_subset] bins); leftover trajectories pack
+            # block-diagonally. The merged PackingInfo + per-bin layouts drive the two-pass forward
+            # (HybridModel.forward(shared_prefix_params=...)) + the logprob fan-out.
+            from megatron.rl.shared_prefix_packing import build_shared_prefix_bins
+            sp_bins, sp_blockdiag = build_shared_prefix_bins(
+                trajs, generation_masks, group_ids, bin_size, max_sequences_per_bin,
+                pad_token=tokenizer.pad,
+            )
+            (packed_trajs, packed_position_ids, packed_loss_mask, packing_info,
+             shared_prefix_layouts) = merge_shared_and_blockdiag_bins(
+                sp_bins, sp_blockdiag, trajs, generation_masks, packer, packing_algo,
+            )
+            n_shared_comp = sum(len(b.completion_lens) for b in sp_bins)
+            log_single_rank(
+                logger, logging.INFO,
+                f"[shared-prefix-pack] {len(sp_bins)} shared bins ({n_shared_comp} completions), "
+                f"{len(sp_blockdiag)} block-diagonal trajs",
+            )
+        else:
+            # Pack sequences with generation masks (block-diagonal only)
+            (packed_trajs, packed_position_ids, packed_loss_mask, packing_info) = (
+                packer.pack_sequences(trajs, generation_masks)
+            )
+            packing_info.packing_algo = packing_algo
+            shared_prefix_layouts = None
 
-        # Distribute packed bins across the data parallel ranks
-        (
+        # Distribute packed bins across the data parallel ranks (layouts reordered in lockstep)
+        (packed_trajs, packed_position_ids, packed_loss_mask, packing_info,
+         shared_prefix_layouts) = distribute_packed_bins(
             packed_trajs,
             packed_position_ids,
             packed_loss_mask,
             packing_info,
-        ) = distribute_packed_bins(
-            packed_trajs,
-            packed_position_ids,
-            packed_loss_mask,
-            packing_info,
+            shared_prefix_layouts=shared_prefix_layouts,
         )
 
     # Create bin_advantages list
@@ -1070,6 +1082,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         original_inference_logprobs=inference_logprobs,
         bin_advantages=bin_advantages,
         cached_packed_seq_params=cached_packed_seq_params,
+        shared_prefix_layouts=shared_prefix_layouts if shared_prefix_layouts is not None else [],
     )
 
     log_packing_efficiency(packing_context)

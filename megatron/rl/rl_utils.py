@@ -1070,7 +1070,7 @@ def _gather_logprobs_context_parallel(
     return torch.cat(chunks, dim=1)[:, :-1]
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None, shared_prefix_layout=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -1132,6 +1132,22 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             model.config.flash_decode = False
             fp32_output = not (args.fp16 or args.bf16)
 
+            # Shared-prefix bin: build the SharedPrefixParams (tree mask + prefix-continued
+            # positions) and slice to the packed [P, C_1..C_G] length, so HybridModel.forward
+            # routes to the two-pass forward instead of the dense decoder.
+            spp = None
+            if shared_prefix_layout is not None:
+                assert cp_size == 1, "shared-prefix forward not yet wired for CP>1 (Phase D)"
+                from megatron.core.models.hybrid.shared_prefix import SharedPrefixParams
+                from megatron.rl.shared_prefix_packing import dense_tree_mask
+                L = shared_prefix_layout
+                T = L.total_len
+                tree_mask = (~dense_tree_mask(L, device=tokens.device)).view(1, 1, T, T)
+                spp = SharedPrefixParams(
+                    prefix_len=L.prefix_len, completion_lens=list(L.completion_lens),
+                    attention_mask=tree_mask, position_ids=L.position_ids.to(tokens.device),
+                )
+
             if cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
                 local_tokens, local_position_ids, cp_packed_seq_params, local_labels = (
@@ -1145,6 +1161,18 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                         packed_seq_params=cp_packed_seq_params,
                         runtime_gather_output=True,
                         fp32_output=fp32_output,
+                    )
+            elif spp is not None:
+                # shared-prefix two-pass forward over the packed [P, C_1..C_G] (sliced to T)
+                with torch.no_grad() if no_grad else nullcontext():
+                    logits_or_hidden_states = model(
+                        tokens[:, :spp.total_len],
+                        position_ids[:, :spp.total_len],
+                        attention_mask_for_forward,
+                        packed_seq_params=packed_seq_params,
+                        runtime_gather_output=True,
+                        fp32_output=fp32_output,
+                        shared_prefix_params=spp,
                     )
             else:
                 with torch.no_grad() if no_grad else nullcontext():
@@ -1167,7 +1195,22 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
         logits = logits_or_hidden_states
         with nvtx_range("rl/log-softmax", time=True):
-            if cp_size > 1:
+            if spp is not None:
+                # Shared-prefix fan-out: each completion's first token is scored from the SHARED
+                # prefix's last logit (not the previous packed token, which belongs to another
+                # branch). extract_completion_logprobs handles the fan-out; scatter the result back
+                # into a [1, bin_size-1] tensor at comp_positions-1 so the loss/advantage/mask
+                # machinery (which expects the next-token-shifted layout) is unchanged.
+                from megatron.rl.shared_prefix_packing import extract_completion_logprobs
+                L = shared_prefix_layout
+                comp_lp = extract_completion_logprobs(
+                    logits[0, :L.total_len, :], tokens[0, :L.total_len], L
+                )
+                logprobs = torch.zeros(
+                    (1, tokens.shape[1] - 1), dtype=comp_lp.dtype, device=comp_lp.device
+                )
+                logprobs[0, L.comp_positions - 1] = comp_lp
+            elif cp_size > 1:
                 # Compute local logprobs then gather the full sequence.
                 local_logprobs = selective_log_softmax(logits, local_labels)
                 logprobs = _gather_logprobs_context_parallel(local_logprobs, no_grad)
@@ -1688,13 +1731,19 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
     # the forward pass from training after it has been captured on the 1st iteration.
     model.eval()
 
+    shared_prefix_layout = None
     if packing_context is not None:
         # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
         bin_tensor = next(data_iterator)[0]
+        bin_idx = bin_tensor.item()
         #TODO(jalbericiola): change for named tuple
         (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
-            load_packed_data_by_index(bin_tensor.item(), packing_context, is_correction)
+            load_packed_data_by_index(bin_idx, packing_context, is_correction)
         )
+        # shared-prefix bin -> route the forward to the two-pass + fan-out logprob extraction
+        layouts = getattr(packing_context, "shared_prefix_layouts", None)
+        if layouts and bin_idx < len(layouts):
+            shared_prefix_layout = layouts[bin_idx]
     else:
         b_trajs, b_posids = next(data_iterator)
         b_packed_seq_params = None
@@ -1707,6 +1756,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             no_grad=True,
             sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
+            shared_prefix_layout=shared_prefix_layout,
         ),
         None,
     )
