@@ -500,6 +500,7 @@ def pack_inference_logprobs(
     old_logprobs: Optional[torch.Tensor] = None,
     trajs: Optional[torch.Tensor] = None,
     eod_token: Optional[int] = None,
+    shared_prefix_layouts: Optional[List[Any]] = None,
 ) -> torch.Tensor:
     """Pack inference logprobs into bins aligned with packed sequences.
 
@@ -515,6 +516,12 @@ def pack_inference_logprobs(
         trajs: Packed-source (global) token ids [num_seqs, seq_len], used only to detect
             whether a trajectory ended in a generated EOD (which inference does not score).
         eod_token: EOD token id, paired with ``trajs`` for the EOD detection above.
+        shared_prefix_layouts: per-local-bin SharedPrefixLayout (or None for block-diagonal bins).
+            For a shared-prefix bin the branch carries ONLY the completion (the prompt P is shared
+            and stored once), so the inference logprobs must land at the fan-out positions
+            comp_positions-1 == the contiguous run [seq_start-1 .. seq_start+Lc-2] -- the SAME slots
+            the training fan-out (extract_completion_logprobs) writes, so the IS ratio aligns.
+            None -> every bin is block-diagonal (legacy behavior).
 
     Returns:
         Packed inference logprobs tensor of shape [num_bins, bin_size - 1]
@@ -587,9 +594,19 @@ def pack_inference_logprobs(
         if raw_len <= 0:
             continue
 
-        # Calculate where to place inference logprobs in the packed tensor
-        # The inference logprobs start at the first generated token position
-        pack_start = seq_start + first_gen_idx
+        # Calculate where to place inference logprobs in the packed tensor.
+        # Block-diagonal bin: the branch is [prompt, completion]; generation starts at
+        # first_gen_idx within it. Shared-prefix bin: the branch is ONLY the completion (P is
+        # shared and stored once), so the logprobs land contiguously at the fan-out positions
+        # comp_positions-1 == [seq_start-1 .. seq_start+Lc-2] -- the SAME slots the training
+        # fan-out writes, so the IS ratio aligns. (first_gen_idx assumes an in-branch prompt and
+        # would over-shoot for a shared bin.)
+        is_shared_bin = (
+            shared_prefix_layouts is not None
+            and local_bin_idx < len(shared_prefix_layouts)
+            and shared_prefix_layouts[local_bin_idx] is not None
+        )
+        pack_start = (seq_start - 1) if is_shared_bin else (seq_start + first_gen_idx)
         pack_end = min(
             pack_start + raw_len, seq_start + packing_info.seq_lengths[seq_idx] - 1
         )

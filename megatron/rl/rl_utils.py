@@ -2209,6 +2209,9 @@ def prepare_data_for_update(
                         old_logprobs=old_logprobs,
                         trajs=packing_context.original_trajs,
                         eod_token=tokenizer.eod,
+                        shared_prefix_layouts=getattr(
+                            packing_context, "shared_prefix_layouts", None
+                        ),
                     )
 
                     # Compute statistics for logging using packed data
