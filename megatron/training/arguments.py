@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import warnings
 import types
 
 import torch
@@ -574,12 +575,17 @@ def validate_args(args, defaults={}):
         if getattr(args, 'rl_sequence_packing_shared_prefix', False):
             assert args.rl_use_sequence_packing, \
                 "--rl-sequence-packing-shared-prefix requires --rl-use-sequence-packing."
-            raise NotImplementedError(
-                "--rl-sequence-packing-shared-prefix is Milestone 1 only: the packing-layout "
-                "helpers and the numerical oracle exist, but the shared-prefix attention forward "
-                "is not yet wired into get_logprobs. Validate the oracle on GPU first "
-                "(python -m test.test_shared_prefix_equivalence), then complete Milestone 1b "
-                "before enabling this flag. See docs/sequence_packing_prefix_sharing.md.")
+            # The two-pass forward (MambaMixer.fork_segment + tree-mask attention) is wired into
+            # HybridModel.forward and get_logprobs, validated CP=1. Remaining limitations:
+            assert args.context_parallel_size == 1, (
+                "--rl-sequence-packing-shared-prefix is CP=1 only for now (the Mamba fork + the "
+                "shared-prefix get_logprobs path assert cp_size==1; CP>1 is Phase D).")
+            if getattr(args, 'rl_inference_logprobs_is_correction', False):
+                warnings.warn(
+                    "--rl-sequence-packing-shared-prefix with IS-correction: inference logprobs "
+                    "for shared bins are not yet re-aligned to the fan-out layout; IS weights on "
+                    "shared bins may be slightly off until that lands. Policy/old/ref logprobs ARE "
+                    "fan-out-correct.")
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '

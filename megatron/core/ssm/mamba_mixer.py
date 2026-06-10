@@ -76,6 +76,14 @@ _MAMBA_SPLIT_HAS_STATE_DTYPE = (
     mamba_split_conv1d_scan_combined is not None
     and "state_dtype" in inspect.signature(mamba_split_conv1d_scan_combined).parameters
 )
+# mamba_chunk_scan_combined gained state_dtype support independently of the split kernel above
+# (some installed mamba_ssm builds have it on the split path but not the chunk path). The static
+# (non-mem-eff) training-fallback scan and fork_segment both call mamba_chunk_scan_combined, so
+# they must gate state_dtype on this function's own signature -- not _MAMBA_SPLIT_HAS_STATE_DTYPE.
+_MAMBA_CHUNK_SCAN_HAS_STATE_DTYPE = (
+    mamba_chunk_scan_combined is not None
+    and "state_dtype" in inspect.signature(mamba_chunk_scan_combined).parameters
+)
 
 try:
     from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
@@ -1061,6 +1069,7 @@ class MambaMixer(MegatronModule):
                 **(
                     {}
                     if self.mamba_training_ssm_states_dtype is None
+                    or not _MAMBA_CHUNK_SCAN_HAS_STATE_DTYPE
                     else {"state_dtype": self.mamba_training_ssm_states_dtype}
                 ),
             )
@@ -1159,6 +1168,7 @@ class MambaMixer(MegatronModule):
             z=None, dt_bias=cp.get_dt_bias().float(), dt_softplus=True,
             initial_states=ssm_init, return_final_states=capture,
             **({} if self.mamba_training_ssm_states_dtype is None
+               or not _MAMBA_CHUNK_SCAN_HAS_STATE_DTYPE
                else {"state_dtype": self.mamba_training_ssm_states_dtype}),
         )
         if capture:
@@ -1171,6 +1181,79 @@ class MambaMixer(MegatronModule):
         y = self.norm(y, zr)                                          # gated RMSNorm
         out, out_bias = self.out_proj(y)
         return out, out_bias, conv_ctx_out, ssm_final
+
+    def fork_branches(
+        self,
+        branches: torch.Tensor,
+        ssm_init: torch.Tensor,
+        conv_ctx: torch.Tensor,
+    ):
+        """BATCHED shared-prefix fork: scan all G completions of a group in ONE pass, each forked
+        from the prefix's captured ``(conv_ctx, ssm_init)``.
+
+        Equivalent (fwd + bwd) to calling ``fork_segment`` G times -- a Mamba scan is independent
+        across the batch dimension, so stacking the G completions into a batch (right-padded to the
+        longest) and broadcasting the single prefix end-state as every branch's ``initial_states``
+        gives bit-identical per-branch outputs, but amortizes kernel/launch overhead (1 conv + 1
+        scan over the batch instead of G small ones -- the per-completion sequential loop was the
+        shared-prefix forward's bottleneck). Right-padding is safe: the scan/conv are causal so pad
+        tokens (placed after the real ones, and zero-valued) never affect a real token's output, and
+        completion segments do not capture an end-state.
+
+        Args:
+            branches: ``(Lmax, G, d_model)`` the G completions, sequence-first, right-padded with
+                zeros to the longest completion length.
+            ssm_init: ``(1, nheads, headdim, d_state)`` the prefix's captured SSM end-state.
+            conv_ctx: ``(1, conv_dim, d_conv-1)`` the prefix's last conv-input columns.
+
+        Returns:
+            ``(out, out_bias)`` with ``out`` ``(Lmax, G, d_model)`` -- the caller slices each
+            branch to its true length and reassembles into the packed completion region.
+        """
+        assert self.cp.cp_size == 1, "fork_branches: CP>1 shared-prefix not yet wired (Phase D)"
+        assert self.rmsnorm, "fork_branches requires rmsnorm (gated-norm applied after the scan)"
+        cp = self.cp
+        ng, ds, nh, hd = self.ngroups, self.d_state, self.nheads, self.headdim
+        d_inner = self.d_inner
+        Lmax, G, _ = branches.shape
+
+        zxBCdt, _ = self.in_proj(branches)                            # (Lmax, G, pd)
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()     # (G, Lmax, pd)
+        A = -torch.exp(cp.get_A_log().float())
+        z, xBC, dt = torch.split(zxBCdt, [d_inner, d_inner + 2 * ng * ds, nh], dim=-1)
+
+        # conv (silu) with the prefix conv-context prepended to EVERY branch (broadcast over G);
+        # NOT detached -- gradient flows back through it to P, as the SSM initial_states path does.
+        xBC = rearrange(xBC, "b l d -> b d l").contiguous()           # (G, conv_dim, Lmax)
+        w = rearrange(cp.get_conv1d_weight(), "d 1 w -> d w")
+        b = cp.get_conv1d_bias()
+        cc = conv_ctx.to(xBC.dtype).expand(G, -1, -1)                 # (G, conv_dim, d_conv-1)
+        xin = torch.cat([cc, xBC], dim=-1)
+        conv = causal_conv1d_fn(xin, w, b, activation=self.activation)[:, :, cc.shape[-1]:]
+        xBC = rearrange(conv, "b d l -> b l d").contiguous()
+
+        x, B, C = torch.split(xBC, [d_inner, ng * ds, ng * ds], dim=-1)
+        x = rearrange(x, "b l (h p) -> b l h p", p=hd).contiguous()
+        B = rearrange(B, "b l (g n) -> b l g n", n=ds).contiguous()
+        C = rearrange(C, "b l (g n) -> b l g n", n=ds).contiguous()
+        z4 = rearrange(z, "b l (h p) -> b l h p", p=hd).contiguous()
+        ssm_b = ssm_init.expand(G, *ssm_init.shape[1:]).contiguous()  # (G, nh, hd, ds)
+
+        y = mamba_chunk_scan_combined(
+            x, dt.contiguous(), A, B, C, self.chunk_size,
+            D=(rearrange(cp.get_D().float(), "(h p) -> h p", p=hd) if self.D_has_hdim
+               else cp.get_D()),
+            z=None, dt_bias=cp.get_dt_bias().float(), dt_softplus=True,
+            initial_states=ssm_b, return_final_states=False,
+            **({} if self.mamba_training_ssm_states_dtype is None
+               or not _MAMBA_CHUNK_SCAN_HAS_STATE_DTYPE
+               else {"state_dtype": self.mamba_training_ssm_states_dtype}),
+        )
+        y = rearrange(y, "b l h p -> l b (h p)").contiguous()         # (Lmax, G, d_inner)
+        zr = rearrange(z4, "b l h p -> l b (h p)").contiguous()
+        y = self.norm(y, zr)                                          # gated RMSNorm
+        out, out_bias = self.out_proj(y)                              # (Lmax, G, d_model)
+        return out, out_bias
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
         """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.

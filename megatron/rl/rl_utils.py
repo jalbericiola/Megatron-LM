@@ -1138,11 +1138,21 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             spp = None
             if shared_prefix_layout is not None:
                 assert cp_size == 1, "shared-prefix forward not yet wired for CP>1 (Phase D)"
-                from megatron.core.models.hybrid.shared_prefix import SharedPrefixParams
-                from megatron.rl.shared_prefix_packing import dense_tree_mask
+                from megatron.core.models.hybrid.shared_prefix import (
+                    HAVE_FLEX_ATTENTION,
+                    SharedPrefixParams,
+                )
                 L = shared_prefix_layout
                 T = L.total_len
-                tree_mask = (~dense_tree_mask(L, device=tokens.device)).view(1, 1, T, T)
+                # forward_shared_prefix builds a sparse FlexAttention BlockMask from the layout, so
+                # the dense [1,1,T,T] tree mask is only needed for the (rare) no-FlexAttention
+                # fallback. Skip materializing it otherwise -- it is O(T^2) (~386MB @ T=20k,
+                # infeasible at 49k) and unused on the flex path.
+                tree_mask = None
+                if not HAVE_FLEX_ATTENTION:
+                    from megatron.rl.shared_prefix_packing import dense_tree_mask
+
+                    tree_mask = (~dense_tree_mask(L, device=tokens.device)).view(1, 1, T, T)
                 spp = SharedPrefixParams(
                     prefix_len=L.prefix_len, completion_lens=list(L.completion_lens),
                     attention_mask=tree_mask, position_ids=L.position_ids.to(tokens.device),

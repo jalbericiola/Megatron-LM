@@ -26,6 +26,79 @@ from typing import Iterator, List, Optional, Tuple
 
 import torch
 
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+    HAVE_FLEX_ATTENTION = True
+except ImportError:  # torch < 2.5
+    create_block_mask = None
+    flex_attention = None
+    HAVE_FLEX_ATTENTION = False
+
+# Lazily torch.compile'd flex_attention. Compilation is keyed on tensor shapes, so distinct packed
+# lengths recompile (and cache) -- acceptable since bin shapes recur within a run. The compiled
+# kernel skips fully-masked (sibling-branch) blocks, which is the whole speedup over the dense
+# [T,T]-mask SDPA path (measured ~11x faster, ~5x faster than the un-shared baseline @ Lp5247/G16).
+_COMPILED_FLEX = None
+
+
+def _get_compiled_flex():
+    global _COMPILED_FLEX
+    if _COMPILED_FLEX is None:
+        _COMPILED_FLEX = torch.compile(flex_attention)
+    return _COMPILED_FLEX
+
+
+def build_tree_segment_ids(prefix_len: int, completion_lens: List[int], device) -> torch.Tensor:
+    """``[total_len]`` long: 0 for prefix tokens, ``i+1`` for completion ``i``'s tokens."""
+    total = int(prefix_len) + sum(int(x) for x in completion_lens)
+    seg = torch.zeros(total, dtype=torch.long, device=device)
+    cursor = int(prefix_len)
+    for i, lc in enumerate(completion_lens):
+        seg[cursor : cursor + int(lc)] = i + 1
+        cursor += int(lc)
+    return seg
+
+
+def build_tree_block_mask(prefix_len: int, completion_lens: List[int], device):
+    """FlexAttention ``BlockMask`` for the shared-prefix tree: a query attends a key iff the key is
+    causally before it AND (the key is in the prefix OR in the same completion branch). Sibling
+    branches never attend to each other. Returns ``None`` if FlexAttention is unavailable.
+
+    This is the kernel realization of ``shared_prefix_packing.dense_tree_mask`` -- built here from
+    just (prefix_len, completion_lens) so ``megatron.core`` needs no ``megatron.rl`` import.
+    """
+    if not HAVE_FLEX_ATTENTION:
+        return None
+    seg = build_tree_segment_ids(prefix_len, completion_lens, device)
+    total = int(seg.numel())
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        causal = kv_idx <= q_idx
+        k_is_prefix = seg[kv_idx] == 0
+        same_branch = seg[kv_idx] == seg[q_idx]
+        return causal & (k_is_prefix | same_branch)
+
+    return create_block_mask(mask_mod, B=1, H=None, Q_LEN=total, KV_LEN=total, device=device)
+
+
+def flex_tree_attention(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, block_mask, scale=None
+) -> torch.Tensor:
+    """Run the tree-masked attention via (compiled) FlexAttention.
+
+    ``query/key/value`` are in Megatron core-attention layout ``[sq, b, n_heads, head_dim]``
+    (key/value may have fewer heads for GQA). Returns the context in ``[sq, b, n_heads*head_dim]``,
+    matching what ``core_attention`` returns to ``linear_proj``.
+    """
+    q = query.permute(1, 2, 0, 3)  # [b, np, sq, hn]
+    k = key.permute(1, 2, 0, 3)  # [b, ng, sk, hn]
+    v = value.permute(1, 2, 0, 3)
+    enable_gqa = q.shape[1] != k.shape[1]
+    out = _get_compiled_flex()(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa, scale=scale)
+    sq, b = query.shape[0], query.shape[1]
+    return out.permute(2, 0, 1, 3).reshape(sq, b, -1).contiguous()  # [sq, b, np*hn]
+
 
 @dataclass
 class SharedPrefixParams:

@@ -165,14 +165,24 @@ class MambaLayer(GraphableMegatronModule):
             y_p, out_bias, conv_ctx, ssm_final = self.mixer.fork_segment(
                 hidden_states[:Lp], capture=True
             )
-            parts = [y_p]
-            cursor = Lp
-            for lc in ctx.completion_lens:
-                y_c, _, _, _ = self.mixer.fork_segment(
-                    hidden_states[cursor:cursor + lc], conv_ctx=conv_ctx, ssm_init=ssm_final
-                )
-                parts.append(y_c)
-                cursor += lc
+            lcs = ctx.completion_lens
+            if lcs:
+                # Batch the G completions into one scan instead of a per-completion loop: stack them
+                # right-padded into (Lmax, G, d_model) and fork all branches from the SAME prefix
+                # end-state in a single batched conv+scan (fork_branches). Equivalent to G separate
+                # fork_segment calls (the scan is independent per batch element) but amortizes the
+                # kernel overhead that made the sequential fork the forward's bottleneck.
+                Lmax = max(lcs)
+                d_model = hidden_states.shape[-1]
+                branches = hidden_states.new_zeros(Lmax, len(lcs), d_model)
+                cursor = Lp
+                for i, lc in enumerate(lcs):
+                    branches[:lc, i, :] = hidden_states[cursor:cursor + lc, 0, :]
+                    cursor += lc
+                out_b, _ = self.mixer.fork_branches(branches, ssm_final, conv_ctx)  # (Lmax,G,d)
+                parts = [y_p] + [out_b[:lc, i:i + 1, :] for i, lc in enumerate(lcs)]
+            else:
+                parts = [y_p]
             # out_bias is the (y-independent) out_proj bias -- identical for every segment.
             mixer_out_with_bias = (torch.cat(parts, dim=0), out_bias)
         else:
