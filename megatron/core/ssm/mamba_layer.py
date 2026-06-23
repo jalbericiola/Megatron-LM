@@ -167,11 +167,14 @@ class MambaLayer(GraphableMegatronModule):
             )
             lcs = ctx.completion_lens
             if lcs:
-                # Batch the G completions into one scan instead of a per-completion loop: stack them
-                # right-padded into (Lmax, G, d_model) and fork all branches from the SAME prefix
-                # end-state in a single batched conv+scan (fork_branches). Equivalent to G separate
-                # fork_segment calls (the scan is independent per batch element) but amortizes the
-                # kernel overhead that made the sequential fork the forward's bottleneck.
+                # Fork the G completions from the prefix end-state in ONE batched conv+scan
+                # (fork_branches): each batch element gets the prefix (conv_ctx, ssm_final) as its
+                # own initial_states. This REQUIRES the batch dim + right-padding to the batch max
+                # -- a true varlen (zero-pad) fork is impossible here: causal_conv1d_fn /
+                # mamba_chunk_scan_combined reset state to ZERO at varlen boundaries and reject
+                # per-segment initial_states ("initial_states must be None if seq_idx is not None").
+                # (Length-bucketing the pad was measured negligible -- the fork is not the
+                # ragged-case bottleneck; the flex attention + MLP over the full packed T are.)
                 Lmax = max(lcs)
                 d_model = hidden_states.shape[-1]
                 branches = hidden_states.new_zeros(Lmax, len(lcs), d_model)

@@ -39,13 +39,19 @@ except ImportError:  # torch < 2.5
 # lengths recompile (and cache) -- acceptable since bin shapes recur within a run. The compiled
 # kernel skips fully-masked (sibling-branch) blocks, which is the whole speedup over the dense
 # [T,T]-mask SDPA path (measured ~11x faster, ~5x faster than the un-shared baseline @ Lp5247/G16).
+#
+# mode="max-autotune-no-cudagraphs": the DEFAULT compile picks a poor BACKWARD kernel (bwd ~13x the
+# fwd; flex bwd 2x SLOWER than flash -> shared-prefix net-loses for TRAINING). Autotuning the fwd+bwd
+# Triton configs cuts the backward ~2.8x (60->21ms @ Lp5247/G16), so flex bwd (21ms) now BEATS flash
+# (37ms) and attention fwd+bwd flips from 0.79x to ~2x. First call autotunes (slow, cached);
+# no-cudagraphs avoids capture conflicts with the RL trainer's own cuda graphs + variable bin shapes.
 _COMPILED_FLEX = None
 
 
 def _get_compiled_flex():
     global _COMPILED_FLEX
     if _COMPILED_FLEX is None:
-        _COMPILED_FLEX = torch.compile(flex_attention)
+        _COMPILED_FLEX = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs")
     return _COMPILED_FLEX
 
 
