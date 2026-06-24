@@ -106,6 +106,65 @@ def flex_tree_attention(
     return out.permute(2, 0, 1, 3).reshape(sq, b, -1).contiguous()  # [sq, b, np*hn]
 
 
+def two_term_tree_attention(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+    prefix_len: int, completion_lens: List[int], scale=None,
+) -> torch.Tensor:
+    """CP-compatible shared-prefix attention as TWO flash terms + an online-softmax (LSE) merge,
+    instead of one FlexAttention tree BlockMask. Numerically equals ``flex_tree_attention`` but uses
+    only dense/causal flash kernels, which (unlike FlexAttention) compose with context parallelism:
+    the prefix K/V are gathered full once, and each completion's queries (the rank-local shard under
+    CP) attend (1) the full prefix non-causally and (2) their own branch causally; the two disjoint
+    key sets are merged exactly via their log-sum-exps.
+
+    For each completion token q (prefix-continued position): the tree softmax is over {all prefix
+    keys} ∪ {own-branch keys causally <= q}. These sets are disjoint, so
+        out = (o1·e^{l1} + o2·e^{l2}) / (e^{l1} + e^{l2})
+    where (o1,l1)=cross-attend(prefix), (o2,l2)=causal-self(own completion), and l* are flash's LSEs
+    (log Σ e^{scaled score}). Prefix tokens are plain causal self-attention within the prefix.
+
+    ``query/key/value``: Megatron core-attention layout ``[sq, b, n_heads, head_dim]`` (b==1 for a
+    packed group; key/value may have fewer heads for GQA -- flash handles GQA natively). Returns the
+    context ``[sq, b, n_heads*head_dim]``, matching ``flex_tree_attention`` / ``core_attention``.
+
+    NOTE: q/k must already carry RoPE (prefix at positions 0..Lp-1, each completion prefix-continued)
+    -- applied upstream, exactly as for the flex path. This function is RoPE-agnostic.
+    """
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+
+    T, b, nq, hd = query.shape
+    assert b == 1, "two_term_tree_attention expects a packed group with batch=1"
+    Lp = int(prefix_len)
+    q, k, v = query[:, 0], key[:, 0], value[:, 0]                 # [T, n*, hd]
+    kp, vp = k[:Lp], v[:Lp]                                       # prefix K/V (full)
+
+    # prefix region: causal self-attention within the prefix
+    op = flash_attn_func(q[:Lp][None], kp[None], vp[None], softmax_scale=scale, causal=True)[0]
+
+    parts = [op]
+    if completion_lens:
+        qc, kc, vc = q[Lp:], k[Lp:], v[Lp:]                      # [Lc_sum, n*, hd]
+        # term1: every completion query attends the FULL prefix (non-causal; all prefix precedes it)
+        o1, l1, _ = flash_attn_func(qc[None], kp[None], vp[None], softmax_scale=scale,
+                                    causal=False, return_attn_probs=True)
+        o1, l1 = o1[0], l1[0]                                     # o1 [Lc,nq,hd], l1 [nq,Lc]
+        # term2: per-completion causal self-attention (varlen block-diagonal over the G branches)
+        cu = torch.zeros(len(completion_lens) + 1, device=q.device, dtype=torch.int32)
+        cu[1:] = torch.tensor(completion_lens, device=q.device, dtype=torch.int32).cumsum(0)
+        maxl = max(completion_lens)
+        o2, l2, _ = flash_attn_varlen_func(qc, kc, vc, cu, cu, maxl, maxl, softmax_scale=scale,
+                                           causal=True, return_attn_probs=True)
+        # online-softmax merge of the two disjoint key sets (LSE in fp32 for stability)
+        l1t = l1.transpose(0, 1).unsqueeze(-1).float()           # [Lc,nq,1]
+        l2t = l2.transpose(0, 1).unsqueeze(-1).float()
+        m = torch.maximum(l1t, l2t)
+        w1, w2 = (l1t - m).exp(), (l2t - m).exp()
+        oc = (o1.float() * w1 + o2.float() * w2) / (w1 + w2)     # [Lc,nq,hd]
+        parts.append(oc.to(query.dtype))
+
+    return torch.cat(parts, dim=0).reshape(T, 1, nq * hd).contiguous()   # [sq, b, nq*hd]
+
+
 @dataclass
 class SharedPrefixParams:
     """Model-forward input describing one packed shared-prefix group ``[P, C_1, ..., C_G]``.
