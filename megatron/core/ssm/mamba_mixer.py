@@ -1126,17 +1126,25 @@ class MambaMixer(MegatronModule):
             (out_bias is the y-independent bias, consumed by MambaLayer's mamba_bda);
             ``conv_ctx_out``/``ssm_final`` are None unless ``capture``.
 
-        NOTE (Phase D): this CP=1 path uses ``self.cp.get_*`` accessors but does NOT route through
-        ``self.cp.pre_conv_ssm``/``post_conv_ssm``; context-parallel forking (P split across CP
-        ranks) is the remaining generalization. Asserts cp_size==1 to fail loudly until then.
+        Context parallelism (cp_size>1): mirrors the production prefill exactly -- in_proj ->
+        ``cp.pre_conv_ssm`` (all_to_all the sequence-sharded ``[L/cp,1,pd]`` to head-sharded full
+        ``[L,1,pd//cp]``) -> conv/scan on the rank's HEAD slice (so the WHOLE segment is local per
+        rank, no cross-rank scan) -> gated RMSNorm AFTER ``cp.post_conv_ssm`` (back to ``[L/cp]``)
+        -> out_proj. The captured ``(conv_ctx_out, ssm_final)`` are head-local and forked head-local
+        by ``fork_branches``; the fork is independent per head so cp2hp makes it correct with no
+        state relay. Identity at cp_size==1 (pre/post_conv_ssm are no-ops, ``*_local_tpcp == *_local_tp``).
+        Uses cp-local dims throughout (also corrects the previous TP>1 dims, which used global).
         """
-        assert self.cp.cp_size == 1, "fork_segment: CP>1 shared-prefix not yet wired (Phase D)"
         assert self.rmsnorm, "fork_segment requires rmsnorm (gated-norm applied after the scan)"
         cp = self.cp
-        ng, ds, nh, hd, dconv = (self.ngroups, self.d_state, self.nheads, self.headdim, self.d_conv)
-        d_inner = self.d_inner
+        # cp-local (TP- and CP-sharded) dims, matching _ssm_prefill (L849-936). d_state/headdim/
+        # d_conv are not CP-sharded.
+        ng, ds, nh, hd, dconv = (
+            cp.ngroups_local_tpcp, self.d_state, cp.nheads_local_tpcp, self.headdim, self.d_conv)
+        d_inner = cp.d_inner_local_tpcp
 
-        zxBCdt, _ = self.in_proj(hidden_states)                       # (L,1,pd)
+        zxBCdt, _ = self.in_proj(hidden_states)                       # (L/cp,1,pd_tp)
+        zxBCdt = cp.pre_conv_ssm(zxBCdt)                              # (L,1,pd_tpcp) head-sharded
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
         A = -torch.exp(cp.get_A_log().float())
         z, xBC, dt = torch.split(zxBCdt, [d_inner, d_inner + 2 * ng * ds, nh], dim=-1)
@@ -1176,8 +1184,12 @@ class MambaMixer(MegatronModule):
         else:
             y, ssm_final = scan, None
 
+        # gated RMSNorm AFTER post_conv_ssm (on the seq-sharded full-feature tensor), exactly as
+        # _ssm_prefill L1081-1087, so the norm's group_size sees the full d_inner_local_tp.
         y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+        y = cp.post_conv_ssm(y)
         zr = rearrange(z4, "b l h p -> l b (h p)").contiguous()
+        zr = cp.post_conv_ssm(zr)
         y = self.norm(y, zr)                                          # gated RMSNorm
         out, out_bias = self.out_proj(y)
         return out, out_bias, conv_ctx_out, ssm_final
@@ -1209,16 +1221,23 @@ class MambaMixer(MegatronModule):
         Returns:
             ``(out, out_bias)`` with ``out`` ``(Lmax, G, d_model)`` -- the caller slices each
             branch to its true length and reassembles into the packed completion region.
+
+        Context parallelism (cp_size>1): identical routing to ``fork_segment`` -- the G completions
+        are the batch dim ``b`` through ``cp.pre_conv_ssm``/``post_conv_ssm`` (the cp2hp all_to_all
+        is rectangular-batch-safe), so each rank scans the FULL ``Lmax`` over its head slice and
+        forks from the head-local ``(conv_ctx, ssm_init)`` captured by ``fork_segment``. Input/output
+        are sequence-sharded along ``Lmax`` (``[Lmax/cp, G, d_model]``); ``Lmax`` must be a multiple
+        of ``2*cp``. Identity at cp_size==1.
         """
-        assert self.cp.cp_size == 1, "fork_branches: CP>1 shared-prefix not yet wired (Phase D)"
         assert self.rmsnorm, "fork_branches requires rmsnorm (gated-norm applied after the scan)"
         cp = self.cp
-        ng, ds, nh, hd = self.ngroups, self.d_state, self.nheads, self.headdim
-        d_inner = self.d_inner
-        Lmax, G, _ = branches.shape
+        ng, ds, nh, hd = cp.ngroups_local_tpcp, self.d_state, cp.nheads_local_tpcp, self.headdim
+        d_inner = cp.d_inner_local_tpcp
+        Lmax, G, _ = branches.shape                                   # Lmax is LOCAL (Lmax_global/cp)
 
-        zxBCdt, _ = self.in_proj(branches)                            # (Lmax, G, pd)
-        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()     # (G, Lmax, pd)
+        zxBCdt, _ = self.in_proj(branches)                            # (Lmax/cp, G, pd_tp)
+        zxBCdt = cp.pre_conv_ssm(zxBCdt)                              # (Lmax, G, pd_tpcp) head-sharded
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()     # (G, Lmax, pd_tpcp)
         A = -torch.exp(cp.get_A_log().float())
         z, xBC, dt = torch.split(zxBCdt, [d_inner, d_inner + 2 * ng * ds, nh], dim=-1)
 
@@ -1249,10 +1268,13 @@ class MambaMixer(MegatronModule):
                or not _MAMBA_CHUNK_SCAN_HAS_STATE_DTYPE
                else {"state_dtype": self.mamba_training_ssm_states_dtype}),
         )
-        y = rearrange(y, "b l h p -> l b (h p)").contiguous()         # (Lmax, G, d_inner)
+        # gated RMSNorm AFTER post_conv_ssm (seq-sharded full-feature), mirroring _ssm_prefill.
+        y = rearrange(y, "b l h p -> l b (h p)").contiguous()         # (Lmax, G, d_inner_tpcp)
+        y = cp.post_conv_ssm(y)                                       # (Lmax/cp, G, d_inner_tp)
         zr = rearrange(z4, "b l h p -> l b (h p)").contiguous()
+        zr = cp.post_conv_ssm(zr)
         y = self.norm(y, zr)                                          # gated RMSNorm
-        out, out_bias = self.out_proj(y)                              # (Lmax, G, d_model)
+        out, out_bias = self.out_proj(y)                              # (Lmax/cp, G, d_model)
         return out, out_bias
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
