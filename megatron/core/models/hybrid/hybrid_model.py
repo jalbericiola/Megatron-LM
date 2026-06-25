@@ -521,6 +521,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     else attention_mask
                 ),
                 rotary_pos_emb=rotary_pos_emb,
+                real_prefix_len=shared_prefix_params.real_prefix_len,
+                real_completion_lens=shared_prefix_params.real_completion_lens,
             )
         else:
             hidden_states = self.decoder(

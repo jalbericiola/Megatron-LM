@@ -445,6 +445,45 @@ def build_shared_prefix_bins(
     return bins, sorted(blockdiag)
 
 
+def cp_pad_shared_inputs(packed_tokens, position_ids, prefix_len, completion_lens, cp_size, device):
+    """Pad a shared-prefix packed sequence so every segment is a multiple of 2*cp (CP zigzag) and
+    all completions share a COMMON length (uniform Mamba fork batch). Pads at each segment's END.
+
+    Returns ``(padded_tokens [1,T_pad], padded_positions [1,T_pad], prefix_len_pad, comp_len_pad,
+    real_idx [T_real])`` where ``real_idx`` maps each REAL packed position (in real packed order) to
+    its index in the padded sequence -- so gathered padded logits ``[T_pad,vocab]`` indexed by
+    ``real_idx`` recover the real ``[T_real,vocab]`` for the unchanged ``extract_completion_logprobs``.
+    Pad token id 0 / continuation positions (both unused: pads are loss-masked, excluded as attention
+    keys, and dropped from the Mamba capture)."""
+    cp2 = 2 * cp_size
+    Lp_r, lcs_r = int(prefix_len), [int(c) for c in completion_lens]
+    Lp_p = ((Lp_r + cp2 - 1) // cp2) * cp2
+    Lc_p = (((max(lcs_r) + cp2 - 1) // cp2) * cp2) if lcs_r else 0
+    toks = packed_tokens.view(-1)
+    seg_starts, c = [0], Lp_r
+    for lc in lcs_r:
+        seg_starts.append(c); c += lc
+    pt, pp, real_idx, opad = [], [], [], 0
+
+    def _emit(real_slice_tokens, real_lo, real_len_, pad_to):
+        nonlocal opad
+        pt.append(real_slice_tokens)
+        pt.append(real_slice_tokens.new_zeros(pad_to - real_len_))
+        pp.append(torch.arange(real_lo, real_lo + real_len_, device=device))
+        pp.append(torch.arange(real_lo + real_len_, real_lo + pad_to, device=device))
+        real_idx.extend(range(opad, opad + real_len_))
+        opad += pad_to
+
+    _emit(toks[:Lp_r], 0, Lp_r, Lp_p)                       # prefix -> positions 0..Lp_r-1
+    for i, lc in enumerate(lcs_r):
+        s = seg_starts[i + 1]
+        _emit(toks[s:s + lc], Lp_r, lc, Lc_p)               # completion -> prefix-continued Lp_r..
+    padded_tokens = torch.cat(pt).view(1, -1)
+    padded_positions = torch.cat(pp).view(1, -1)
+    return (padded_tokens, padded_positions, Lp_p, Lc_p,
+            torch.tensor(real_idx, dtype=torch.long, device=device))
+
+
 def extract_completion_logprobs(
     logits: torch.Tensor, packed_tokens: torch.Tensor, layout: SharedPrefixLayout
 ) -> torch.Tensor:

@@ -1137,6 +1137,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             # routes to the two-pass forward instead of the dense decoder.
             spp = None
             cp_sp_layout = None
+            cp_real_idx = None
             if shared_prefix_layout is not None:
                 from megatron.core.models.hybrid.shared_prefix import (
                     HAVE_FLEX_ATTENTION,
@@ -1159,25 +1160,36 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 )
 
             if cp_size > 1 and spp is not None:
-                # CP + shared-prefix (Phase D): scatter the packed [P,C_1..C_G] per-segment-zigzag to
-                # this rank's local [1, T/cp]; the model routes to forward_shared_prefix, which forks
-                # Mamba (pre/post_conv_ssm) and gathers attention K/V internally. FULL position_ids
-                # drive position-aware RoPE (forward_shared_prefix slices it to the local tokens).
-                from megatron.core.models.hybrid.shared_prefix import CPSharedPrefixLayout
-
-                cp_sp_layout = CPSharedPrefixLayout(
-                    spp.prefix_len, list(spp.completion_lens), cp_size,
-                    mpu.get_context_parallel_rank(), tokens.device,
+                # CP + shared-prefix (Phase D): end-pad each segment to a multiple of 2*cp and all
+                # completions to a COMMON length (uniform Mamba fork), scatter per-segment-zigzag to
+                # this rank's local [1, T_pad/cp], and forward (the model forks Mamba + gathers
+                # attention K/V internally; real lengths drive the fork capture + attention pad-mask;
+                # FULL prefix-continued position_ids drive RoPE, sliced internally).
+                from megatron.core.models.hybrid.shared_prefix import (
+                    CPSharedPrefixLayout,
+                    SharedPrefixParams,
                 )
+                from megatron.rl.shared_prefix_packing import cp_pad_shared_inputs
+
+                Lp_r, lcs_r = spp.prefix_len, list(spp.completion_lens)
+                pad_toks, pad_pos, Lp_p, Lc_p, cp_real_idx = cp_pad_shared_inputs(
+                    tokens[0, :spp.total_len], None, Lp_r, lcs_r, cp_size, tokens.device)
+                Gn = len(lcs_r)
+                spp_pad = SharedPrefixParams(
+                    prefix_len=Lp_p, completion_lens=[Lc_p] * Gn, position_ids=pad_pos[0],
+                    real_prefix_len=Lp_r, real_completion_lens=lcs_r)
+                cp_sp_layout = CPSharedPrefixLayout(
+                    Lp_p, [Lc_p] * Gn, cp_size, mpu.get_context_parallel_rank(), tokens.device,
+                    real_prefix_len=Lp_r, real_completion_lens=lcs_r)
                 lgp = cp_sp_layout.local_global_pos
                 with torch.no_grad() if no_grad else nullcontext():
                     logits_or_hidden_states = model(
-                        tokens[:, :spp.total_len][:, lgp],
-                        position_ids[:, :spp.total_len][:, lgp],
+                        pad_toks[:, lgp],
+                        pad_pos[:, lgp],
                         attention_mask_for_forward,
                         runtime_gather_output=True,
                         fp32_output=fp32_output,
-                        shared_prefix_params=spp,
+                        shared_prefix_params=spp_pad,
                     )
             elif cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
@@ -1235,12 +1247,14 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 from megatron.rl.shared_prefix_packing import extract_completion_logprobs
                 L = shared_prefix_layout
                 if cp_size > 1:
-                    # CP: all-gather the rank-local logits to the FULL global-order sequence
-                    # (un-zigzag per segment; differentiable), then the unchanged cp=1 fan-out.
-                    # NOTE: gathers full [T, vocab] -- fine at moderate seq length; the memory-optimal
-                    # scattered fan-out (broadcast only logits[Lp-1]) is a follow-up for the flagship.
+                    # CP: all-gather the rank-local logits to the FULL global-order PADDED sequence
+                    # (un-zigzag per segment; differentiable), drop the pads back to the REAL packed
+                    # order (cp_real_idx), then the unchanged cp=1 fan-out on the REAL layout.
+                    # NOTE: gathers full [T_pad, vocab] -- fine at moderate seq length; the
+                    # memory-optimal scattered fan-out (broadcast only logits[Lp-1]) is a follow-up.
                     full_logits = cp_sp_layout._gather(logits[0], mpu.get_context_parallel_group())
-                    comp_lp = extract_completion_logprobs(full_logits, tokens[0, :L.total_len], L)
+                    real_logits = full_logits[cp_real_idx]       # [T_pad,vocab] -> [T_real,vocab]
+                    comp_lp = extract_completion_logprobs(real_logits, tokens[0, :L.total_len], L)
                 else:
                     comp_lp = extract_completion_logprobs(
                         logits[0, :L.total_len, :], tokens[0, :L.total_len], L

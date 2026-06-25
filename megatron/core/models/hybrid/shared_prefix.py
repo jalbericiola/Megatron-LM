@@ -305,6 +305,11 @@ class SharedPrefixParams:
     # prefix-continued positions [total_len] (P -> 0..Lp-1, each C_i -> Lp..Lp+Lc_i-1) for
     # position-aware RoPE; None falls back to packed-index RoPE (only correct without attention).
     position_ids: Optional[torch.Tensor] = None
+    # Under CP, prefix_len/completion_lens are the PADDED (multiple-of-2*cp) segment lengths; these
+    # carry the REAL (unpadded) lengths so the Mamba fork captures at the real prefix end and the
+    # attention excludes end-pad keys. None -> no padding (real == padded).
+    real_prefix_len: Optional[int] = None
+    real_completion_lens: Optional[List[int]] = None
 
     @property
     def total_len(self) -> int:
