@@ -1094,6 +1094,7 @@ class MambaMixer(MegatronModule):
         conv_ctx: Optional[torch.Tensor] = None,
         ssm_init: Optional[torch.Tensor] = None,
         capture: bool = False,
+        real_len: Optional[int] = None,
     ):
         """Shared-prefix ("tree") two-pass SSM segment: scan one segment of a sequence with the
         conv + SSM state forked from a prefix, and (optionally) capture this segment's end-states.
@@ -1151,9 +1152,16 @@ class MambaMixer(MegatronModule):
 
         # --- conv (silu) with prefix-context prepended (== causal_conv1d initial_states) ---
         xBC = rearrange(xBC, "b l d -> b d l").contiguous()           # (b, conv_dim, l)
+        # real_len: when the segment is end-padded to a multiple of 2*cp (Phase D, arbitrary
+        # prefix lengths), the scan output is causal so real positions are unaffected by trailing
+        # pads -- but the CAPTURED conv_ctx/ssm_final must be taken at the REAL last token, not the
+        # padded end (the SSM state would otherwise evolve over the pad tokens). So capture at
+        # real_len and scan only [:real_len].
+        L_full = xBC.shape[-1]
+        rl = L_full if real_len is None else int(real_len)
         # NOT detached: the branch's conv sees P's last conv-input columns, so gradient must flow
         # back through them to P -- exactly as the SSM initial_states path does.
-        conv_ctx_out = xBC[:, :, -(dconv - 1):].clone() if capture else None
+        conv_ctx_out = xBC[:, :, rl - (dconv - 1):rl].clone() if capture else None
         w = rearrange(cp.get_conv1d_weight(), "d 1 w -> d w")
         b = cp.get_conv1d_bias()
         if conv_ctx is not None:
@@ -1169,8 +1177,12 @@ class MambaMixer(MegatronModule):
         C = rearrange(C, "b l (g n) -> b l g n", n=ds).contiguous()
         z4 = rearrange(z, "b l (h p) -> b l h p", p=hd).contiguous()
 
+        # Scan only the REAL tokens [:rl] -- causal, so real-position outputs equal the full-scan's,
+        # and the captured ssm_final is at the real last token (not the padded end). The pad
+        # positions' output is zero-filled (discarded downstream by the completion-only loss mask).
         scan = mamba_chunk_scan_combined(
-            x, dt.contiguous(), A, B, C, self.chunk_size,
+            x[:, :rl].contiguous(), dt[:, :rl].contiguous(), A, B[:, :rl].contiguous(),
+            C[:, :rl].contiguous(), self.chunk_size,
             D=(rearrange(cp.get_D().float(), "(h p) -> h p", p=hd) if self.D_has_hdim
                else cp.get_D()),
             z=None, dt_bias=cp.get_dt_bias().float(), dt_softplus=True,
@@ -1183,6 +1195,10 @@ class MambaMixer(MegatronModule):
             y, ssm_final = scan
         else:
             y, ssm_final = scan, None
+        if rl < L_full:                                              # restore padded length (zeros)
+            y_full = y.new_zeros(y.shape[0], L_full, *y.shape[2:])
+            y_full[:, :rl] = y
+            y = y_full
 
         # gated RMSNorm AFTER post_conv_ssm (on the seq-sharded full-feature tensor), exactly as
         # _ssm_prefill L1081-1087, so the norm's group_size sees the full d_inner_local_tp.
