@@ -376,6 +376,7 @@ class HybridStack(MegatronModule):
         attention_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
         real_prefix_len: Optional[int] = None,
+        real_completion_lens=None,
     ):
         """Shared-prefix ("tree") packed forward for a GRPO group.
 
@@ -428,7 +429,8 @@ class HybridStack(MegatronModule):
             cp_group = _ps.get_context_parallel_group()
             cp_layout = CPSharedPrefixLayout(
                 prefix_len, completion_lens, cp_size, _ps.get_context_parallel_rank(),
-                hidden_states.device,
+                hidden_states.device, real_prefix_len=real_prefix_len,
+                real_completion_lens=real_completion_lens,
             )
             # rotary_pos_emb arrives FULL [T, ...] (built from the global prefix-continued
             # position_ids); slice it to this rank's local tokens so attention applies the right

@@ -106,7 +106,8 @@ def flex_tree_attention(
     return out.permute(2, 0, 1, 3).reshape(sq, b, -1).contiguous()  # [sq, b, np*hn]
 
 
-def build_local_tree_block_mask(q_global_pos: torch.Tensor, seg_full: torch.Tensor, device):
+def build_local_tree_block_mask(q_global_pos: torch.Tensor, seg_full: torch.Tensor, device,
+                                is_pad_full: Optional[torch.Tensor] = None):
     """Tree ``BlockMask`` for a CP rank's LOCAL queries against the FULL (gathered) key sequence.
 
     ``q_global_pos[i]`` is the global packed position of local query ``i``; ``seg_full[j]`` is the
@@ -128,7 +129,10 @@ def build_local_tree_block_mask(q_global_pos: torch.Tensor, seg_full: torch.Tens
         ki = torch.clamp(kv_idx, max=T - 1)
         causal = kv_idx <= q_global_pos[qi]
         same = (seg_full[ki] == 0) | (seg_full[ki] == seg_q[qi])
-        return in_range & causal & same
+        keep = in_range & causal & same
+        if is_pad_full is not None:
+            keep = keep & ~is_pad_full[ki]                  # never attend an end-pad key
+        return keep
 
     return create_block_mask(mask_mod, B=1, H=None, Q_LEN=n_local, KV_LEN=T, device=device)
 
@@ -166,11 +170,22 @@ class CPSharedPrefixLayout:
     Each segment length must be a multiple of ``2*cp_size`` (the zigzag chunking).
     """
 
-    def __init__(self, prefix_len, completion_lens, cp_size, cp_rank, device):
+    def __init__(self, prefix_len, completion_lens, cp_size, cp_rank, device,
+                 real_prefix_len=None, real_completion_lens=None):
         self.cp_size, self.cp_rank, self.device = cp_size, cp_rank, device
         self.global_seg_lens = [int(prefix_len)] + [int(c) for c in completion_lens]
         assert all(L % (2 * cp_size) == 0 for L in self.global_seg_lens), (
             f"each segment must be a multiple of 2*cp ({2 * cp_size}); got {self.global_seg_lens}")
+        # per-segment REAL lengths (<= padded global len); positions beyond them are end-pads,
+        # excluded as attention keys (the Mamba fork excludes them via fork_segment real_len).
+        real_lens = [int(real_prefix_len) if real_prefix_len is not None else int(prefix_len)] + (
+            [int(c) for c in real_completion_lens] if real_completion_lens is not None
+            else [int(c) for c in completion_lens])
+        ispad = []
+        for L, rl in zip(self.global_seg_lens, real_lens):
+            ispad += [0] * rl + [1] * (L - rl)
+        self.is_pad_full = torch.tensor(ispad, dtype=torch.bool, device=device)
+        self.any_pad = bool(self.is_pad_full.any().item())
         self.local_seg_lens = [L // cp_size for L in self.global_seg_lens]
         self.total_local = sum(self.local_seg_lens)
         self.total_global = sum(self.global_seg_lens)
@@ -208,7 +223,9 @@ class CPSharedPrefixLayout:
         return self._gather(key_local, cp_group), self._gather(value_local, cp_group)
 
     def local_block_mask(self):
-        return build_local_tree_block_mask(self.local_global_pos, self.seg_full, self.device)
+        return build_local_tree_block_mask(
+            self.local_global_pos, self.seg_full, self.device,
+            is_pad_full=self.is_pad_full if self.any_pad else None)
 
 
 def two_term_tree_attention(
