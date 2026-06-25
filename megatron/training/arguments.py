@@ -576,10 +576,11 @@ def validate_args(args, defaults={}):
             assert args.rl_use_sequence_packing, \
                 "--rl-sequence-packing-shared-prefix requires --rl-use-sequence-packing."
             # The two-pass forward (MambaMixer.fork_segment + tree-mask attention) is wired into
-            # HybridModel.forward and get_logprobs, validated CP=1. Remaining limitations:
-            assert args.context_parallel_size == 1, (
-                "--rl-sequence-packing-shared-prefix is CP=1 only for now (the Mamba fork + the "
-                "shared-prefix get_logprobs path assert cp_size==1; CP>1 is Phase D).")
+            # HybridModel.forward and get_logprobs, validated CP=1 AND CP>1 (Phase D: the Mamba fork
+            # routes through pre/post_conv_ssm and attention gathers K/V + local-query tree flex on
+            # the segment-local-zigzag transport; forward+backward bit-exact vs CP=1). The CP>1
+            # logprob path all-gathers the local logits (approach a; memory-optimal scattered fan-out
+            # is a follow-up), so it is best for high-prompt-fraction envs at moderate seq length.
             if getattr(args, 'rl_inference_logprobs_is_correction', False):
                 warnings.warn(
                     "--rl-sequence-packing-shared-prefix with IS-correction: inference logprobs "
@@ -2504,6 +2505,20 @@ def _add_rl_args(parser):
     group.add_argument('--rl-dynamic-maxlen-reward-refresh-frac', type=float, default=0.05,
                        help='reward controller: probability of generating UNCAPPED post-warmup, to '
                             'keep observing the true (uncensored) length tail as the policy drifts.')
+    group.add_argument('--rl-dynamic-maxlen-reward-protect-delta', type=float, default=0.03,
+                       help='reward controller protection guard: if an env\'s UNCAPPED-phase reward '
+                            'exceeds its CAPPED-phase reward by more than this, the cap is '
+                            'suppressing reward (e.g. multi-turn envs whose responses get '
+                            'truncated) -> revert that env to ~uncapped. Prevents the reward-mass '
+                            'percentile from getting stuck in a low-reward local optimum.')
+    group.add_argument('--rl-dynamic-maxlen-reward-protect-min-samples', type=int, default=32,
+                       help='reward controller protection guard: min capped AND uncapped rollout '
+                            'samples per env before the guard can trip.')
+    group.add_argument('--rl-dynamic-maxlen-reward-protect-percentile', type=float, default=0.99,
+                       help='reward controller protection guard: when it fires, cap at THIS '
+                            'percentile of the env\'s true uncapped completion lengths instead of '
+                            'going fully uncapped -- trims the runaway-long tail while preserving '
+                            'the reward-bearing bulk (1.0 == fully uncapped).')
     group.add_argument('--rl-dynamic-maxlen-bandit-arms', type=str,
                        default='0.75,1.0,1.25,1.5,2.0,3.0',
                        help='Comma-separated cap multiplier arms for bandit controller.')

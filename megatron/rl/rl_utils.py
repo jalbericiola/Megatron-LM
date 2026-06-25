@@ -1136,8 +1136,8 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             # positions) and slice to the packed [P, C_1..C_G] length, so HybridModel.forward
             # routes to the two-pass forward instead of the dense decoder.
             spp = None
+            cp_sp_layout = None
             if shared_prefix_layout is not None:
-                assert cp_size == 1, "shared-prefix forward not yet wired for CP>1 (Phase D)"
                 from megatron.core.models.hybrid.shared_prefix import (
                     HAVE_FLEX_ATTENTION,
                     SharedPrefixParams,
@@ -1158,7 +1158,28 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     attention_mask=tree_mask, position_ids=L.position_ids.to(tokens.device),
                 )
 
-            if cp_size > 1:
+            if cp_size > 1 and spp is not None:
+                # CP + shared-prefix (Phase D): scatter the packed [P,C_1..C_G] per-segment-zigzag to
+                # this rank's local [1, T/cp]; the model routes to forward_shared_prefix, which forks
+                # Mamba (pre/post_conv_ssm) and gathers attention K/V internally. FULL position_ids
+                # drive position-aware RoPE (forward_shared_prefix slices it to the local tokens).
+                from megatron.core.models.hybrid.shared_prefix import CPSharedPrefixLayout
+
+                cp_sp_layout = CPSharedPrefixLayout(
+                    spp.prefix_len, list(spp.completion_lens), cp_size,
+                    mpu.get_context_parallel_rank(), tokens.device,
+                )
+                lgp = cp_sp_layout.local_global_pos
+                with torch.no_grad() if no_grad else nullcontext():
+                    logits_or_hidden_states = model(
+                        tokens[:, :spp.total_len][:, lgp],
+                        position_ids[:, :spp.total_len][:, lgp],
+                        attention_mask_for_forward,
+                        runtime_gather_output=True,
+                        fp32_output=fp32_output,
+                        shared_prefix_params=spp,
+                    )
+            elif cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
                 local_tokens, local_position_ids, cp_packed_seq_params, local_labels = (
                     _scatter_for_context_parallel(tokens, position_ids, packed_seq_params, cp_size)
@@ -1213,9 +1234,17 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 # machinery (which expects the next-token-shifted layout) is unchanged.
                 from megatron.rl.shared_prefix_packing import extract_completion_logprobs
                 L = shared_prefix_layout
-                comp_lp = extract_completion_logprobs(
-                    logits[0, :L.total_len, :], tokens[0, :L.total_len], L
-                )
+                if cp_size > 1:
+                    # CP: all-gather the rank-local logits to the FULL global-order sequence
+                    # (un-zigzag per segment; differentiable), then the unchanged cp=1 fan-out.
+                    # NOTE: gathers full [T, vocab] -- fine at moderate seq length; the memory-optimal
+                    # scattered fan-out (broadcast only logits[Lp-1]) is a follow-up for the flagship.
+                    full_logits = cp_sp_layout._gather(logits[0], mpu.get_context_parallel_group())
+                    comp_lp = extract_completion_logprobs(full_logits, tokens[0, :L.total_len], L)
+                else:
+                    comp_lp = extract_completion_logprobs(
+                        logits[0, :L.total_len, :], tokens[0, :L.total_len], L
+                    )
                 logprobs = torch.zeros(
                     (1, tokens.shape[1] - 1), dtype=comp_lp.dtype, device=comp_lp.device
                 )
