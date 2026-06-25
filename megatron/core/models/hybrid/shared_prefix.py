@@ -106,6 +106,46 @@ def flex_tree_attention(
     return out.permute(2, 0, 1, 3).reshape(sq, b, -1).contiguous()  # [sq, b, np*hn]
 
 
+def build_local_tree_block_mask(q_global_pos: torch.Tensor, seg_full: torch.Tensor, device):
+    """Tree ``BlockMask`` for a CP rank's LOCAL queries against the FULL (gathered) key sequence.
+
+    ``q_global_pos[i]`` is the global packed position of local query ``i``; ``seg_full[j]`` is the
+    segment id (0=prefix, b+1=branch b) of full-key ``j``. A local query attends a key iff the key is
+    causally before it (by GLOBAL position) AND (key is prefix OR same branch). Q_LEN=n_local,
+    KV_LEN=T -- a non-square mask, so each CP rank attends the whole prefix + its branch keys while
+    computing only its own query rows. Returns None if FlexAttention is unavailable.
+    """
+    if not HAVE_FLEX_ATTENTION:
+        return None
+    n_local, T = int(q_global_pos.numel()), int(seg_full.numel())
+    seg_q = seg_full[q_global_pos]                                # [n_local]
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        causal = kv_idx <= q_global_pos[q_idx]
+        return causal & ((seg_full[kv_idx] == 0) | (seg_full[kv_idx] == seg_q[q_idx]))
+
+    return create_block_mask(mask_mod, B=1, H=None, Q_LEN=n_local, KV_LEN=T, device=device)
+
+
+def local_tree_attention(
+    query_local: torch.Tensor, key_full: torch.Tensor, value_full: torch.Tensor,
+    block_mask, scale=None,
+) -> torch.Tensor:
+    """CP shared-prefix attention: a rank's LOCAL queries attend the FULL (gathered) K/V via the
+    tree mask. ``query_local`` ``[n_local, b, nq, hd]`` (the rank's shard, post-RoPE); ``key/value_full``
+    ``[T, b, nk, hd]`` (all CP ranks' K/V gathered to global order, post-RoPE; nk<=nq for GQA).
+    Returns ``[n_local, b, nq*hd]``. The K/V are gathered (cheap under GQA) so each rank reuses the
+    validated dense FlexAttention kernel locally -- no distributed-attention kernel needed; the
+    gather's autograd reduce-scatters the K/V gradient back across CP."""
+    q = query_local.permute(1, 2, 0, 3)                          # [b, nq, n_local, hd]
+    k = key_full.permute(1, 2, 0, 3)                             # [b, nk, T, hd]
+    v = value_full.permute(1, 2, 0, 3)
+    enable_gqa = q.shape[1] != k.shape[1]
+    out = _get_compiled_flex()(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa, scale=scale)
+    n_local, b = query_local.shape[0], query_local.shape[1]
+    return out.permute(2, 0, 1, 3).reshape(n_local, b, -1).contiguous()
+
+
 def two_term_tree_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
     prefix_len: int, completion_lens: List[int], scale=None,

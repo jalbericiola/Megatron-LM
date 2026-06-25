@@ -406,17 +406,33 @@ class HybridStack(MegatronModule):
             (total_len, 1, D) packed output (post final-norm); slice per the layout to recover each
             completion's hidden states / logits.
         """
-        ctx = SharedPrefixContext(prefix_len, completion_lens)
+        from megatron.core import parallel_state as _ps
+
+        cp_size = _ps.get_context_parallel_world_size()
+        if cp_size > 1:
+            # Context-parallel (Phase D): the packed sequence is sharded per-segment via the
+            # load-balanced zigzag (each segment independently), so hidden_states is the rank-local
+            # [T/cp]. MambaLayer slices the LOCAL segment shards and fork_segment/fork_branches
+            # all_to_all them to head-parallel full-segment internally (pre/post_conv_ssm); hence the
+            # ctx carries LOCAL segment lengths. Each segment must be a multiple of 2*cp (the zigzag).
+            assert prefix_len % (2 * cp_size) == 0 and all(
+                c % (2 * cp_size) == 0 for c in completion_lens
+            ), f"shared-prefix CP={cp_size}: each segment must be a multiple of 2*cp_size"
+            ctx = SharedPrefixContext(prefix_len // cp_size, [c // cp_size for c in completion_lens])
+        else:
+            ctx = SharedPrefixContext(prefix_len, completion_lens)
         assert hidden_states.shape[0] == ctx.total_len, (
-            f"packed length {hidden_states.shape[0]} != Lp+sum(Lc) {ctx.total_len}"
+            f"packed length {hidden_states.shape[0]} != Lp+sum(Lc) {ctx.total_len} (cp={cp_size})"
         )
         # Prefer FlexAttention for the tree mask: a sparse BlockMask that skips the fully-masked
         # sibling-branch blocks (~5x faster than the un-shared baseline, ~11x faster than the dense
         # [T,T]-mask SDPA path). Fall back to the dense `attention_mask` only if FlexAttention is
         # unavailable (torch < 2.5) or the layout couldn't build a BlockMask.
+        # The global tree BlockMask is for the cp=1 full-sequence path. Under CP the attention runs
+        # gather-KV + local-query tree flex (step 6b-2); not yet wired, so guard below.
         block_mask = (
             build_tree_block_mask(prefix_len, completion_lens, hidden_states.device)
-            if HAVE_FLEX_ATTENTION
+            if HAVE_FLEX_ATTENTION and cp_size == 1
             else None
         )
         for layer in self.layers:
@@ -428,9 +444,14 @@ class HybridStack(MegatronModule):
                 )
             elif isinstance(layer, TransformerLayer):
                 if isinstance(layer.self_attention, IdentityOp):
-                    # MLP / MoE (stateless)
+                    # MLP / MoE (stateless) -- runs per-token, CP-agnostic on the local [T/cp]
                     hidden_states = layer(
                         hidden_states=hidden_states, attention_mask=attention_mask
+                    )
+                elif cp_size > 1:
+                    # Real attention under CP needs gather-KV + local-query tree flex (step 6b-2).
+                    raise NotImplementedError(
+                        "shared-prefix real attention under CP>1 not yet wired (Phase D step 6b-2)"
                     )
                 elif block_mask is not None:
                     # real attention via FlexAttention tree BlockMask (+ position-aware RoPE). The
