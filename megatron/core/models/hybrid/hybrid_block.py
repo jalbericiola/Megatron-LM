@@ -23,6 +23,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.shared_prefix import (
     HAVE_FLEX_ATTENTION,
+    CPSharedPrefixLayout,
     SharedPrefixContext,
     build_tree_block_mask,
 )
@@ -419,8 +420,21 @@ class HybridStack(MegatronModule):
                 c % (2 * cp_size) == 0 for c in completion_lens
             ), f"shared-prefix CP={cp_size}: each segment must be a multiple of 2*cp_size"
             ctx = SharedPrefixContext(prefix_len // cp_size, [c // cp_size for c in completion_lens])
+            cp_group = _ps.get_context_parallel_group()
+            cp_layout = CPSharedPrefixLayout(
+                prefix_len, completion_lens, cp_size, _ps.get_context_parallel_rank(),
+                hidden_states.device,
+            )
+            # rotary_pos_emb arrives FULL [T, ...] (built from the global prefix-continued
+            # position_ids); slice it to this rank's local tokens so attention applies the right
+            # per-token RoPE with no further CP slicing.
+            rotary_local = (
+                rotary_pos_emb.index_select(0, cp_layout.local_global_pos)
+                if rotary_pos_emb is not None else None
+            )
         else:
             ctx = SharedPrefixContext(prefix_len, completion_lens)
+            cp_layout = cp_group = rotary_local = None
         assert hidden_states.shape[0] == ctx.total_len, (
             f"packed length {hidden_states.shape[0]} != Lp+sum(Lc) {ctx.total_len} (cp={cp_size})"
         )
@@ -449,10 +463,17 @@ class HybridStack(MegatronModule):
                         hidden_states=hidden_states, attention_mask=attention_mask
                     )
                 elif cp_size > 1:
-                    # Real attention under CP needs gather-KV + local-query tree flex (step 6b-2).
-                    raise NotImplementedError(
-                        "shared-prefix real attention under CP>1 not yet wired (Phase D step 6b-2)"
-                    )
+                    # Real attention under CP: gather-KV + local-query tree flex. The local q/k get
+                    # per-token RoPE from rotary_local (no further CP slice); the hook gathers K/V.
+                    layer.self_attention._sp_cp_ctx = (cp_layout, cp_group)
+                    try:
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=None,
+                            rotary_pos_emb=rotary_local,
+                        )
+                    finally:
+                        layer.self_attention._sp_cp_ctx = None
                 elif block_mask is not None:
                     # real attention via FlexAttention tree BlockMask (+ position-aware RoPE). The
                     # dense mask is not materialized; _run_core_attention reads `_sp_block_mask`.

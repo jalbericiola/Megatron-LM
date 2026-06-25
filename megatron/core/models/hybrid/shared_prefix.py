@@ -121,8 +121,14 @@ def build_local_tree_block_mask(q_global_pos: torch.Tensor, seg_full: torch.Tens
     seg_q = seg_full[q_global_pos]                                # [n_local]
 
     def mask_mod(b, h, q_idx, kv_idx):
-        causal = kv_idx <= q_global_pos[q_idx]
-        return causal & ((seg_full[kv_idx] == 0) | (seg_full[kv_idx] == seg_q[q_idx]))
+        # create_block_mask rounds Q_LEN/KV_LEN up to the block size and evaluates mask_mod at
+        # PADDED indices, so clamp before gathering (avoid OOB) and mask the padded region out.
+        in_range = (q_idx < n_local) & (kv_idx < T)
+        qi = torch.clamp(q_idx, max=n_local - 1)
+        ki = torch.clamp(kv_idx, max=T - 1)
+        causal = kv_idx <= q_global_pos[qi]
+        same = (seg_full[ki] == 0) | (seg_full[ki] == seg_q[qi])
+        return in_range & causal & same
 
     return create_block_mask(mask_mod, B=1, H=None, Q_LEN=n_local, KV_LEN=T, device=device)
 
@@ -144,6 +150,65 @@ def local_tree_attention(
     out = _get_compiled_flex()(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa, scale=scale)
     n_local, b = query_local.shape[0], query_local.shape[1]
     return out.permute(2, 0, 1, 3).reshape(n_local, b, -1).contiguous()
+
+
+class CPSharedPrefixLayout:
+    """Per-CP-rank layout for the segment-local-zigzag shared-prefix transport (Phase D).
+
+    The packed ``[P, C_1, ..., C_G]`` is sharded by zigzag-splitting EACH segment independently
+    across the CP group; rank r's local sequence is the concatenation of its zigzag shard of every
+    segment. Built from the GLOBAL (prefix_len, completion_lens) + cp_size/cp_rank, it exposes:
+      * ``local_global_pos`` [T_local]: the global packed position of each local token (drives the
+        local-query tree mask and the RoPE slice);
+      * ``seg_full`` [T]: segment id (0=prefix, b+1=branch b) of each global position;
+      * ``gather_kv``: differentiable all-gather of the rank-local K/V to the FULL global-order
+        sequence (un-zigzagging each segment), so attention runs ``local_tree_attention``.
+    Each segment length must be a multiple of ``2*cp_size`` (the zigzag chunking).
+    """
+
+    def __init__(self, prefix_len, completion_lens, cp_size, cp_rank, device):
+        self.cp_size, self.cp_rank, self.device = cp_size, cp_rank, device
+        self.global_seg_lens = [int(prefix_len)] + [int(c) for c in completion_lens]
+        assert all(L % (2 * cp_size) == 0 for L in self.global_seg_lens), (
+            f"each segment must be a multiple of 2*cp ({2 * cp_size}); got {self.global_seg_lens}")
+        self.local_seg_lens = [L // cp_size for L in self.global_seg_lens]
+        self.total_local = sum(self.local_seg_lens)
+        self.total_global = sum(self.global_seg_lens)
+        lgp, gstart = [], 0
+        for L in self.global_seg_lens:                       # zigzag positions of rank cp_rank
+            cs = L // (2 * cp_size)
+            r = cp_rank
+            lgp += list(range(gstart + r * cs, gstart + (r + 1) * cs))
+            lgp += list(range(gstart + (2 * cp_size - 1 - r) * cs, gstart + (2 * cp_size - r) * cs))
+            gstart += L
+        self.local_global_pos = torch.tensor(lgp, dtype=torch.long, device=device)
+        seg = []
+        for s, L in enumerate(self.global_seg_lens):
+            seg += [s] * L
+        self.seg_full = torch.tensor(seg, dtype=torch.long, device=device)
+
+    def _gather(self, x_local, cp_group):
+        from torch.distributed.nn.functional import all_gather as diff_all_gather
+
+        cp = self.cp_size
+        gathered = diff_all_gather(x_local.contiguous(), group=cp_group)   # list cp x [T_local,...]
+        out_segs, loff = [], 0
+        for Ll in self.local_seg_lens:
+            half = Ll // 2
+            slots = [None] * (2 * cp)
+            for r in range(cp):
+                piece = gathered[r][loff:loff + Ll]
+                slots[r], slots[2 * cp - 1 - r] = piece[:half], piece[half:]
+            out_segs.append(torch.cat(slots, dim=0))
+            loff += Ll
+        return torch.cat(out_segs, dim=0)                                  # [T_global,...]
+
+    def gather_kv(self, key_local, value_local, cp_group):
+        """Differentiable all-gather + per-segment un-zigzag of K/V to FULL global order."""
+        return self._gather(key_local, cp_group), self._gather(value_local, cp_group)
+
+    def local_block_mask(self):
+        return build_local_tree_block_mask(self.local_global_pos, self.seg_full, self.device)
 
 
 def two_term_tree_attention(
