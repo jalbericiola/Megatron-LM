@@ -375,6 +375,7 @@ class HybridStack(MegatronModule):
         completion_lens,
         attention_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
+        real_prefix_len: Optional[int] = None,
     ):
         """Shared-prefix ("tree") packed forward for a GRPO group.
 
@@ -419,7 +420,11 @@ class HybridStack(MegatronModule):
             assert prefix_len % (2 * cp_size) == 0 and all(
                 c % (2 * cp_size) == 0 for c in completion_lens
             ), f"shared-prefix CP={cp_size}: each segment must be a multiple of 2*cp_size"
-            ctx = SharedPrefixContext(prefix_len // cp_size, [c // cp_size for c in completion_lens])
+            # real_prefix_len is in FULL (post-pre_conv_ssm) coords -- default to the full padded
+            # prefix_len (NOT the local prefix_len//cp), so fork_segment scans the whole real prefix.
+            ctx = SharedPrefixContext(
+                prefix_len // cp_size, [c // cp_size for c in completion_lens],
+                real_prefix_len=(real_prefix_len if real_prefix_len is not None else prefix_len))
             cp_group = _ps.get_context_parallel_group()
             cp_layout = CPSharedPrefixLayout(
                 prefix_len, completion_lens, cp_size, _ps.get_context_parallel_rank(),
@@ -433,7 +438,7 @@ class HybridStack(MegatronModule):
                 if rotary_pos_emb is not None else None
             )
         else:
-            ctx = SharedPrefixContext(prefix_len, completion_lens)
+            ctx = SharedPrefixContext(prefix_len, completion_lens, real_prefix_len=real_prefix_len)
             cp_layout = cp_group = rotary_local = None
         assert hidden_states.shape[0] == ctx.total_len, (
             f"packed length {hidden_states.shape[0]} != Lp+sum(Lc) {ctx.total_len} (cp={cp_size})"

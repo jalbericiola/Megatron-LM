@@ -303,9 +303,13 @@ class SharedPrefixContext:
     completions (loss/gradient-preserving).
     """
 
-    def __init__(self, prefix_len: int, completion_lens: List[int]) -> None:
+    def __init__(self, prefix_len: int, completion_lens: List[int],
+                 real_prefix_len: Optional[int] = None) -> None:
         self.prefix_len = int(prefix_len)
         self.completion_lens = [int(x) for x in completion_lens]
+        # FULL real prefix length (head-parallel coords) used as fork_segment(real_len=...) when the
+        # prefix is end-padded to a multiple of 2*cp under CP; defaults to prefix_len (no padding).
+        self.real_prefix_len = int(real_prefix_len) if real_prefix_len is not None else self.prefix_len
         assert self.prefix_len >= 1, "shared prefix must be non-empty"
 
     @property

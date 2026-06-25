@@ -163,7 +163,7 @@ class MambaLayer(GraphableMegatronModule):
             ctx = shared_prefix_context
             Lp = ctx.prefix_len
             y_p, out_bias, conv_ctx, ssm_final = self.mixer.fork_segment(
-                hidden_states[:Lp], capture=True
+                hidden_states[:Lp], capture=True, real_len=ctx.real_prefix_len
             )
             lcs = ctx.completion_lens
             if lcs:
