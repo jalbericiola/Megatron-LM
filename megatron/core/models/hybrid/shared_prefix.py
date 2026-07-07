@@ -271,6 +271,138 @@ def flash_composed_tree_attention(query, key, value, prefix_len, completion_lens
     return out.reshape(sq, 1, np_ * hn).contiguous()   # [sq, b, np*hn]
 
 
+# --- Optimization: plan caching + fused (Triton) LSE merge ------------------------------------
+# The fused kernel's overhead vs raw flash is NOT attention math; it is (a) rebuilding the pass
+# plan (pure-Python node loops + Python-int index lists -> H2D copies) on EVERY call -- the same
+# bin layout recurs across all ~50 layers of a step -- and (b) the eager online-softmax merge,
+# which upcasts every pass output to fp32 and round-trips full [total, np, hn] tensors through
+# memory several times per forward. (a) is fixed by an LRU plan cache keyed on the node arrays;
+# (b) by a single Triton kernel that reads each pass's output/LSE once and writes the merged
+# output (+ final LSE) once, fp32 math in-register, bf16 out. NRL_SP_FUSED_MERGE=0 restores the
+# eager merge (fallback also automatic if Triton is unavailable).
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
+_SP_FUSED_MERGE = os.environ.get("NRL_SP_FUSED_MERGE", "1") not in ("0", "", "false", "False")
+
+_PLAN_CACHE: dict = {}
+_PLAN_CACHE_MAX = 128
+
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _sp_merge_fwd_kernel(
+        o0, o1, o2, o3, o4, o5, o6,          # pass outputs, [rows_p, np, HN] (dtype of q)
+        l0, l1, l2, l3, l4, l5, l6,          # pass LSEs, fp32 [np, rows_p]
+        i0, i1, i2, i3, i4, i5, i6,          # int32 [total]: token -> row in pass (or -1)
+        r0, r1, r2, r3, r4, r5, r6,          # rows_p per pass (for LSE stride)
+        out_ptr,                              # merged output [total, np, HN] (dtype of q)
+        lsef_ptr,                             # final LSE fp32 [np, total]
+        n_passes, total, np_: tl.constexpr, HN: tl.constexpr,
+    ):
+        t = tl.program_id(0)
+        h = tl.program_id(1)
+        offs = tl.arange(0, HN)
+        m = float("-inf")
+        s = 0.0
+        acc = tl.zeros([HN], dtype=tl.float32)
+        for p in tl.static_range(7):
+            if p < n_passes:
+                if p == 0:
+                    idx_ptr, o_ptr, l_ptr, rows = i0, o0, l0, r0
+                elif p == 1:
+                    idx_ptr, o_ptr, l_ptr, rows = i1, o1, l1, r1
+                elif p == 2:
+                    idx_ptr, o_ptr, l_ptr, rows = i2, o2, l2, r2
+                elif p == 3:
+                    idx_ptr, o_ptr, l_ptr, rows = i3, o3, l3, r3
+                elif p == 4:
+                    idx_ptr, o_ptr, l_ptr, rows = i4, o4, l4, r4
+                elif p == 5:
+                    idx_ptr, o_ptr, l_ptr, rows = i5, o5, l5, r5
+                else:
+                    idx_ptr, o_ptr, l_ptr, rows = i6, o6, l6, r6
+                r = tl.load(idx_ptr + t)
+                if r >= 0:
+                    lse = tl.load(l_ptr + h * rows + r)
+                    o = tl.load(o_ptr + (r * np_ + h) * HN + offs).to(tl.float32)
+                    m_new = tl.maximum(m, lse)
+                    scale_old = tl.exp(m - m_new)
+                    w = tl.exp(lse - m_new)
+                    acc = acc * scale_old + o * w
+                    s = s * scale_old + w
+                    m = m_new
+        out = acc / s
+        tl.store(out_ptr + (t * np_ + h) * HN + offs, out.to(out_ptr.dtype.element_ty))
+        tl.store(lsef_ptr + h * total + t, m + tl.log(s))
+
+
+def _plan_key(node_start, node_len, node_parent, device):
+    return (tuple(int(x) for x in node_start), tuple(int(x) for x in node_len),
+            tuple(int(x) for x in node_parent), str(device))
+
+
+def _forest_attention_plan_cached(node_start, node_len, node_parent, device):
+    """Cached ``(total, passes, inv_maps)`` for a bin layout. The same layout is reused by every
+    attention layer of the step (and often across steps), so the Python plan construction and the
+    token->pass-row inverse maps (for the fused merge) are built once. ``inv_maps[p]`` is an int32
+    ``[total]`` tensor mapping token -> its row in pass ``p`` (-1 if the token is not a query of
+    that pass; pass 0 -- the self pass -- is the identity)."""
+    key = _plan_key(node_start, node_len, node_parent, device)
+    hit = _PLAN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    total, passes = _forest_attention_plan(node_start, node_len, node_parent, device)
+    inv_maps = []
+    for (q_idx, *_rest) in passes:
+        if q_idx is None:
+            inv = torch.arange(total, dtype=torch.int32, device=device)
+        else:
+            inv = torch.full((total,), -1, dtype=torch.int32, device=device)
+            inv[q_idx] = torch.arange(q_idx.numel(), dtype=torch.int32, device=device)
+        inv_maps.append(inv)
+    if len(_PLAN_CACHE) >= _PLAN_CACHE_MAX:
+        _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
+    _PLAN_CACHE[key] = (total, passes, inv_maps)
+    return _PLAN_CACHE[key]
+
+
+def _merge_passes_triton(passes, inv_maps, outs, lses, total, np_, hn, dtype, device):
+    """One-kernel online-softmax merge across passes. Returns (o_merged [total, np, hn] in
+    ``dtype``, lse_final fp32 [np, total])."""
+    MAXP = 7
+    n = len(passes)
+    assert n <= MAXP, f"fused merge supports <= {MAXP} passes (got {n}); deepen tl.static_range"
+    dummy_o = outs[0]
+    dummy_l = lses[0]
+    dummy_i = inv_maps[0]
+    o_args, l_args, i_args, r_args = [], [], [], []
+    for p in range(MAXP):
+        if p < n:
+            o_args.append(outs[p].contiguous())
+            l_args.append(lses[p].contiguous())
+            i_args.append(inv_maps[p])
+            r_args.append(lses[p].shape[1])
+        else:
+            o_args.append(dummy_o)
+            l_args.append(dummy_l)
+            i_args.append(dummy_i)
+            r_args.append(1)
+    out = torch.empty(total, np_, hn, dtype=dtype, device=device)
+    lse_final = torch.empty(np_, total, dtype=torch.float32, device=device)
+    _sp_merge_fwd_kernel[(total, np_)](
+        *o_args, *l_args, *i_args, *r_args, out, lse_final,
+        n, total, np_=np_, HN=hn,
+    )
+    return out, lse_final
+
+
 def _forest_attention_plan(node_start, node_len, node_parent, device):
     """Decompose a forest/tree into the flash passes the composed attention runs.
 
@@ -382,7 +514,9 @@ class _ComposedForestAttn(torch.autograd.Function):
         # q: [total, np, hn]; k, v: [total, ng, hn]; scale already resolved to a float.
         from flash_attn import flash_attn_varlen_func
 
-        total, passes = _forest_attention_plan(node_start, node_len, node_parent, q.device)
+        total, passes, inv_maps = _forest_attention_plan_cached(
+            node_start, node_len, node_parent, q.device
+        )
         np_, hn = q.shape[1], q.shape[2]
         outs, lses = [], []
         for q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal in passes:
@@ -396,23 +530,31 @@ class _ComposedForestAttn(torch.autograd.Function):
             outs.append(o)
             lses.append(lse)
 
-        # merged LSE per (head, token): logsumexp over every pass the token queries in.
-        lse_final = torch.full((np_, total), float("-inf"), device=q.device, dtype=torch.float32)
-        for (q_idx, *_), lse in zip(passes, lses):
-            if q_idx is None:
-                lse_final = torch.logaddexp(lse_final, lse.float())
-            else:
-                lse_final[:, q_idx] = torch.logaddexp(lse_final[:, q_idx], lse.float())
-        # merged output: sum_pass w_pass * o_pass, w_pass = exp(lse_pass - lse_final).
-        o_merged = torch.zeros(total, np_, hn, device=q.device, dtype=torch.float32)
-        for (q_idx, *_), o, lse in zip(passes, outs, lses):
-            lf = lse_final if q_idx is None else lse_final.index_select(1, q_idx)
-            contrib = torch.exp(lse.float() - lf).transpose(0, 1).unsqueeze(-1) * o.float()
-            if q_idx is None:
-                o_merged = o_merged + contrib
-            else:
-                o_merged.index_add_(0, q_idx, contrib)
-        o_merged = o_merged.to(q.dtype)
+        if _SP_FUSED_MERGE and HAVE_TRITON and len(passes) <= 7:
+            # single-kernel online-softmax merge: reads each pass output/LSE once, writes the
+            # merged output + final LSE once (fp32 in-register), replacing the eager fp32
+            # upcast/mul/index_add round-trips below.
+            o_merged, lse_final = _merge_passes_triton(
+                passes, inv_maps, outs, lses, total, np_, hn, q.dtype, q.device
+            )
+        else:
+            # merged LSE per (head, token): logsumexp over every pass the token queries in.
+            lse_final = torch.full((np_, total), float("-inf"), device=q.device, dtype=torch.float32)
+            for (q_idx, *_), lse in zip(passes, lses):
+                if q_idx is None:
+                    lse_final = torch.logaddexp(lse_final, lse.float())
+                else:
+                    lse_final[:, q_idx] = torch.logaddexp(lse_final[:, q_idx], lse.float())
+            # merged output: sum_pass w_pass * o_pass, w_pass = exp(lse_pass - lse_final).
+            o_merged = torch.zeros(total, np_, hn, device=q.device, dtype=torch.float32)
+            for (q_idx, *_), o, lse in zip(passes, outs, lses):
+                lf = lse_final if q_idx is None else lse_final.index_select(1, q_idx)
+                contrib = torch.exp(lse.float() - lf).transpose(0, 1).unsqueeze(-1) * o.float()
+                if q_idx is None:
+                    o_merged = o_merged + contrib
+                else:
+                    o_merged.index_add_(0, q_idx, contrib)
+            o_merged = o_merged.to(q.dtype)
 
         ctx.save_for_backward(q, k, v, o_merged)
         ctx.passes = passes
