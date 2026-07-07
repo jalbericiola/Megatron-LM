@@ -23,6 +23,7 @@ without an import cycle.
 
 import logging
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Tuple
 
@@ -378,6 +379,53 @@ if HAVE_TRITON:
         tl.store(dst_ptr + (t * n_ + h) * HN + offs, cur + add)
 
 
+if HAVE_TRITON:
+
+    @triton.jit
+    def _sp_gather_kv_kernel(
+        k_ptr, v_ptr,      # [total, ng, HN] sources (q dtype)
+        idx_ptr,           # int64 [rows] pass-row -> token
+        kx_ptr, vx_ptr,    # [rows, ng, HN] destinations
+        ng: tl.constexpr, HN: tl.constexpr,
+    ):
+        r = tl.program_id(0)
+        h = tl.program_id(1)
+        offs = tl.arange(0, HN)
+        t = tl.load(idx_ptr + r)
+        tl.store(kx_ptr + (r * ng + h) * HN + offs, tl.load(k_ptr + (t * ng + h) * HN + offs))
+        tl.store(vx_ptr + (r * ng + h) * HN + offs, tl.load(v_ptr + (t * ng + h) * HN + offs))
+
+
+# Round-3: overlap the independent per-pass flash calls on side CUDA streams (they only join at
+# the LSE merge / the gradient scatters), and gather K+V through one fused kernel into
+# plan-cached workspace buffers (no per-call allocations, one index read for both tensors).
+# NRL_SP_STREAMS=0 disables the stream overlap (kernels still fused).
+_SP_STREAMS = os.environ.get("NRL_SP_STREAMS", "1") not in ("0", "", "false", "False")
+_SP_STREAM_POOL: List = []
+_SP_STREAM_POOL_N = 4
+
+
+def _sp_streams():
+    if not _SP_STREAMS or not torch.cuda.is_available():
+        return None
+    if not _SP_STREAM_POOL:
+        _SP_STREAM_POOL.extend(torch.cuda.Stream() for _ in range(_SP_STREAM_POOL_N))
+    return _SP_STREAM_POOL
+
+
+def _gather_kv(k, v, k_idx):
+    """Fused K+V gather (one index read, both tensors) via Triton; falls back to two
+    index_selects without it."""
+    if HAVE_TRITON and _SP_FUSED_MERGE:
+        rows = k_idx.numel()
+        ng, hn = k.shape[1], k.shape[2]
+        kx = torch.empty(rows, ng, hn, dtype=k.dtype, device=k.device)
+        vx = torch.empty(rows, ng, hn, dtype=v.dtype, device=v.device)
+        _sp_gather_kv_kernel[(rows, ng)](k, v, k_idx, kx, vx, ng=ng, HN=hn)
+        return kx, vx
+    return k.index_select(0, k_idx), v.index_select(0, k_idx)
+
+
 def _plan_key(node_start, node_len, node_parent, device):
     return (tuple(int(x) for x in node_start), tuple(int(x) for x in node_len),
             tuple(int(x) for x in node_parent), str(device))
@@ -556,17 +604,49 @@ class _ComposedForestAttn(torch.autograd.Function):
             node_start, node_len, node_parent, q.device
         )
         np_, hn = q.shape[1], q.shape[2]
-        outs, lses = [], []
-        for q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal in passes:
-            qx = q if q_idx is None else q.index_select(0, q_idx)  # q_idx None => identity (self pass)
-            kx = k if k_idx is None else k.index_select(0, k_idx)
-            vx = v if k_idx is None else v.index_select(0, k_idx)
-            o, lse, _ = flash_attn_varlen_func(
-                qx, kx, vx, cu_q, cu_k, mxq, mxk,
-                softmax_scale=scale, causal=causal, return_attn_probs=True,
-            )  # o [Σq, np, hn], lse [np, Σq]
-            outs.append(o)
-            lses.append(lse)
+        streams = _sp_streams()
+        outs, lses = [None] * len(passes), [None] * len(passes)
+        if streams is not None and len(passes) > 1:
+            # passes are independent until the merge: fan them out on side streams so the small
+            # cross passes hide under the big self pass. Their outputs are consumed back on the
+            # current stream after the join events (record_stream keeps the allocator honest).
+            cur = torch.cuda.current_stream()
+            ev_in = torch.cuda.Event()
+            ev_in.record(cur)
+            join = []
+            for i, (q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal) in enumerate(passes):
+                st = streams[i % len(streams)]
+                st.wait_event(ev_in)
+                with torch.cuda.stream(st):
+                    qx = q if q_idx is None else q.index_select(0, q_idx)
+                    if k_idx is None:
+                        kx, vx = k, v
+                    else:
+                        kx, vx = _gather_kv(k, v, k_idx)
+                    o, lse, _ = flash_attn_varlen_func(
+                        qx, kx, vx, cu_q, cu_k, mxq, mxk,
+                        softmax_scale=scale, causal=causal, return_attn_probs=True,
+                    )
+                    o.record_stream(cur)
+                    lse.record_stream(cur)
+                    ev = torch.cuda.Event()
+                    ev.record(st)
+                    join.append(ev)
+                outs[i], lses[i] = o, lse
+            for ev in join:
+                cur.wait_event(ev)
+        else:
+            for i, (q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal) in enumerate(passes):
+                qx = q if q_idx is None else q.index_select(0, q_idx)  # None => identity (self pass)
+                if k_idx is None:
+                    kx, vx = k, v
+                else:
+                    kx, vx = _gather_kv(k, v, k_idx)
+                o, lse, _ = flash_attn_varlen_func(
+                    qx, kx, vx, cu_q, cu_k, mxq, mxk,
+                    softmax_scale=scale, causal=causal, return_attn_probs=True,
+                )  # o [Σq, np, hn], lse [np, Σq]
+                outs[i], lses[i] = o, lse
 
         if _SP_FUSED_MERGE and HAVE_TRITON and len(passes) <= 7:
             # single-kernel online-softmax merge: reads each pass output/LSE once, writes the
@@ -619,25 +699,55 @@ class _ComposedForestAttn(torch.autograd.Function):
             # the fp32 accumulators instead of zeros+add; cross passes scatter-accumulate through a
             # cast-fused kernel (no per-pass .float() temporaries). The flash calls are unchanged
             # -- the exact-backward trick (merged o substituted for the pass output) is preserved.
-            dq = dk = dv = None
+            ng = k.shape[1]
+            streams = _sp_streams()
+            cur = torch.cuda.current_stream()
+            results = [None] * len(ctx.passes)
+            join = [None] * len(ctx.passes)
+            ev_in = None
+            if streams is not None and len(ctx.passes) > 1:
+                ev_in = torch.cuda.Event()
+                ev_in.record(cur)
             for i, ((q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal), lse) in enumerate(
                 zip(ctx.passes, ctx.lses)
             ):
-                qidx = ctx.qidx64[i]
-                rows = qidx.numel()
-                qx = q if q_idx is None else q.index_select(0, q_idx)
-                kx = k if k_idx is None else k.index_select(0, k_idx)
-                vx = v if k_idx is None else v.index_select(0, k_idx)
-                ox = o_merged if q_idx is None else o_merged.index_select(0, q_idx)
-                dox = torch.empty(rows, np_, hn, dtype=q.dtype, device=q.device)
-                _sp_scale_gather_kernel[(rows, np_)](
-                    do, lse.contiguous(), lse_final, qidx, dox, rows, total, np_=np_, HN=hn,
-                )
-                dqx, dkx, dvx = torch.empty_like(qx), torch.empty_like(kx), torch.empty_like(vx)
-                _flash_attn_varlen_backward(
-                    dox, qx, kx, vx, ox, lse, dqx, dkx, dvx, cu_q, cu_k, mxq, mxk,
-                    0.0, scale, causal, -1, -1, 0.0, None, False, None, False,
-                )
+                st = None if ev_in is None else streams[i % len(streams)]
+                stream_ctx = torch.cuda.stream(st) if st is not None else nullcontext()
+                if st is not None:
+                    st.wait_event(ev_in)
+                with stream_ctx:
+                    qidx = ctx.qidx64[i]
+                    rows = qidx.numel()
+                    qx = q if q_idx is None else q.index_select(0, q_idx)
+                    if k_idx is None:
+                        kx, vx = k, v
+                    else:
+                        kx, vx = _gather_kv(k, v, k_idx)
+                    ox = o_merged if q_idx is None else o_merged.index_select(0, q_idx)
+                    dox = torch.empty(rows, np_, hn, dtype=q.dtype, device=q.device)
+                    _sp_scale_gather_kernel[(rows, np_)](
+                        do, lse.contiguous(), lse_final, qidx, dox, rows, total, np_=np_, HN=hn,
+                    )
+                    dqx, dkx, dvx = torch.empty_like(qx), torch.empty_like(kx), torch.empty_like(vx)
+                    _flash_attn_varlen_backward(
+                        dox, qx, kx, vx, ox, lse, dqx, dkx, dvx, cu_q, cu_k, mxq, mxk,
+                        0.0, scale, causal, -1, -1, 0.0, None, False, None, False,
+                    )
+                    results[i] = (dqx, dkx, dvx, qidx, k_idx, rows)
+                    if st is not None:
+                        dqx.record_stream(cur)
+                        dkx.record_stream(cur)
+                        dvx.record_stream(cur)
+                        ev = torch.cuda.Event()
+                        ev.record(st)
+                        join[i] = ev
+            # accumulate in pass order on the current stream (scatters are read-modify-write on
+            # the shared accumulators, so they stay ordered; the flash backwards above overlap).
+            dq = dk = dv = None
+            for i, res in enumerate(results):
+                if join[i] is not None:
+                    cur.wait_event(join[i])
+                dqx, dkx, dvx, qidx, k_idx, rows = res
                 if i == 0:
                     # self pass: identity over all tokens -> direct init, no zeros/scatter.
                     dq = dqx.float()
@@ -645,7 +755,6 @@ class _ComposedForestAttn(torch.autograd.Function):
                     dv = dvx.float()
                 else:
                     _sp_scatter_accum_kernel[(rows, np_)](dq, dqx, qidx, n_=np_, HN=hn)
-                    ng = k.shape[1]
                     _sp_scatter_accum_kernel[(k_idx.numel(), ng)](dk, dkx, k_idx, n_=ng, HN=hn)
                     _sp_scatter_accum_kernel[(k_idx.numel(), ng)](dv, dvx, k_idx, n_=ng, HN=hn)
             return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
