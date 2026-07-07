@@ -307,12 +307,18 @@ if HAVE_TRITON:
         lsef_ptr,                             # final LSE fp32 [np, total]
         n_passes, total, np_: tl.constexpr, HN: tl.constexpr,
     ):
-        t = tl.program_id(0)
+        # One program merges a BLOCK_T-token tile for one head: amortizes scheduling over
+        # 524k-programs-of-tiny-work (the v1 grid), keeps o loads coalesced along HN, and gives
+        # the compiler ILP across the tile. [BLOCK_T, HN] fp32 tile state.
+        tb = tl.program_id(0)
         h = tl.program_id(1)
+        BLOCK_T: tl.constexpr = 16
+        t = tb * BLOCK_T + tl.arange(0, BLOCK_T)
+        tmask = t < total
         offs = tl.arange(0, HN)
-        m = float("-inf")
-        s = 0.0
-        acc = tl.zeros([HN], dtype=tl.float32)
+        m = tl.full([BLOCK_T], float("-inf"), dtype=tl.float32)
+        s = tl.zeros([BLOCK_T], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_T, HN], dtype=tl.float32)
         for p in tl.static_range(7):
             if p < n_passes:
                 if p == 0:
@@ -329,19 +335,27 @@ if HAVE_TRITON:
                     idx_ptr, o_ptr, l_ptr, rows = i5, o5, l5, r5
                 else:
                     idx_ptr, o_ptr, l_ptr, rows = i6, o6, l6, r6
-                r = tl.load(idx_ptr + t)
-                if r >= 0:
-                    lse = tl.load(l_ptr + h * rows + r)
-                    o = tl.load(o_ptr + (r * np_ + h) * HN + offs).to(tl.float32)
-                    m_new = tl.maximum(m, lse)
-                    scale_old = tl.exp(m - m_new)
-                    w = tl.exp(lse - m_new)
-                    acc = acc * scale_old + o * w
-                    s = s * scale_old + w
-                    m = m_new
-        out = acc / s
-        tl.store(out_ptr + (t * np_ + h) * HN + offs, out.to(out_ptr.dtype.element_ty))
-        tl.store(lsef_ptr + h * total + t, m + tl.log(s))
+                r = tl.load(idx_ptr + t, mask=tmask, other=-1)
+                hit = (r >= 0) & tmask
+                lse = tl.load(l_ptr + h * rows + r, mask=hit, other=float("-inf"))
+                o = tl.load(
+                    o_ptr + (r[:, None] * np_ + h) * HN + offs[None, :],
+                    mask=hit[:, None], other=0.0,
+                ).to(tl.float32)
+                m_new = tl.maximum(m, lse)
+                m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+                scale_old = tl.where(m == float("-inf"), 0.0, tl.exp(m - m_safe))
+                w = tl.where(hit, tl.exp(lse - m_safe), 0.0)
+                acc = acc * scale_old[:, None] + o * w[:, None]
+                s = s * scale_old + w
+                m = m_new
+        out = acc / tl.where(s == 0.0, 1.0, s)[:, None]
+        tl.store(
+            out_ptr + (t[:, None] * np_ + h) * HN + offs[None, :],
+            out.to(out_ptr.dtype.element_ty),
+            mask=tmask[:, None],
+        )
+        tl.store(lsef_ptr + h * total + t, m + tl.log(s), mask=tmask)
 
 
 if HAVE_TRITON:
@@ -355,28 +369,47 @@ if HAVE_TRITON:
         dox_ptr,       # out [rows, np, HN] (q dtype): w * do[qidx]
         rows, total, np_: tl.constexpr, HN: tl.constexpr,
     ):
-        r = tl.program_id(0)
+        rb = tl.program_id(0)
         h = tl.program_id(1)
+        BLOCK_R: tl.constexpr = 16
+        r = rb * BLOCK_R + tl.arange(0, BLOCK_R)
+        rmask = r < rows
         offs = tl.arange(0, HN)
-        t = tl.load(qidx_ptr + r)
-        w = tl.exp(tl.load(lse_ptr + h * rows + r) - tl.load(lsef_ptr + h * total + t))
-        do = tl.load(do_ptr + (t * np_ + h) * HN + offs).to(tl.float32)
-        tl.store(dox_ptr + (r * np_ + h) * HN + offs, (do * w).to(dox_ptr.dtype.element_ty))
+        t = tl.load(qidx_ptr + r, mask=rmask, other=0)
+        w = tl.exp(
+            tl.load(lse_ptr + h * rows + r, mask=rmask, other=0.0)
+            - tl.load(lsef_ptr + h * total + t, mask=rmask, other=0.0)
+        )
+        do = tl.load(
+            do_ptr + (t[:, None] * np_ + h) * HN + offs[None, :], mask=rmask[:, None], other=0.0
+        ).to(tl.float32)
+        tl.store(
+            dox_ptr + (r[:, None] * np_ + h) * HN + offs[None, :],
+            (do * w[:, None]).to(dox_ptr.dtype.element_ty),
+            mask=rmask[:, None],
+        )
 
     @triton.jit
     def _sp_scatter_accum_kernel(
         dst_ptr,       # fp32 [total, n, HN] accumulator
         src_ptr,       # [rows, n, HN] pass grad (q dtype)
         idx_ptr,       # int64 [rows] pass-row -> token
+        n_rows,
         n_: tl.constexpr, HN: tl.constexpr,
     ):
-        r = tl.program_id(0)
+        rb = tl.program_id(0)
         h = tl.program_id(1)
+        BLOCK_R: tl.constexpr = 16
+        r = rb * BLOCK_R + tl.arange(0, BLOCK_R)
+        rmask = r < n_rows
         offs = tl.arange(0, HN)
-        t = tl.load(idx_ptr + r)
-        cur = tl.load(dst_ptr + (t * n_ + h) * HN + offs)
-        add = tl.load(src_ptr + (r * n_ + h) * HN + offs).to(tl.float32)
-        tl.store(dst_ptr + (t * n_ + h) * HN + offs, cur + add)
+        t = tl.load(idx_ptr + r, mask=rmask, other=0)
+        add = tl.load(
+            src_ptr + (r[:, None] * n_ + h) * HN + offs[None, :], mask=rmask[:, None], other=0.0
+        ).to(tl.float32)
+        # atomic: with the consolidated cross pass a deep token owns one row PER ancestor level,
+        # so multiple programs may target the same destination row.
+        tl.atomic_add(dst_ptr + (t[:, None] * n_ + h) * HN + offs[None, :], add, mask=rmask[:, None])
 
 
 if HAVE_TRITON:
@@ -401,6 +434,10 @@ if HAVE_TRITON:
 # plan-cached workspace buffers (no per-call allocations, one index read for both tensors).
 # NRL_SP_STREAMS=0 disables the stream overlap (kernels still fused).
 _SP_STREAMS = os.environ.get("NRL_SP_STREAMS", "1") not in ("0", "", "false", "False")
+# Consolidate all per-level cross passes into one flash call (any depth => 2 flash calls total).
+# Requires the Triton merge path (the eager merge cannot handle a token owning multiple rows of
+# one pass); plans are cached per effective mode so runtime flag flips stay correct.
+_SP_COMBINE_CROSS = os.environ.get("NRL_SP_COMBINE", "1") not in ("0", "", "false", "False")
 _SP_STREAM_POOL: List = []
 _SP_STREAM_POOL_N = 4
 
@@ -426,9 +463,13 @@ def _gather_kv(k, v, k_idx):
     return k.index_select(0, k_idx), v.index_select(0, k_idx)
 
 
+def _sp_combine_effective():
+    return _SP_COMBINE_CROSS and HAVE_TRITON and _SP_FUSED_MERGE
+
+
 def _plan_key(node_start, node_len, node_parent, device):
     return (tuple(int(x) for x in node_start), tuple(int(x) for x in node_len),
-            tuple(int(x) for x in node_parent), str(device))
+            tuple(int(x) for x in node_parent), str(device), _sp_combine_effective())
 
 
 def _forest_attention_plan_cached(node_start, node_len, node_parent, device):
@@ -442,47 +483,85 @@ def _forest_attention_plan_cached(node_start, node_len, node_parent, device):
     if hit is not None:
         return hit
     total, passes = _forest_attention_plan(node_start, node_len, node_parent, device)
-    inv_maps, qidx64 = [], []
-    identity = torch.arange(total, dtype=torch.long, device=device)
-    for (q_idx, *_rest) in passes:
-        if q_idx is None:
-            inv = torch.arange(total, dtype=torch.int32, device=device)
-            qidx64.append(identity)
-        else:
+    if _sp_combine_effective() and len(passes) > 2:
+        # Consolidate every per-depth-level cross pass into ONE flash_varlen call: varlen just
+        # needs per-sequence contiguous q/k slices, and each (ancestor-span <- descendant-run)
+        # pair is one sequence regardless of which level it came from. Any tree then costs
+        # exactly 2 flash calls (self + cross) instead of depth+1 -- fewer launches, bigger
+        # kernels. The merge/backward kernels are unchanged: they operate per SLOT (a token's
+        # entry at one ancestor level), and cross slots simply share the combined pass's
+        # output/LSE tensors with different row maps.
+        self_pass = passes[0]
+        qpos_parts, kpos_parts, cuq, cuk = [], [], [0], [0]
+        level_row_start = []  # row offset of each level's block in the combined pass
+        for (q_idx, k_idx, cu_q, cu_k, _mxq, _mxk, _c) in passes[1:]:
+            level_row_start.append(cuq[-1])
+            qpos_parts.append(q_idx)
+            kpos_parts.append(k_idx)
+            base_q, base_k = cuq[-1], cuk[-1]
+            cuq.extend((cu_q[1:].to(torch.long) + base_q).tolist())
+            cuk.extend((cu_k[1:].to(torch.long) + base_k).tolist())
+        qpos = torch.cat(qpos_parts)
+        kpos = torch.cat(kpos_parts)
+        mxq = max(cuq[i + 1] - cuq[i] for i in range(len(cuq) - 1))
+        mxk = max(cuk[i + 1] - cuk[i] for i in range(len(cuk) - 1))
+        combined = (qpos, kpos,
+                    torch.tensor(cuq, dtype=torch.int32, device=device),
+                    torch.tensor(cuk, dtype=torch.int32, device=device),
+                    mxq, mxk, False)
+        # slots: slot 0 = self pass; slot j>=1 = the level-(j-1) rows INSIDE the combined pass.
+        slot_pass = [0] + [1] * (len(passes) - 1)
+        slot_inv = [torch.arange(total, dtype=torch.int32, device=device)]
+        for li, (q_idx, *_rest) in enumerate(passes[1:]):
             inv = torch.full((total,), -1, dtype=torch.int32, device=device)
-            inv[q_idx] = torch.arange(q_idx.numel(), dtype=torch.int32, device=device)
-            qidx64.append(q_idx)
-        inv_maps.append(inv)
+            inv[q_idx] = torch.arange(
+                q_idx.numel(), dtype=torch.int32, device=device
+            ) + level_row_start[li]
+            slot_inv.append(inv)
+        passes = [self_pass, combined]
+        identity = torch.arange(total, dtype=torch.long, device=device)
+        qidx64 = [identity, qpos]
+        entry = (total, passes, slot_inv, qidx64, slot_pass)
+    else:
+        inv_maps, qidx64 = [], []
+        identity = torch.arange(total, dtype=torch.long, device=device)
+        for (q_idx, *_rest) in passes:
+            if q_idx is None:
+                inv = torch.arange(total, dtype=torch.int32, device=device)
+                qidx64.append(identity)
+            else:
+                inv = torch.full((total,), -1, dtype=torch.int32, device=device)
+                inv[q_idx] = torch.arange(q_idx.numel(), dtype=torch.int32, device=device)
+                qidx64.append(q_idx)
+            inv_maps.append(inv)
+        entry = (total, passes, inv_maps, qidx64, list(range(len(passes))))
     if len(_PLAN_CACHE) >= _PLAN_CACHE_MAX:
         _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
-    _PLAN_CACHE[key] = (total, passes, inv_maps, qidx64)
-    return _PLAN_CACHE[key]
+    _PLAN_CACHE[key] = entry
+    return entry
 
 
-def _merge_passes_triton(passes, inv_maps, outs, lses, total, np_, hn, dtype, device):
-    """One-kernel online-softmax merge across passes. Returns (o_merged [total, np, hn] in
-    ``dtype``, lse_final fp32 [np, total])."""
+def _merge_passes_triton(slot_pass, inv_maps, outs, lses, total, np_, hn, dtype, device):
+    """One-kernel online-softmax merge across SLOTS. A slot is one attended-set contribution for
+    a token (its own node, or one ancestor level); ``slot_pass[s]`` says which pass's output/LSE
+    tensors slot ``s`` reads (with the consolidated cross pass, every cross slot shares pass 1's
+    tensors under a different row map). Returns (o_merged [total, np, hn] in ``dtype``, lse_final
+    fp32 [np, total])."""
     MAXP = 7
-    n = len(passes)
-    assert n <= MAXP, f"fused merge supports <= {MAXP} passes (got {n}); deepen tl.static_range"
-    dummy_o = outs[0]
-    dummy_l = lses[0]
-    dummy_i = inv_maps[0]
+    n = len(slot_pass)
+    assert n <= MAXP, f"fused merge supports <= {MAXP} slots (got {n}); deepen tl.static_range"
+    outs = [o.contiguous() for o in outs]
+    lses = [l.contiguous() for l in lses]
     o_args, l_args, i_args, r_args = [], [], [], []
-    for p in range(MAXP):
-        if p < n:
-            o_args.append(outs[p].contiguous())
-            l_args.append(lses[p].contiguous())
-            i_args.append(inv_maps[p])
-            r_args.append(lses[p].shape[1])
-        else:
-            o_args.append(dummy_o)
-            l_args.append(dummy_l)
-            i_args.append(dummy_i)
-            r_args.append(1)
+    for s in range(MAXP):
+        p = slot_pass[s] if s < n else slot_pass[0]
+        o_args.append(outs[p])
+        l_args.append(lses[p])
+        i_args.append(inv_maps[s] if s < n else inv_maps[0])
+        r_args.append(lses[p].shape[1])
     out = torch.empty(total, np_, hn, dtype=dtype, device=device)
     lse_final = torch.empty(np_, total, dtype=torch.float32, device=device)
-    _sp_merge_fwd_kernel[(total, np_)](
+    _sp_merge_fwd_kernel[((total + 15) // 16, np_)](
         *o_args, *l_args, *i_args, *r_args, out, lse_final,
         n, total, np_=np_, HN=hn,
     )
@@ -600,7 +679,7 @@ class _ComposedForestAttn(torch.autograd.Function):
         # q: [total, np, hn]; k, v: [total, ng, hn]; scale already resolved to a float.
         from flash_attn import flash_attn_varlen_func
 
-        total, passes, inv_maps, qidx64 = _forest_attention_plan_cached(
+        total, passes, inv_maps, qidx64, slot_pass = _forest_attention_plan_cached(
             node_start, node_len, node_parent, q.device
         )
         np_, hn = q.shape[1], q.shape[2]
@@ -648,12 +727,12 @@ class _ComposedForestAttn(torch.autograd.Function):
                 )  # o [Σq, np, hn], lse [np, Σq]
                 outs[i], lses[i] = o, lse
 
-        if _SP_FUSED_MERGE and HAVE_TRITON and len(passes) <= 7:
+        if _SP_FUSED_MERGE and HAVE_TRITON and len(slot_pass) <= 7:
             # single-kernel online-softmax merge: reads each pass output/LSE once, writes the
             # merged output + final LSE once (fp32 in-register), replacing the eager fp32
             # upcast/mul/index_add round-trips below.
             o_merged, lse_final = _merge_passes_triton(
-                passes, inv_maps, outs, lses, total, np_, hn, q.dtype, q.device
+                slot_pass, inv_maps, outs, lses, total, np_, hn, q.dtype, q.device
             )
         else:
             # merged LSE per (head, token): logsumexp over every pass the token queries in.
@@ -725,7 +804,7 @@ class _ComposedForestAttn(torch.autograd.Function):
                         kx, vx = _gather_kv(k, v, k_idx)
                     ox = o_merged if q_idx is None else o_merged.index_select(0, q_idx)
                     dox = torch.empty(rows, np_, hn, dtype=q.dtype, device=q.device)
-                    _sp_scale_gather_kernel[(rows, np_)](
+                    _sp_scale_gather_kernel[((rows + 15) // 16, np_)](
                         do, lse.contiguous(), lse_final, qidx, dox, rows, total, np_=np_, HN=hn,
                     )
                     dqx, dkx, dvx = torch.empty_like(qx), torch.empty_like(kx), torch.empty_like(vx)
@@ -754,9 +833,10 @@ class _ComposedForestAttn(torch.autograd.Function):
                     dk = dkx.float()
                     dv = dvx.float()
                 else:
-                    _sp_scatter_accum_kernel[(rows, np_)](dq, dqx, qidx, n_=np_, HN=hn)
-                    _sp_scatter_accum_kernel[(k_idx.numel(), ng)](dk, dkx, k_idx, n_=ng, HN=hn)
-                    _sp_scatter_accum_kernel[(k_idx.numel(), ng)](dv, dvx, k_idx, n_=ng, HN=hn)
+                    kro = k_idx.numel()
+                    _sp_scatter_accum_kernel[((rows + 15) // 16, np_)](dq, dqx, qidx, rows, n_=np_, HN=hn)
+                    _sp_scatter_accum_kernel[((kro + 15) // 16, ng)](dk, dkx, k_idx, kro, n_=ng, HN=hn)
+                    _sp_scatter_accum_kernel[((kro + 15) // 16, ng)](dv, dvx, k_idx, kro, n_=ng, HN=hn)
             return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
 
         dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
