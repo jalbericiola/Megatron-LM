@@ -343,6 +343,41 @@ if HAVE_TRITON:
         tl.store(lsef_ptr + h * total + t, m + tl.log(s))
 
 
+if HAVE_TRITON:
+
+    @triton.jit
+    def _sp_scale_gather_kernel(
+        do_ptr,        # [total, np, HN] upstream grad (q dtype)
+        lse_ptr,       # fp32 [np, rows] this pass's LSE
+        lsef_ptr,      # fp32 [np, total] merged LSE
+        qidx_ptr,      # int64 [rows] pass-row -> token (identity pass passes arange)
+        dox_ptr,       # out [rows, np, HN] (q dtype): w * do[qidx]
+        rows, total, np_: tl.constexpr, HN: tl.constexpr,
+    ):
+        r = tl.program_id(0)
+        h = tl.program_id(1)
+        offs = tl.arange(0, HN)
+        t = tl.load(qidx_ptr + r)
+        w = tl.exp(tl.load(lse_ptr + h * rows + r) - tl.load(lsef_ptr + h * total + t))
+        do = tl.load(do_ptr + (t * np_ + h) * HN + offs).to(tl.float32)
+        tl.store(dox_ptr + (r * np_ + h) * HN + offs, (do * w).to(dox_ptr.dtype.element_ty))
+
+    @triton.jit
+    def _sp_scatter_accum_kernel(
+        dst_ptr,       # fp32 [total, n, HN] accumulator
+        src_ptr,       # [rows, n, HN] pass grad (q dtype)
+        idx_ptr,       # int64 [rows] pass-row -> token
+        n_: tl.constexpr, HN: tl.constexpr,
+    ):
+        r = tl.program_id(0)
+        h = tl.program_id(1)
+        offs = tl.arange(0, HN)
+        t = tl.load(idx_ptr + r)
+        cur = tl.load(dst_ptr + (t * n_ + h) * HN + offs)
+        add = tl.load(src_ptr + (r * n_ + h) * HN + offs).to(tl.float32)
+        tl.store(dst_ptr + (t * n_ + h) * HN + offs, cur + add)
+
+
 def _plan_key(node_start, node_len, node_parent, device):
     return (tuple(int(x) for x in node_start), tuple(int(x) for x in node_len),
             tuple(int(x) for x in node_parent), str(device))
@@ -359,17 +394,20 @@ def _forest_attention_plan_cached(node_start, node_len, node_parent, device):
     if hit is not None:
         return hit
     total, passes = _forest_attention_plan(node_start, node_len, node_parent, device)
-    inv_maps = []
+    inv_maps, qidx64 = [], []
+    identity = torch.arange(total, dtype=torch.long, device=device)
     for (q_idx, *_rest) in passes:
         if q_idx is None:
             inv = torch.arange(total, dtype=torch.int32, device=device)
+            qidx64.append(identity)
         else:
             inv = torch.full((total,), -1, dtype=torch.int32, device=device)
             inv[q_idx] = torch.arange(q_idx.numel(), dtype=torch.int32, device=device)
+            qidx64.append(q_idx)
         inv_maps.append(inv)
     if len(_PLAN_CACHE) >= _PLAN_CACHE_MAX:
         _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
-    _PLAN_CACHE[key] = (total, passes, inv_maps)
+    _PLAN_CACHE[key] = (total, passes, inv_maps, qidx64)
     return _PLAN_CACHE[key]
 
 
@@ -514,7 +552,7 @@ class _ComposedForestAttn(torch.autograd.Function):
         # q: [total, np, hn]; k, v: [total, ng, hn]; scale already resolved to a float.
         from flash_attn import flash_attn_varlen_func
 
-        total, passes, inv_maps = _forest_attention_plan_cached(
+        total, passes, inv_maps, qidx64 = _forest_attention_plan_cached(
             node_start, node_len, node_parent, q.device
         )
         np_, hn = q.shape[1], q.shape[2]
@@ -561,6 +599,7 @@ class _ComposedForestAttn(torch.autograd.Function):
         ctx.lses = lses
         ctx.lse_final = lse_final
         ctx.scale = scale
+        ctx.qidx64 = qidx64
         return o_merged
 
     @staticmethod
@@ -570,6 +609,47 @@ class _ComposedForestAttn(torch.autograd.Function):
         q, k, v, o_merged = ctx.saved_tensors
         lse_final, scale = ctx.lse_final, ctx.scale
         do = do.contiguous()
+        total, np_, hn = q.shape[0], q.shape[1], q.shape[2]
+        use_triton = _SP_FUSED_MERGE and HAVE_TRITON and getattr(ctx, "qidx64", None) is not None
+
+        if use_triton:
+            # Fused backward glue: (a) per-pass dout scaling w*do fused with the query gather in
+            # one kernel (the eager path materialized an fp32 exp/mul chain + an index_select per
+            # pass); (b) the self pass (always pass 0, identity indices over all tokens) INITIALIZES
+            # the fp32 accumulators instead of zeros+add; cross passes scatter-accumulate through a
+            # cast-fused kernel (no per-pass .float() temporaries). The flash calls are unchanged
+            # -- the exact-backward trick (merged o substituted for the pass output) is preserved.
+            dq = dk = dv = None
+            for i, ((q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal), lse) in enumerate(
+                zip(ctx.passes, ctx.lses)
+            ):
+                qidx = ctx.qidx64[i]
+                rows = qidx.numel()
+                qx = q if q_idx is None else q.index_select(0, q_idx)
+                kx = k if k_idx is None else k.index_select(0, k_idx)
+                vx = v if k_idx is None else v.index_select(0, k_idx)
+                ox = o_merged if q_idx is None else o_merged.index_select(0, q_idx)
+                dox = torch.empty(rows, np_, hn, dtype=q.dtype, device=q.device)
+                _sp_scale_gather_kernel[(rows, np_)](
+                    do, lse.contiguous(), lse_final, qidx, dox, rows, total, np_=np_, HN=hn,
+                )
+                dqx, dkx, dvx = torch.empty_like(qx), torch.empty_like(kx), torch.empty_like(vx)
+                _flash_attn_varlen_backward(
+                    dox, qx, kx, vx, ox, lse, dqx, dkx, dvx, cu_q, cu_k, mxq, mxk,
+                    0.0, scale, causal, -1, -1, 0.0, None, False, None, False,
+                )
+                if i == 0:
+                    # self pass: identity over all tokens -> direct init, no zeros/scatter.
+                    dq = dqx.float()
+                    dk = dkx.float()
+                    dv = dvx.float()
+                else:
+                    _sp_scatter_accum_kernel[(rows, np_)](dq, dqx, qidx, n_=np_, HN=hn)
+                    ng = k.shape[1]
+                    _sp_scatter_accum_kernel[(k_idx.numel(), ng)](dk, dkx, k_idx, n_=ng, HN=hn)
+                    _sp_scatter_accum_kernel[(k_idx.numel(), ng)](dv, dvx, k_idx, n_=ng, HN=hn)
+            return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
+
         dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
         dv = torch.zeros(v.shape, device=v.device, dtype=torch.float32)
