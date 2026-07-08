@@ -104,20 +104,21 @@ def branched_mc_tree(P=512, seg=400, n_boundaries=6, sib_len=2900, n_sib=4,
 
     branch_set = set(branch_boundaries)
     root = add(-1, P)               # prompt
-    for _ in range(n_sib):          # siblings fork at the root (emitted before the spine subtree)
-        add(root, sib_len)
 
-    # Seed spine as a chain, emitted in DFS PREORDER: each segment, then its branch (a leaf), then
-    # recurse into the deeper spine -- so every segment's subtree is the contiguous run after it
-    # (required by the fused kernel). ``k`` is the 1-indexed boundary.
+    # CHAIN-FIRST DFS preorder (still a valid preorder -- children order is free): each node's
+    # continuation child is emitted immediately after it, so the root+spine is one adjacent run
+    # (a pure causal sequence for the chain-first plan) and every branch/sibling's ancestor set
+    # is a contiguous prefix [0, boundary_end). Branches unwind after the spine, siblings last.
     def build_spine(parent_node, k):
         s = add(parent_node, seg)
-        if k in branch_set:
-            add(s, branch_len)      # branch continuation off this boundary
         if k < n_boundaries:
             build_spine(s, k + 1)
+        if k in branch_set:
+            add(s, branch_len)      # branch continuation off this boundary
 
     build_spine(root, 1)
+    for _ in range(n_sib):          # siblings fork at the root (emitted after the spine subtree)
+        add(root, sib_len)
 
     # baseline row lengths (root->leaf path per trained trajectory)
     seed_path = P + n_boundaries * seg

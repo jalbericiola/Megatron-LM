@@ -469,7 +469,8 @@ def _sp_combine_effective():
 
 def _plan_key(node_start, node_len, node_parent, device):
     return (tuple(int(x) for x in node_start), tuple(int(x) for x in node_len),
-            tuple(int(x) for x in node_parent), str(device), _sp_combine_effective())
+            tuple(int(x) for x in node_parent), str(device), _sp_combine_effective(),
+            _SP_CHAINFIRST)
 
 
 def _forest_attention_plan_cached(node_start, node_len, node_parent, device):
@@ -482,7 +483,12 @@ def _forest_attention_plan_cached(node_start, node_len, node_parent, device):
     hit = _PLAN_CACHE.get(key)
     if hit is not None:
         return hit
-    total, passes = _forest_attention_plan(node_start, node_len, node_parent, device)
+    plan = None
+    if _SP_CHAINFIRST:
+        plan = _forest_attention_plan_chainfirst(node_start, node_len, node_parent, device)
+    if plan is None:
+        plan = _forest_attention_plan(node_start, node_len, node_parent, device)
+    total, passes = plan
     if _sp_combine_effective() and len(passes) > 2:
         # Consolidate every per-depth-level cross pass into ONE flash_varlen call: varlen just
         # needs per-sequence contiguous q/k slices, and each (ancestor-span <- descendant-run)
@@ -566,6 +572,87 @@ def _merge_passes_triton(slot_pass, inv_maps, outs, lses, total, np_, hn, dtype,
         n, total, np_=np_, HN=hn,
     )
     return out, lse_final
+
+
+# Chain-first plan (NRL_SP_CHAINFIRST=1, default on, auto-fallback): when the layout emits each
+# node's continuation child immediately after it (chain-first DFS), maximal parent-adjacent runs
+# ("chains") behave as plain CAUSAL sequences — a chain token's causal prefix within the run is
+# exactly its in-chain ancestors. The self pass then uses per-CHAIN (not per-node) causal
+# sequences, absorbing all within-chain cross attention (for spine-dominated trees that deletes
+# most cross rows). Each chain with ancestors ABOVE its head attends one contiguous k-range
+# [path_start, chain_start) — fat, flash-friendly K instead of per-level skinny spans — packed
+# into a single non-causal cross pass. Falls back to the per-level plan when any cross-needing
+# chain's ancestor range is non-contiguous (e.g. interior non-first children).
+_SP_CHAINFIRST = os.environ.get("NRL_SP_CHAINFIRST", "1") not in ("0", "", "false", "False")
+
+
+def _forest_attention_plan_chainfirst(node_start, node_len, node_parent, device):
+    """Chain-first decomposition. Returns ``(total, passes)`` like the per-level planner, or
+    ``None`` when the layout does not satisfy the contiguous-ancestor condition."""
+    ns = [int(x) for x in node_start]
+    nl = [int(x) for x in node_len]
+    par = [int(x) for x in node_parent]
+    N = len(ns)
+    total = max((ns[i] + nl[i] for i in range(N)), default=0)
+
+    adj = [par[i] != -1 and ns[i] == ns[par[i]] + nl[par[i]] for i in range(N)]
+    chain_head = list(range(N))
+    for i in range(N):
+        if adj[i]:
+            chain_head[i] = chain_head[par[i]]
+    # ancestor range start for each chain head: the path start (root of its tree) — contiguous
+    # iff every path node above the head's parent is adjacent to ITS parent.
+    def anc_range(head):
+        p = par[head]
+        if p == -1:
+            return None
+        end = ns[p] + nl[p]
+        x = p
+        while par[x] != -1:
+            if not adj[x]:
+                return "broken"
+            x = par[x]
+        return (ns[x], end)
+
+    heads = sorted(set(chain_head))
+    chain_end = {}
+    for i in range(N):
+        h = chain_head[i]
+        chain_end[h] = max(chain_end.get(h, 0), ns[i] + nl[i])
+
+    cross = []
+    for h in heads:
+        r = anc_range(h)
+        if r == "broken":
+            return None
+        if r is not None:
+            cross.append((ns[h], chain_end[h], r[0], r[1]))
+
+    def _i32(x):
+        return torch.tensor(x, dtype=torch.int32, device=device)
+
+    def _i64(x):
+        return torch.tensor(x, dtype=torch.long, device=device)
+
+    passes = []
+    # self pass: one causal sequence per CHAIN (q/k identity over [0, total)).
+    cu = [0]
+    for h in heads:
+        cu.append(cu[-1] + (chain_end[h] - ns[h]))
+    mx = max((chain_end[h] - ns[h] for h in heads), default=0)
+    passes.append((None, None, _i32(cu), _i32(cu), mx, mx, True))
+
+    if cross:
+        qpos, kpos, cuq, cuk = [], [], [0], [0]
+        for (q0, q1, a0, a1) in cross:
+            qpos.append(torch.arange(q0, q1, dtype=torch.long, device=device))
+            kpos.append(torch.arange(a0, a1, dtype=torch.long, device=device))
+            cuq.append(cuq[-1] + (q1 - q0))
+            cuk.append(cuk[-1] + (a1 - a0))
+        mxq = max(cross_i[1] - cross_i[0] for cross_i in cross)
+        mxk = max(cross_i[3] - cross_i[2] for cross_i in cross)
+        passes.append((torch.cat(qpos), torch.cat(kpos), _i32(cuq), _i32(cuk), mxq, mxk, False))
+    return total, passes
 
 
 def _forest_attention_plan(node_start, node_len, node_parent, device):
