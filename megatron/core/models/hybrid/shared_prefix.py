@@ -490,7 +490,10 @@ def _forest_attention_plan_cached(node_start, node_len, node_parent, device):
     if plan is None:
         plan = _forest_attention_plan(node_start, node_len, node_parent, device)
     total, passes = plan
-    if _sp_combine_effective() and len(passes) > 2:
+    # never consolidate slice-form cross passes: combining would re-materialize the q gather
+    # (and its backward scatter) that the _QSlice views exist to avoid.
+    if (_sp_combine_effective() and len(passes) > 2
+            and not any(isinstance(p[0], _QSlice) for p in passes)):
         # Consolidate every per-depth-level cross pass into ONE flash_varlen call: varlen just
         # needs per-sequence contiguous q/k slices, and each (ancestor-span <- descendant-run)
         # pair is one sequence regardless of which level it came from. Any tree then costs
@@ -628,8 +631,18 @@ def _sel_rows(t, q_idx):
 
 
 def _forest_attention_plan_chainfirst(node_start, node_len, node_parent, device):
-    """Chain-first decomposition. Returns ``(total, passes)`` like the per-level planner, or
-    ``None`` when the layout does not satisfy the contiguous-ancestor condition."""
+    """Hybrid chain decomposition (opt9; supersedes both the pure chain-first plan and the
+    per-level fallback). Always applicable:
+
+    - SELF pass: one CAUSAL sequence per maximal parent-adjacent chain. A chain is a pure path
+      (only one child can start at its parent's end), so a chain token's causal prefix is exactly
+      its in-chain ancestors — correct for any DFS-preorder layout.
+    - FAT cross pass: each chain attends the maximal CONTIGUOUS prefix of its head's ancestor
+      path (walking down from the tree root while spans stay adjacent) — one fat-K sequence.
+      Chain-first layouts have fully contiguous ancestor paths, so this is their only cross pass.
+    - SKINNY cross passes: ancestors after the contiguity break (e.g. interior non-first children
+      in balanced trees) get one per-ancestor sequence each, grouped by break-index so every q row
+      appears at most once per pass (the merge-slot invariant)."""
     ns = [int(x) for x in node_start]
     nl = [int(x) for x in node_len]
     par = [int(x) for x in node_parent]
@@ -641,19 +654,6 @@ def _forest_attention_plan_chainfirst(node_start, node_len, node_parent, device)
     for i in range(N):
         if adj[i]:
             chain_head[i] = chain_head[par[i]]
-    # ancestor range start for each chain head: the path start (root of its tree) — contiguous
-    # iff every path node above the head's parent is adjacent to ITS parent.
-    def anc_range(head):
-        p = par[head]
-        if p == -1:
-            return None
-        end = ns[p] + nl[p]
-        x = p
-        while par[x] != -1:
-            if not adj[x]:
-                return "broken"
-            x = par[x]
-        return (ns[x], end)
 
     heads = sorted(set(chain_head))
     chain_end = {}
@@ -661,13 +661,26 @@ def _forest_attention_plan_chainfirst(node_start, node_len, node_parent, device)
         h = chain_head[i]
         chain_end[h] = max(chain_end.get(h, 0), ns[i] + nl[i])
 
-    cross = []
+    fat = []          # (q0, q1, a0, a1): contiguous ancestor-prefix sequences
+    skinny = {}       # break-index -> list of (q0, q1, s0, s1) single-ancestor sequences
     for h in heads:
-        r = anc_range(h)
-        if r == "broken":
-            return None
-        if r is not None:
-            cross.append((ns[h], chain_end[h], r[0], r[1]))
+        if par[h] == -1:
+            continue
+        path, x = [], par[h]
+        while x != -1:
+            path.append(x)
+            x = par[x]
+        path.reverse()  # tree root first
+        y0 = ns[path[0]]
+        y = y0 + nl[path[0]]
+        i = 1
+        while i < len(path) and ns[path[i]] == y:
+            y += nl[path[i]]
+            i += 1
+        q0, q1 = ns[h], chain_end[h]
+        fat.append((q0, q1, y0, y))
+        for j, a in enumerate(path[i:]):
+            skinny.setdefault(j, []).append((q0, q1, ns[a], ns[a] + nl[a]))
 
     def _i32(x):
         return torch.tensor(x, dtype=torch.int32, device=device)
@@ -683,14 +696,14 @@ def _forest_attention_plan_chainfirst(node_start, node_len, node_parent, device)
     mx = max((chain_end[h] - ns[h] for h in heads), default=0)
     passes.append((None, None, _i32(cu), _i32(cu), mx, mx, True))
 
-    if cross:
-        cross.sort(key=lambda c: c[0])
+    def _build_cross(seqs):
+        seqs.sort(key=lambda c: c[0])
         if _SP_QSLICE:
-            # contiguous q view [qlo, qhi): real sequences + zero-K padding over inter-tree gaps.
-            qlo, qhi = cross[0][0], cross[-1][1]
+            # contiguous q view [qlo, qhi): real sequences + zero-K padding over the gaps.
+            qlo, qhi = seqs[0][0], seqs[-1][1]
             kpos, cuq, cuk, gaps = [], [0], [0], []
             cur, mxq = qlo, 0
-            for (q0, q1, a0, a1) in cross:
+            for (q0, q1, a0, a1) in seqs:
                 if q0 > cur:  # gap: rows exist in the view but attend nothing
                     gaps.append((cur, q0))
                     cuq.append(cuq[-1] + (q0 - cur))
@@ -701,19 +714,23 @@ def _forest_attention_plan_chainfirst(node_start, node_len, node_parent, device)
                 cuk.append(cuk[-1] + (a1 - a0))
                 mxq = max(mxq, q1 - q0)
                 cur = q1
-            mxk = max(c[3] - c[2] for c in cross)
-            passes.append((_QSlice(qlo, qhi, gaps), torch.cat(kpos),
-                           _i32(cuq), _i32(cuk), mxq, mxk, False))
-        else:
-            qpos, kpos, cuq, cuk = [], [], [0], [0]
-            for (q0, q1, a0, a1) in cross:
-                qpos.append(torch.arange(q0, q1, dtype=torch.long, device=device))
-                kpos.append(torch.arange(a0, a1, dtype=torch.long, device=device))
-                cuq.append(cuq[-1] + (q1 - q0))
-                cuk.append(cuk[-1] + (a1 - a0))
-            mxq = max(cross_i[1] - cross_i[0] for cross_i in cross)
-            mxk = max(cross_i[3] - cross_i[2] for cross_i in cross)
-            passes.append((torch.cat(qpos), torch.cat(kpos), _i32(cuq), _i32(cuk), mxq, mxk, False))
+            mxk = max(c[3] - c[2] for c in seqs)
+            return (_QSlice(qlo, qhi, gaps), torch.cat(kpos),
+                    _i32(cuq), _i32(cuk), mxq, mxk, False)
+        qpos, kpos, cuq, cuk = [], [], [0], [0]
+        for (q0, q1, a0, a1) in seqs:
+            qpos.append(torch.arange(q0, q1, dtype=torch.long, device=device))
+            kpos.append(torch.arange(a0, a1, dtype=torch.long, device=device))
+            cuq.append(cuq[-1] + (q1 - q0))
+            cuk.append(cuk[-1] + (a1 - a0))
+        mxq = max(c[1] - c[0] for c in seqs)
+        mxk = max(c[3] - c[2] for c in seqs)
+        return (torch.cat(qpos), torch.cat(kpos), _i32(cuq), _i32(cuk), mxq, mxk, False)
+
+    if fat:
+        passes.append(_build_cross(fat))
+    for j in sorted(skinny):
+        passes.append(_build_cross(skinny[j]))
     return total, passes
 
 
