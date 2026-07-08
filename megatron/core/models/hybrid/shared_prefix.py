@@ -290,6 +290,9 @@ except ImportError:
     HAVE_TRITON = False
 
 _SP_FUSED_MERGE = os.environ.get("NRL_SP_FUSED_MERGE", "1") not in ("0", "", "false", "False")
+# merge/dq-assembly kernel tile config (swept on GB200; override for other parts)
+_SP_MERGE_BT = int(os.environ.get("NRL_SP_MERGE_BT", "16"))
+_SP_MERGE_WARPS = int(os.environ.get("NRL_SP_MERGE_WARPS", "8"))
 
 _PLAN_CACHE: dict = {}
 _PLAN_CACHE_MAX = 128
@@ -305,14 +308,13 @@ if HAVE_TRITON:
         r0, r1, r2, r3, r4, r5, r6,          # rows_p per pass (for LSE stride)
         out_ptr,                              # merged output [total, np, HN] (dtype of q)
         lsef_ptr,                             # final LSE fp32 [np, total]
-        n_passes, total, np_: tl.constexpr, HN: tl.constexpr,
+        n_passes, total, np_: tl.constexpr, HN: tl.constexpr, BLOCK_T: tl.constexpr,
     ):
         # One program merges a BLOCK_T-token tile for one head: amortizes scheduling over
         # 524k-programs-of-tiny-work (the v1 grid), keeps o loads coalesced along HN, and gives
         # the compiler ILP across the tile. [BLOCK_T, HN] fp32 tile state.
         tb = tl.program_id(0)
         h = tl.program_id(1)
-        BLOCK_T: tl.constexpr = 16
         t = tb * BLOCK_T + tl.arange(0, BLOCK_T)
         tmask = t < total
         offs = tl.arange(0, HN)
@@ -420,7 +422,7 @@ if HAVE_TRITON:
         d0, d1, d2, d3, d4, d5, d6,          # per-pass dq contributions [rows_p, np, HN] (q dtype)
         i0, i1, i2, i3, i4, i5, i6,          # int32 [total]: token -> row in pass (or -1)
         out_ptr,                              # final dq [total, np, HN] (q dtype)
-        n_passes, total, np_: tl.constexpr, HN: tl.constexpr,
+        n_passes, total, np_: tl.constexpr, HN: tl.constexpr, BLOCK_T: tl.constexpr,
     ):
         # opt10: dq final assembly as a gather-side sum over slots (mirror of the fwd merge,
         # minus the LSE weighting — each pass's dqx is already its finished contribution).
@@ -428,7 +430,6 @@ if HAVE_TRITON:
         # every dqx is read once, dq written once, fp32 math in-register.
         tb = tl.program_id(0)
         h = tl.program_id(1)
-        BLOCK_T: tl.constexpr = 16
         t = tb * BLOCK_T + tl.arange(0, BLOCK_T)
         tmask = t < total
         offs = tl.arange(0, HN)
@@ -625,9 +626,10 @@ def _merge_passes_triton(slot_pass, inv_maps, outs, lses, total, np_, hn, dtype,
         r_args.append(lses[p].shape[1])
     out = torch.empty(total, np_, hn, dtype=dtype, device=device)
     lse_final = torch.empty(np_, total, dtype=torch.float32, device=device)
-    _sp_merge_fwd_kernel[((total + 15) // 16, np_)](
+    bt, wp = _SP_MERGE_BT, _SP_MERGE_WARPS
+    _sp_merge_fwd_kernel[((total + bt - 1) // bt, np_)](
         *o_args, *l_args, *i_args, *r_args, out, lse_final,
-        n, total, np_=np_, HN=hn,
+        n, total, np_=np_, HN=hn, BLOCK_T=bt, num_warps=wp,
     )
     return out, lse_final
 
@@ -644,8 +646,9 @@ def _merge_dq_triton(slot_pass, inv_maps, dqxs, total, np_, hn, dtype, device):
         d_args.append(dqxs[p])
         i_args.append(inv_maps[s] if s < n else inv_maps[0])
     dq = torch.empty(total, np_, hn, dtype=dtype, device=device)
-    _sp_dq_merge_kernel[((total + 15) // 16, np_)](
-        *d_args, *i_args, dq, n, total, np_=np_, HN=hn,
+    bt, wp = _SP_MERGE_BT, _SP_MERGE_WARPS
+    _sp_dq_merge_kernel[((total + bt - 1) // bt, np_)](
+        *d_args, *i_args, dq, n, total, np_=np_, HN=hn, BLOCK_T=bt, num_warps=wp,
     )
     return dq
 
