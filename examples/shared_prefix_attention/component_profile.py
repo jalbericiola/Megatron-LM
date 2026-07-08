@@ -57,7 +57,7 @@ for name, builder in SHAPES.items():
             t_g = 0.0
         else:
             def gather():
-                a = q.index_select(0, q_idx)
+                a = sp._sel_rows(q, q_idx)
                 b, c = sp._gather_kv(k, v, k_idx)
                 return a, b, c
             t_g, (qx, kx, vx) = timed(gather)

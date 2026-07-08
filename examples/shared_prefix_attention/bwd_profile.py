@@ -51,7 +51,7 @@ for name, builder in SHAPES.items():
     # forward once to get outs/lses/o_merged/lse_final
     outs, lses = [], []
     for (q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal) in passes:
-        qx = q if q_idx is None else q.index_select(0, q_idx)
+        qx = sp._sel_rows(q, q_idx)
         kx = k if k_idx is None else k.index_select(0, k_idx)
         vx = v if k_idx is None else v.index_select(0, k_idx)
         o, lse, _ = flash_attn_varlen_func(qx, kx, vx, cu_q, cu_k, mxq, mxk,
@@ -74,9 +74,9 @@ for name, builder in SHAPES.items():
             do, lse_c, lse_final, qidx, dox, rows, total, np_=NP, HN=HN))
 
         def gathers():
-            qx = q if q_idx is None else q.index_select(0, q_idx)
+            qx = sp._sel_rows(q, q_idx)
             kx, vx = (k, v) if k_idx is None else sp._gather_kv(k, v, k_idx)
-            ox = o_merged if q_idx is None else o_merged.index_select(0, q_idx)
+            ox = sp._sel_rows(o_merged, q_idx)
             return qx, kx, vx, ox
         t2 = timed(gathers)
         qx, kx, vx, ox = gathers()

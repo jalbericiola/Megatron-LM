@@ -416,6 +416,52 @@ if HAVE_TRITON:
 if HAVE_TRITON:
 
     @triton.jit
+    def _sp_dq_merge_kernel(
+        d0, d1, d2, d3, d4, d5, d6,          # per-pass dq contributions [rows_p, np, HN] (q dtype)
+        i0, i1, i2, i3, i4, i5, i6,          # int32 [total]: token -> row in pass (or -1)
+        out_ptr,                              # final dq [total, np, HN] (q dtype)
+        n_passes, total, np_: tl.constexpr, HN: tl.constexpr,
+    ):
+        # opt10: dq final assembly as a gather-side sum over slots (mirror of the fwd merge,
+        # minus the LSE weighting — each pass's dqx is already its finished contribution).
+        # Replaces the fp32 [total, np, HN] accumulator + per-pass scatter/adds + final cast:
+        # every dqx is read once, dq written once, fp32 math in-register.
+        tb = tl.program_id(0)
+        h = tl.program_id(1)
+        BLOCK_T: tl.constexpr = 16
+        t = tb * BLOCK_T + tl.arange(0, BLOCK_T)
+        tmask = t < total
+        offs = tl.arange(0, HN)
+        acc = tl.zeros([BLOCK_T, HN], dtype=tl.float32)
+        for p in tl.static_range(7):
+            if p < n_passes:
+                if p == 0:
+                    idx_ptr, d_ptr = i0, d0
+                elif p == 1:
+                    idx_ptr, d_ptr = i1, d1
+                elif p == 2:
+                    idx_ptr, d_ptr = i2, d2
+                elif p == 3:
+                    idx_ptr, d_ptr = i3, d3
+                elif p == 4:
+                    idx_ptr, d_ptr = i4, d4
+                elif p == 5:
+                    idx_ptr, d_ptr = i5, d5
+                else:
+                    idx_ptr, d_ptr = i6, d6
+                r = tl.load(idx_ptr + t, mask=tmask, other=-1)
+                hit = (r >= 0) & tmask
+                acc += tl.load(
+                    d_ptr + (r[:, None] * np_ + h) * HN + offs[None, :],
+                    mask=hit[:, None], other=0.0,
+                ).to(tl.float32)
+        tl.store(
+            out_ptr + (t[:, None] * np_ + h) * HN + offs[None, :],
+            acc.to(out_ptr.dtype.element_ty),
+            mask=tmask[:, None],
+        )
+
+    @triton.jit
     def _sp_gather_kv_kernel(
         k_ptr, v_ptr,      # [total, ng, HN] sources (q dtype)
         idx_ptr,           # int64 [rows] pass-row -> token
@@ -584,6 +630,24 @@ def _merge_passes_triton(slot_pass, inv_maps, outs, lses, total, np_, hn, dtype,
         n, total, np_=np_, HN=hn,
     )
     return out, lse_final
+
+
+def _merge_dq_triton(slot_pass, inv_maps, dqxs, total, np_, hn, dtype, device):
+    """dq final assembly across slots: dq[t] = sum over slots s of dqxs[slot_pass[s]][inv_s[t]].
+    One kernel, dqx tensors read once, dq written once in ``dtype`` (no fp32 accumulator)."""
+    MAXP = 7
+    n = len(slot_pass)
+    assert n <= MAXP
+    d_args, i_args = [], []
+    for s in range(MAXP):
+        p = slot_pass[s] if s < n else slot_pass[0]
+        d_args.append(dqxs[p])
+        i_args.append(inv_maps[s] if s < n else inv_maps[0])
+    dq = torch.empty(total, np_, hn, dtype=dtype, device=device)
+    _sp_dq_merge_kernel[((total + 15) // 16, np_)](
+        *d_args, *i_args, dq, n, total, np_=np_, HN=hn,
+    )
+    return dq
 
 
 # Chain-first plan (NRL_SP_CHAINFIRST=1, default on, auto-fallback): when the layout emits each
@@ -938,6 +1002,8 @@ class _ComposedForestAttn(torch.autograd.Function):
         ctx.lse_final = lse_final
         ctx.scale = scale
         ctx.qidx64 = qidx64
+        ctx.inv_maps = inv_maps
+        ctx.slot_pass = slot_pass
         return o_merged
 
     @staticmethod
@@ -999,29 +1065,28 @@ class _ComposedForestAttn(torch.autograd.Function):
                         ev = torch.cuda.Event()
                         ev.record(st)
                         join[i] = ev
-            # accumulate in pass order on the current stream (scatters are read-modify-write on
-            # the shared accumulators, so they stay ordered; the flash backwards above overlap).
-            dq = dk = dv = None
+            # k/v accumulate in pass order on the current stream (scatters are read-modify-write
+            # on shared fp32 accumulators, ng=8 so the buffers are small); dq is assembled by one
+            # gather-side merge kernel over all pass contributions (opt10) once every pass joins.
+            dk = dv = None
+            dqxs = [None] * len(ctx.passes)
             for i, res in enumerate(results):
                 if join[i] is not None:
                     cur.wait_event(join[i])
                 dqx, dkx, dvx, qidx, k_idx, rows, q_idx = res
+                dqxs[i] = dqx
                 if i == 0:
                     # self pass: identity over all tokens -> direct init, no zeros/scatter.
-                    dq = dqx.float()
                     dk = dkx.float()
                     dv = dvx.float()
                 else:
                     kro = k_idx.numel()
-                    if isinstance(q_idx, _QSlice):
-                        # contiguous rows: plain vectorized slice-add, no atomics (gap rows
-                        # contribute exact zeros from flash's zero-K backward).
-                        dq[q_idx.lo:q_idx.hi] += dqx.float()
-                    else:
-                        _sp_scatter_accum_kernel[((rows + 15) // 16, np_)](dq, dqx, qidx, rows, n_=np_, HN=hn)
                     _sp_scatter_accum_kernel[((kro + 15) // 16, ng)](dk, dkx, k_idx, kro, n_=ng, HN=hn)
                     _sp_scatter_accum_kernel[((kro + 15) // 16, ng)](dv, dvx, k_idx, kro, n_=ng, HN=hn)
-            return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
+            dq = _merge_dq_triton(
+                ctx.slot_pass, ctx.inv_maps, dqxs, total, np_, hn, q.dtype, q.device
+            )
+            return dq, dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
 
         dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
