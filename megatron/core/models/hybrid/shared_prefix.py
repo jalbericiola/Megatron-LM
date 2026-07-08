@@ -376,10 +376,11 @@ if HAVE_TRITON:
         rmask = r < rows
         offs = tl.arange(0, HN)
         t = tl.load(qidx_ptr + r, mask=rmask, other=0)
-        w = tl.exp(
-            tl.load(lse_ptr + h * rows + r, mask=rmask, other=0.0)
-            - tl.load(lsef_ptr + h * total + t, mask=rmask, other=0.0)
-        )
+        lse_p = tl.load(lse_ptr + h * rows + r, mask=rmask, other=0.0)
+        w = tl.exp(lse_p - tl.load(lsef_ptr + h * total + t, mask=rmask, other=0.0))
+        # zero-K padding rows (q-slice cross pass) report LSE=+inf: their weight must be 0,
+        # not inf, so their (zero) flash grads stay zero instead of turning NaN.
+        w = tl.where(lse_p > 1e30, 0.0, w)
         do = tl.load(
             do_ptr + (t[:, None] * np_ + h) * HN + offs[None, :], mask=rmask[:, None], other=0.0
         ).to(tl.float32)
@@ -470,7 +471,7 @@ def _sp_combine_effective():
 def _plan_key(node_start, node_len, node_parent, device):
     return (tuple(int(x) for x in node_start), tuple(int(x) for x in node_len),
             tuple(int(x) for x in node_parent), str(device), _sp_combine_effective(),
-            _SP_CHAINFIRST)
+            _SP_CHAINFIRST, _SP_QSLICE)
 
 
 def _forest_attention_plan_cached(node_start, node_len, node_parent, device):
@@ -535,6 +536,14 @@ def _forest_attention_plan_cached(node_start, node_len, node_parent, device):
             if q_idx is None:
                 inv = torch.arange(total, dtype=torch.int32, device=device)
                 qidx64.append(identity)
+            elif isinstance(q_idx, _QSlice):
+                # row r of the pass <-> token lo+r; gap tokens are padding rows, not queries.
+                inv = torch.full((total,), -1, dtype=torch.int32, device=device)
+                inv[q_idx.lo:q_idx.hi] = torch.arange(
+                    q_idx.hi - q_idx.lo, dtype=torch.int32, device=device)
+                for (g0, g1) in q_idx.gaps:
+                    inv[g0:g1] = -1
+                qidx64.append(torch.arange(q_idx.lo, q_idx.hi, dtype=torch.long, device=device))
             else:
                 inv = torch.full((total,), -1, dtype=torch.int32, device=device)
                 inv[q_idx] = torch.arange(q_idx.numel(), dtype=torch.int32, device=device)
@@ -584,6 +593,38 @@ def _merge_passes_triton(slot_pass, inv_maps, outs, lses, total, np_, hn, dtype,
 # into a single non-causal cross pass. Falls back to the per-level plan when any cross-needing
 # chain's ancestor range is non-contiguous (e.g. interior non-first children).
 _SP_CHAINFIRST = os.environ.get("NRL_SP_CHAINFIRST", "1") not in ("0", "", "false", "False")
+
+# opt8: when the chain-first cross pass's query rows form one contiguous layout range (they do
+# per tree: branches+siblings all sit after the spine), pass a zero-copy VIEW q[lo:hi] to flash
+# instead of index_select (on branched_mc that gather+scatter round-trips ~176MB per fwd+bwd).
+# Gaps between trees in multi-tree bins are covered by zero-length-K padding sequences: flash
+# returns out=0 / dq=0 / LSE=+inf for those rows (probe-verified), the merge excludes them via
+# inv=-1, and the backward scale kernel guards LSE=+inf -> weight 0.
+_SP_QSLICE = os.environ.get("NRL_SP_QSLICE", "1") not in ("0", "", "false", "False")
+
+
+class _QSlice:
+    """Marker for a cross pass whose q rows are the contiguous token range [lo, hi) (row r of
+    the pass <-> token lo+r), with ``gaps`` = token sub-ranges inside [lo, hi) that are only
+    zero-K padding sequences (not real queries of the pass)."""
+
+    __slots__ = ("lo", "hi", "gaps")
+
+    def __init__(self, lo, hi, gaps):
+        self.lo, self.hi, self.gaps = lo, hi, gaps
+
+    def numel(self):
+        return self.hi - self.lo
+
+
+def _sel_rows(t, q_idx):
+    """Resolve a pass's q-row selector: None => identity, _QSlice => zero-copy view,
+    tensor => gather."""
+    if q_idx is None:
+        return t
+    if isinstance(q_idx, _QSlice):
+        return t[q_idx.lo:q_idx.hi]
+    return t.index_select(0, q_idx)
 
 
 def _forest_attention_plan_chainfirst(node_start, node_len, node_parent, device):
@@ -643,15 +684,36 @@ def _forest_attention_plan_chainfirst(node_start, node_len, node_parent, device)
     passes.append((None, None, _i32(cu), _i32(cu), mx, mx, True))
 
     if cross:
-        qpos, kpos, cuq, cuk = [], [], [0], [0]
-        for (q0, q1, a0, a1) in cross:
-            qpos.append(torch.arange(q0, q1, dtype=torch.long, device=device))
-            kpos.append(torch.arange(a0, a1, dtype=torch.long, device=device))
-            cuq.append(cuq[-1] + (q1 - q0))
-            cuk.append(cuk[-1] + (a1 - a0))
-        mxq = max(cross_i[1] - cross_i[0] for cross_i in cross)
-        mxk = max(cross_i[3] - cross_i[2] for cross_i in cross)
-        passes.append((torch.cat(qpos), torch.cat(kpos), _i32(cuq), _i32(cuk), mxq, mxk, False))
+        cross.sort(key=lambda c: c[0])
+        if _SP_QSLICE:
+            # contiguous q view [qlo, qhi): real sequences + zero-K padding over inter-tree gaps.
+            qlo, qhi = cross[0][0], cross[-1][1]
+            kpos, cuq, cuk, gaps = [], [0], [0], []
+            cur, mxq = qlo, 0
+            for (q0, q1, a0, a1) in cross:
+                if q0 > cur:  # gap: rows exist in the view but attend nothing
+                    gaps.append((cur, q0))
+                    cuq.append(cuq[-1] + (q0 - cur))
+                    cuk.append(cuk[-1])
+                    mxq = max(mxq, q0 - cur)
+                kpos.append(torch.arange(a0, a1, dtype=torch.long, device=device))
+                cuq.append(cuq[-1] + (q1 - q0))
+                cuk.append(cuk[-1] + (a1 - a0))
+                mxq = max(mxq, q1 - q0)
+                cur = q1
+            mxk = max(c[3] - c[2] for c in cross)
+            passes.append((_QSlice(qlo, qhi, gaps), torch.cat(kpos),
+                           _i32(cuq), _i32(cuk), mxq, mxk, False))
+        else:
+            qpos, kpos, cuq, cuk = [], [], [0], [0]
+            for (q0, q1, a0, a1) in cross:
+                qpos.append(torch.arange(q0, q1, dtype=torch.long, device=device))
+                kpos.append(torch.arange(a0, a1, dtype=torch.long, device=device))
+                cuq.append(cuq[-1] + (q1 - q0))
+                cuk.append(cuk[-1] + (a1 - a0))
+            mxq = max(cross_i[1] - cross_i[0] for cross_i in cross)
+            mxk = max(cross_i[3] - cross_i[2] for cross_i in cross)
+            passes.append((torch.cat(qpos), torch.cat(kpos), _i32(cuq), _i32(cuk), mxq, mxk, False))
     return total, passes
 
 
@@ -784,7 +846,7 @@ class _ComposedForestAttn(torch.autograd.Function):
                 st = streams[i % len(streams)]
                 st.wait_event(ev_in)
                 with torch.cuda.stream(st):
-                    qx = q if q_idx is None else q.index_select(0, q_idx)
+                    qx = _sel_rows(q, q_idx)
                     if k_idx is None:
                         kx, vx = k, v
                     else:
@@ -803,7 +865,7 @@ class _ComposedForestAttn(torch.autograd.Function):
                 cur.wait_event(ev)
         else:
             for i, (q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal) in enumerate(passes):
-                qx = q if q_idx is None else q.index_select(0, q_idx)  # None => identity (self pass)
+                qx = _sel_rows(q, q_idx)  # None => identity (self pass)
                 if k_idx is None:
                     kx, vx = k, v
                 else:
@@ -825,15 +887,28 @@ class _ComposedForestAttn(torch.autograd.Function):
             # merged LSE per (head, token): logsumexp over every pass the token queries in.
             lse_final = torch.full((np_, total), float("-inf"), device=q.device, dtype=torch.float32)
             for (q_idx, *_), lse in zip(passes, lses):
-                if q_idx is None:
-                    lse_final = torch.logaddexp(lse_final, lse.float())
+                ls = lse.float()
+                if isinstance(q_idx, _QSlice):
+                    # zero-K padding rows report LSE=+inf: neutralize before merging.
+                    ls = torch.where(torch.isinf(ls), torch.full_like(ls, float("-inf")), ls)
+                    lse_final[:, q_idx.lo:q_idx.hi] = torch.logaddexp(
+                        lse_final[:, q_idx.lo:q_idx.hi], ls)
+                elif q_idx is None:
+                    lse_final = torch.logaddexp(lse_final, ls)
                 else:
-                    lse_final[:, q_idx] = torch.logaddexp(lse_final[:, q_idx], lse.float())
+                    lse_final[:, q_idx] = torch.logaddexp(lse_final[:, q_idx], ls)
             # merged output: sum_pass w_pass * o_pass, w_pass = exp(lse_pass - lse_final).
             o_merged = torch.zeros(total, np_, hn, device=q.device, dtype=torch.float32)
             for (q_idx, *_), o, lse in zip(passes, outs, lses):
+                ls = lse.float()
+                if isinstance(q_idx, _QSlice):
+                    ls = torch.where(torch.isinf(ls), torch.full_like(ls, float("-inf")), ls)
+                    lf = lse_final[:, q_idx.lo:q_idx.hi]
+                    contrib = torch.exp(ls - lf).transpose(0, 1).unsqueeze(-1) * o.float()
+                    o_merged[q_idx.lo:q_idx.hi] += contrib
+                    continue
                 lf = lse_final if q_idx is None else lse_final.index_select(1, q_idx)
-                contrib = torch.exp(lse.float() - lf).transpose(0, 1).unsqueeze(-1) * o.float()
+                contrib = torch.exp(ls - lf).transpose(0, 1).unsqueeze(-1) * o.float()
                 if q_idx is None:
                     o_merged = o_merged + contrib
                 else:
@@ -884,12 +959,12 @@ class _ComposedForestAttn(torch.autograd.Function):
                 with stream_ctx:
                     qidx = ctx.qidx64[i]
                     rows = qidx.numel()
-                    qx = q if q_idx is None else q.index_select(0, q_idx)
+                    qx = _sel_rows(q, q_idx)
                     if k_idx is None:
                         kx, vx = k, v
                     else:
                         kx, vx = _gather_kv(k, v, k_idx)
-                    ox = o_merged if q_idx is None else o_merged.index_select(0, q_idx)
+                    ox = _sel_rows(o_merged, q_idx)
                     dox = torch.empty(rows, np_, hn, dtype=q.dtype, device=q.device)
                     _sp_scale_gather_kernel[((rows + 15) // 16, np_)](
                         do, lse.contiguous(), lse_final, qidx, dox, rows, total, np_=np_, HN=hn,
@@ -899,7 +974,7 @@ class _ComposedForestAttn(torch.autograd.Function):
                         dox, qx, kx, vx, ox, lse, dqx, dkx, dvx, cu_q, cu_k, mxq, mxk,
                         0.0, scale, causal, -1, -1, 0.0, None, False, None, False,
                     )
-                    results[i] = (dqx, dkx, dvx, qidx, k_idx, rows)
+                    results[i] = (dqx, dkx, dvx, qidx, k_idx, rows, q_idx)
                     if st is not None:
                         dqx.record_stream(cur)
                         dkx.record_stream(cur)
@@ -913,7 +988,7 @@ class _ComposedForestAttn(torch.autograd.Function):
             for i, res in enumerate(results):
                 if join[i] is not None:
                     cur.wait_event(join[i])
-                dqx, dkx, dvx, qidx, k_idx, rows = res
+                dqx, dkx, dvx, qidx, k_idx, rows, q_idx = res
                 if i == 0:
                     # self pass: identity over all tokens -> direct init, no zeros/scatter.
                     dq = dqx.float()
@@ -921,7 +996,12 @@ class _ComposedForestAttn(torch.autograd.Function):
                     dv = dvx.float()
                 else:
                     kro = k_idx.numel()
-                    _sp_scatter_accum_kernel[((rows + 15) // 16, np_)](dq, dqx, qidx, rows, n_=np_, HN=hn)
+                    if isinstance(q_idx, _QSlice):
+                        # contiguous rows: plain vectorized slice-add, no atomics (gap rows
+                        # contribute exact zeros from flash's zero-K backward).
+                        dq[q_idx.lo:q_idx.hi] += dqx.float()
+                    else:
+                        _sp_scatter_accum_kernel[((rows + 15) // 16, np_)](dq, dqx, qidx, rows, n_=np_, HN=hn)
                     _sp_scatter_accum_kernel[((kro + 15) // 16, ng)](dk, dkx, k_idx, kro, n_=ng, HN=hn)
                     _sp_scatter_accum_kernel[((kro + 15) // 16, ng)](dv, dvx, k_idx, kro, n_=ng, HN=hn)
             return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
@@ -930,13 +1010,21 @@ class _ComposedForestAttn(torch.autograd.Function):
         dk = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
         dv = torch.zeros(v.shape, device=v.device, dtype=torch.float32)
         for (q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal), lse in zip(ctx.passes, ctx.lses):
-            qx = q if q_idx is None else q.index_select(0, q_idx)  # q_idx None => identity (self pass)
+            qx = _sel_rows(q, q_idx)  # q_idx None => identity (self pass)
             kx = k if k_idx is None else k.index_select(0, k_idx)
             vx = v if k_idx is None else v.index_select(0, k_idx)
-            ox = o_merged if q_idx is None else o_merged.index_select(0, q_idx)  # MERGED output -> exact
-            lf = lse_final if q_idx is None else lse_final.index_select(1, q_idx)
-            dox_full = do if q_idx is None else do.index_select(0, q_idx)
-            dox = (torch.exp(lse.float() - lf).transpose(0, 1).unsqueeze(-1) * dox_full).to(q.dtype)
+            ox = _sel_rows(o_merged, q_idx)  # MERGED output -> exact
+            if isinstance(q_idx, _QSlice):
+                lf = lse_final[:, q_idx.lo:q_idx.hi]
+                dox_full = do[q_idx.lo:q_idx.hi]
+                ls = lse.float()
+                ls = torch.where(torch.isinf(ls), torch.full_like(ls, float("-inf")), ls)
+                w = torch.exp(ls - lf)  # 0 on zero-K padding rows
+            else:
+                lf = lse_final if q_idx is None else lse_final.index_select(1, q_idx)
+                dox_full = do if q_idx is None else do.index_select(0, q_idx)
+                w = torch.exp(lse.float() - lf)
+            dox = (w.transpose(0, 1).unsqueeze(-1) * dox_full).to(q.dtype)
             dqx, dkx, dvx = torch.empty_like(qx), torch.empty_like(kx), torch.empty_like(vx)
             _flash_attn_varlen_backward(
                 dox, qx, kx, vx, ox, lse, dqx, dkx, dvx, cu_q, cu_k, mxq, mxk,
@@ -944,6 +1032,8 @@ class _ComposedForestAttn(torch.autograd.Function):
             )
             if q_idx is None:
                 dq += dqx.float()
+            elif isinstance(q_idx, _QSlice):
+                dq[q_idx.lo:q_idx.hi] += dqx.float()
             else:
                 dq.index_add_(0, q_idx, dqx.float())
             if k_idx is None:
