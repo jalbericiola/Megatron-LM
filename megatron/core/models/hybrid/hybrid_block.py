@@ -442,8 +442,17 @@ class HybridStack(MegatronModule):
         else:
             ctx = SharedPrefixContext(prefix_len, completion_lens, real_prefix_len=real_prefix_len)
             cp_layout = cp_group = rotary_local = None
-        assert hidden_states.shape[0] == ctx.total_len, (
-            f"packed length {hidden_states.shape[0]} != Lp+sum(Lc) {ctx.total_len} (cp={cp_size})"
+        # Under TP sequence-parallel the residual stream BETWEEN layers is sharded along the sequence
+        # dim across the TP group (each layer's in_proj/QKV all-gathers it back to ctx.total_len for
+        # the Mamba fork + tree attention, then out_proj reduce-scatters it; the output layer gathers
+        # it before the vocab projection). So the entry hidden_states here is ctx.total_len // tp_sp.
+        # The fork/attention/output therefore see the FULL ctx.total_len sequence -- identical to the
+        # TP=1 path -- and need no SP-specific handling beyond this length bookkeeping.
+        sp = bool(getattr(self.config, "sequence_parallel", False))
+        tp_sp = _ps.get_tensor_model_parallel_world_size() if sp else 1
+        assert hidden_states.shape[0] * tp_sp == ctx.total_len, (
+            f"packed length {hidden_states.shape[0]} * tp_sp {tp_sp} != Lp+sum(Lc) {ctx.total_len} "
+            f"(cp={cp_size}, sequence_parallel={sp})"
         )
         # Prefer FlexAttention for the tree mask: a sparse BlockMask that skips the fully-masked
         # sibling-branch blocks (~5x faster than the un-shared baseline, ~11x faster than the dense
@@ -453,7 +462,14 @@ class HybridStack(MegatronModule):
         # gather-KV + local-query tree flex (step 6b-2); not yet wired, so guard below.
         block_mask = (
             build_tree_block_mask(prefix_len, completion_lens, hidden_states.device)
-            if HAVE_FLEX_ATTENTION and cp_size == 1
+            if HAVE_FLEX_ATTENTION and cp_size == 1 and not _sp_fused_tree_enabled()
+            else None
+        )
+        # Fused flash-composed path (CP=1): thread the star layout instead of a flex BlockMask;
+        # _run_core_attention dispatches on `_sp_star`. NRL_SP_FUSED_TREE=0 restores flex.
+        sp_star = (
+            (prefix_len, list(completion_lens))
+            if cp_size == 1 and _sp_fused_tree_enabled()
             else None
         )
         for layer in self.layers:
@@ -481,6 +497,16 @@ class HybridStack(MegatronModule):
                         )
                     finally:
                         layer.self_attention._sp_cp_ctx = None
+                elif sp_star is not None:
+                    layer.self_attention._sp_star = sp_star
+                    try:
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=None,
+                            rotary_pos_emb=rotary_pos_emb,
+                        )
+                    finally:
+                        layer.self_attention._sp_star = None
                 elif block_mask is not None:
                     # real attention via FlexAttention tree BlockMask (+ position-aware RoPE). The
                     # dense mask is not materialized; _run_core_attention reads `_sp_block_mask`.
@@ -576,3 +602,10 @@ class HybridStack(MegatronModule):
 # Backward-compatible aliases
 MambaStackSubmodules = HybridStackSubmodules
 MambaStack = HybridStack
+
+
+def _sp_fused_tree_enabled() -> bool:
+    """Gate for the fused flash-composed shared-prefix attention (vs FlexAttention)."""
+    import os
+
+    return os.environ.get("NRL_SP_FUSED_TREE", "1") not in ("0", "", "false", "False")

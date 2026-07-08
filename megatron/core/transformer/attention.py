@@ -1276,6 +1276,7 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="core_attention")
         sp_cp_ctx = getattr(self, "_sp_cp_ctx", None)
         sp_block_mask = getattr(self, "_sp_block_mask", None)
+        sp_star = getattr(self, "_sp_star", None)
         if sp_cp_ctx is not None:
             # Shared-prefix under CONTEXT PARALLELISM: query/key/value are this rank's local
             # per-segment-zigzag shard (post-RoPE). All-gather the (GQA-cheap) K/V to the full
@@ -1286,6 +1287,18 @@ class Attention(MegatronModule, ABC):
             layout, cp_group = sp_cp_ctx
             key_full, value_full = layout.gather_kv(key, value, cp_group)
             core_attn_out = local_tree_attention(query, key_full, value_full, layout.local_block_mask())
+        elif sp_star is not None:
+            # Shared-prefix (CP=1) via the fused flash-composed kernel: 2 flash calls + Triton
+            # LSE merge with the EXACT backward, instead of FlexAttention. ~1.5x training step
+            # on star groups at GB200 (see shared_prefix_fused module docstring); flex remains
+            # the fallback (NRL_SP_FUSED_TREE=0 or missing flash/triton).
+            from megatron.core.models.hybrid.shared_prefix_fused import (
+                flash_composed_forest_attention,
+            )
+
+            core_attn_out = flash_composed_forest_attention(
+                query, key, value, [(0, sp_star[0], sp_star[1])]
+            )
         elif sp_block_mask is not None:
             # Shared-prefix ("tree") packing (CP=1): run the tree-masked attention via FlexAttention
             # (sparse BlockMask skips the fully-masked sibling-branch blocks) instead of the
