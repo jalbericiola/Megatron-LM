@@ -90,7 +90,7 @@ MODEL_OPTIONS="\
   --disable-bias-linear \
   --norm-epsilon 1e-5 \
   --init-method-std 0.014 \
-  --exit-duration-in-mins 5750 \
+  --exit-duration-in-mins ${EXIT_DURATION_MINS:-5750} \
   --max-position-embeddings $MAX_SEQ_LENGTH \
   --tensor-model-parallel-size $TP  \
   --pipeline-model-parallel-size $PP  \

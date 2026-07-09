@@ -1,7 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import logging
 from typing import Any, Optional, Type
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 
@@ -325,7 +328,19 @@ class WeightedMultiTask(
             )
             tasks.append(agent.run_evaluation(agent_request))
 
-        # Run all tasks concurrently and gather results
-        all_responses = await asyncio.gather(*tasks)
-
-        return all_responses
+        # Run all tasks concurrently; tolerate per-agent failures. Evaluation is advisory —
+        # a single failed episode (HTTP 500 from the env server, TokenOverflow on a
+        # near-limit prompt) must not kill a training job that just spent hours on a
+        # rollout wave. Failed agents are logged and skipped; their metrics are absent
+        # for this eval pass rather than fatal.
+        all_responses = await asyncio.gather(*tasks, return_exceptions=True)
+        ok_responses = []
+        for agent, resp in zip(self.agents, all_responses):
+            if isinstance(resp, BaseException):
+                logger.error(
+                    f"Evaluation failed for agent {getattr(agent, 'agent_name', agent)!r}; "
+                    f"skipping its metrics this pass: {resp!r}"
+                )
+            else:
+                ok_responses.append(resp)
+        return ok_responses
