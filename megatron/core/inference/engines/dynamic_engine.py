@@ -40,6 +40,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
 )
+from megatron.core.inference.inference_step_trace import get_inference_step_tracer
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -888,6 +889,12 @@ class DynamicInferenceEngine(AbstractEngine):
             end_mem_alloc = end_mem["allocated_bytes.all.current"]
             start_mem_res = start_mem["reserved_bytes.all.current"]
             end_mem_res = end_mem["reserved_bytes.all.current"]
+            # Process-cumulative high-water marks. Deliberately NOT reset here, so we
+            # don't perturb training-side peak-memory reporting; this is the max GPU
+            # footprint reached, which is what the KV-pool (buffer-size-gb) headroom
+            # question needs.
+            end_mem_alloc_peak = end_mem["allocated_bytes.all.peak"]
+            end_mem_res_peak = end_mem["reserved_bytes.all.peak"]
 
             rank_str = torch.distributed.get_rank()
             dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
@@ -906,6 +913,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"cpu: {cpu_mem_str}",
                     f"gpu: alloc {end_mem_alloc / 1e9:.1f} GB",
                     f"res {end_mem_res / 1e9:.1f} GB",
+                    f"peak alloc {end_mem_alloc_peak / 1e9:.1f} GB",
+                    f"peak res {end_mem_res_peak / 1e9:.1f} GB",
                 )
             )
             logging.info(
@@ -1896,6 +1905,32 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # schedule requests
         self.schedule_waiting_requests()
+
+        # Opt-in per-step batch-size trace (RL systems metric). Recorded post-schedule
+        # so it reflects the batch about to be processed this step.
+        _step_tracer = get_inference_step_tracer()
+        if _step_tracer is not None:
+            _ctx = self.context
+            _alloc = _ctx.kv_block_allocator
+            # Live KV-block usage (active + paused blocks) vs. usable capacity.
+            _kv_used = _alloc.get_total_used()
+            # Mamba slots held == admitted requests (active + paused), one slot each.
+            _mamba_total = _ctx.mamba_max_requests
+            _mamba_total = None if _mamba_total == float("inf") else int(_mamba_total)
+            _step_tracer.record(
+                step=_ctx.step_count,
+                active=_ctx.get_active_request_count(),
+                waiting=len(self.waiting_request_ids),
+                paused=_ctx.paused_request_count,
+                prefill=_ctx.num_prefill_requests,
+                decode=_ctx.num_decode_requests,
+                active_tokens=_ctx.active_token_count,
+                kv_blocks_used=_kv_used,
+                kv_blocks_total=_alloc.total_count - 1,
+                mamba_slots_used=_ctx.total_request_count,
+                mamba_slots_total=_mamba_total,
+                max_requests=_ctx.max_requests,
+            )
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
