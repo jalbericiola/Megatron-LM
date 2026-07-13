@@ -1756,16 +1756,19 @@ def prepare_trajectories(
     trajs = torch.tensor(trajs, device='cpu')
 
     if trajs.ndim == 1:
-        # trajs is 1D (shape (0,)) when every rollout had trajectory=[] — i.e. all inference
-        # requests returned empty-trajectory placeholders (e.g. 500/TokenOverflowError from KV-cache
-        # exhaustion or a chunked-prefill wedge).  The downstream trajs[:, 0] assert would give a
-        # confusing IndexError; raise an actionable message here instead.
+        # trajs is 1D (shape (0,)) when every rollout had trajectory=[] — all inference
+        # requests returned empty placeholders (gym timeout, overlay corruption, 500, etc.).
+        # Return empty 2D tensors so the training step is a no-op instead of crashing the chain.
         rank_str = str(dist.get_rank()) if torch.distributed.is_initialized() else "0"
-        raise RuntimeError(
-            f"[rank {rank_str}] prepare_trajectories: 0 usable trajectories from {len(rollouts)} rollout(s). "
-            f"All rollouts have trajectory=[] (empty-trajectory placeholders). "
-            f"Likely cause: inference server returned only 500/TokenOverflowError — check for "
-            f"KV-cache exhaustion (too many parallel generations at this SL) or --enable-chunked-prefill wedge."
+        logger.warning(
+            f"[rank {rank_str}] prepare_trajectories: 0 usable trajectories from {len(rollouts)} "
+            f"rollout(s). All have trajectory=[]. Skipping wave (no-op update). "
+            f"Causes: gym timeout/rc=124, Apptainer overlay corruption, inference 500, or shm exhaustion."
+        )
+        return (
+            torch.zeros((0, seq_length), dtype=torch.long),
+            torch.zeros((0, seq_length), dtype=torch.bool),
+            None,
         )
 
     # Only process if we have inference_logprobs
@@ -2046,6 +2049,22 @@ def prepare_data_for_update(
                 group=mpu.get_data_parallel_group(),
             )
             global_advantages = torch.cat(gathered_adv, dim=0)
+
+        # When prepare_trajectories returned empty tensors (all gym episodes failed),
+        # create dummy all-pad trajectories with all-False generation_mask so the
+        # training step runs with zero loss and no gradient update (no-op iteration).
+        if trajs.shape[0] == 0:
+            rank_str = str(dist.get_rank()) if torch.distributed.is_initialized() else "0"
+            dp_size = max(1, mpu.get_data_parallel_world_size())
+            n_dummy = max(1, args.global_batch_size // dp_size)
+            logger.warning(
+                f"[rank {rank_str}] prepare_data_for_update: all trajectories empty. "
+                f"Substituting {n_dummy} dummy no-op trajectories (zero-loss step)."
+            )
+            trajs = torch.full((n_dummy, args.seq_length), tokenizer.pad, dtype=torch.long)
+            generation_masks = torch.zeros((n_dummy, args.seq_length), dtype=torch.bool)
+            advantages = torch.zeros(n_dummy, dtype=dtype).cuda()
+            inference_logprobs = None
 
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
