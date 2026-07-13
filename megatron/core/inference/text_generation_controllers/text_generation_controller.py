@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import os
 import concurrent
 import copy
 import functools
@@ -1757,6 +1758,11 @@ class TextGenerationController:
             # active, MTP logits are computed serially after verification.
             range_push("forward_pass")
             self._dynamic_step_forward_logits(input_ids, position_ids)
+            if os.environ.get("MRL_SYNC_AFTER_FORWARD"):
+                # Debug probe for the wave-tail illegal-memory-access: force the
+                # fault to report on the graph replay instead of surfacing later
+                # at sample_kernel / step_end_event.synchronize().
+                torch.cuda.synchronize()
 
             # Commit Mamba intermediate states before update_requests, which
             # may swap request indices. The Python lists tracking EOS block IDs
