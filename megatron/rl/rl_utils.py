@@ -1497,16 +1497,25 @@ def prep_wandb_metrics(
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
+        # One row per ROLLOUT with a truncated detokenized trajectory. The previous
+        # per-TURN rows each embedded the ENTIRE r.trajectory (all turns of raw token-id
+        # lists): O(turns^2 x context) objects through wandb's recursive _json_helper.
+        # On a 125-turn/131k-context SWE group the writer rank ground CPU for HOURS while
+        # every other rank waited in a barrier -- DCGM saw N-1 idle GPUs and the cluster
+        # reaper cancelled the job (bearval4/bearval16/f1, 2026-07-11..12; captured via
+        # faulthandler stacks: _json_helper <- Table.to_json <- maybe_log_training_metrics).
+        def _traj_text(r):
+            text = '\n'.join(
+                (tokenizer.detokenize(t) if isinstance(r, TokenRollout) else t)
+                for t in r.trajectory
+            )
+            if len(text) > 6000:
+                text = text[:4000] + '\n...[truncated]...\n' + text[-2000:]
+            return text
+
         metrics['rollouts'] = wandb_writer.Table(
-            columns=['Trajectories', 'Tokens', 'Rewards'],
-            rows=[
-                [
-                    tokenizer.detokenize(turn) if isinstance(r, TokenRollout) else turn,
-                    r.trajectory,
-                    r.reward,
-                ]
-                for r in example_group for turn in r.trajectory
-            ],
+            columns=['Trajectory (truncated)', 'NumTurns', 'Rewards'],
+            rows=[[_traj_text(r), len(r.trajectory), r.reward] for r in example_group],
         )
     return metrics
 
