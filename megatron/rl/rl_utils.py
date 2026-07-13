@@ -10,6 +10,7 @@ import math
 import logging
 import json
 import os
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -1414,6 +1415,15 @@ def prep_wandb_metrics(
     # Per-token staleness
     per_token_policy_staleness = [current_iteration - e for g in policy_epoch for r in g for e in r]
     per_token_kv_staleness = [current_iteration - e for g in kv_cache_epoch for r in g for e in r]
+    # Despite the name, these stamps are per epoch-SEGMENT (sparse (start_idx, epoch)
+    # boundaries from the engine), ~1e4 entries today. Cap defensively: a true
+    # per-token densification (16.8M tokens/iter at 128x131k SL) pushed through
+    # wandb's recursive serializer would recreate the writer-rank wedge (6082aab4d).
+    _pt_cap = 10000
+    if len(per_token_policy_staleness) > _pt_cap:
+        _stride = -(-len(per_token_policy_staleness) // _pt_cap)
+        per_token_policy_staleness = per_token_policy_staleness[::_stride]
+        per_token_kv_staleness = per_token_kv_staleness[::_stride]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -1450,7 +1460,7 @@ def prep_wandb_metrics(
                     rollout_kv_last_token_staleness,
                 )),
             ),
-            # NOTE: This table can get very large (one row per token across all rollouts).
+            # One row per epoch-segment stamp (capped above), NOT truly per token.
             'per_token_table': wandb_writer.Table(
                 columns=['policy_staleness', 'kv_staleness'],
                 data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
@@ -1494,21 +1504,34 @@ def prep_wandb_metrics(
                 'staleness', 'Per-Token KV Cache Staleness'
             ),
     }
-    if example_group:
+    # MRL_DISABLE_EXAMPLE_TABLE=1 skips the example-trajectory table entirely --
+    # runtime off-switch if table serialization ever stalls the writer rank again.
+    if example_group and os.environ.get('MRL_DISABLE_EXAMPLE_TABLE', '0') != '1':
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
         # One row per ROLLOUT with a truncated detokenized trajectory. The previous
         # per-TURN rows each embedded the ENTIRE r.trajectory (all turns of raw token-id
-        # lists): O(turns^2 x context) objects through wandb's recursive _json_helper.
-        # On a 125-turn/131k-context SWE group the writer rank ground CPU for HOURS while
-        # every other rank waited in a barrier -- DCGM saw N-1 idle GPUs and the cluster
-        # reaper cancelled the job (bearval4/bearval16/f1, 2026-07-11..12; captured via
-        # faulthandler stacks: _json_helper <- Table.to_json <- maybe_log_training_metrics).
+        # lists): O(group x turns x context) objects through wandb's recursive
+        # _json_helper (~1.3e8 leaves on a long SWE group). The writer rank ground CPU
+        # while every other rank waited in a barrier -- DCGM saw N-1 idle GPUs and the
+        # cluster reaper cancelled the job (bearval4/bearval16, 2026-07-11..12; captured
+        # via faulthandler stacks: _json_helper <- Table.to_json <- maybe_log_training_metrics).
         def _traj_text(r):
-            text = '\n'.join(
-                (tokenizer.detokenize(t) if isinstance(r, TokenRollout) else t)
-                for t in r.trajectory
-            )
+            if isinstance(r, TokenRollout):
+                # Detokenize only the ends -- the middle is dropped by the char
+                # truncation below, and a full detokenize is ~1M tokens per env per
+                # iteration.
+                tokens = [t for turn in r.trajectory for t in turn]
+                if len(tokens) > 3072:
+                    text = (
+                        tokenizer.detokenize(tokens[:2048])
+                        + '\n...[truncated]...\n'
+                        + tokenizer.detokenize(tokens[-1024:])
+                    )
+                else:
+                    text = tokenizer.detokenize(tokens)
+            else:
+                text = '\n'.join(r.trajectory)
             if len(text) > 6000:
                 text = text[:4000] + '\n...[truncated]...\n' + text[-2000:]
             return text
@@ -1598,7 +1621,14 @@ def maybe_log_training_metrics(
         for k, v in env_metrics.items():
             metrics[f"{env_id}_{k}"] = v
 
+    # Time the writer-rank log call: every other rank is in a barrier while this
+    # runs, so a stall here reads as N-1 idle GPUs to the cluster reaper. Make it
+    # visible in test.log instead.
+    _t0 = time.perf_counter()
     wandb_writer.log(metrics, step=current_iteration)
+    _dt = time.perf_counter() - _t0
+    if _dt > 60:
+        logger.warning(f"wandb_writer.log took {_dt:.0f}s at iteration {current_iteration}")
 
 
 def prepare_trajectories(
