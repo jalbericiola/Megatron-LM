@@ -78,6 +78,7 @@ from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.inflight_tracker import inflight_snapshot, remove_inflight, reset_inflight
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
+from megatron.rl.rollout_capacity import OnlineCapacityController
 from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
@@ -683,6 +684,10 @@ def get_inference_interface(args, loop, model):
 
 _ROLLOUT_GENERATOR = None
 _ROLLOUT_AGENT = None
+_CAPACITY_CONTROLLER: OnlineCapacityController | None = None
+# Per-batch capacity metrics produced on rank 0 (see get_environment_rollouts);
+# broadcast to the wandb-writer rank and logged in maybe_log_training_metrics.
+_capacity_metrics: dict = {}
 
 
 async def _speculative_select_generator(base_generator, k, strategy):
@@ -703,7 +708,7 @@ async def _speculative_select_generator(base_generator, k, strategy):
 
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
-    global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT
+    global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT, _CAPACITY_CONTROLLER
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         # Fresh generator: clear the in-flight counter. Streaming generators persist
         # across iterations (and so does their in-flight count), so this only fires
@@ -750,6 +755,18 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             )
         else:
             _ROLLOUT_GENERATOR = base_gen
+        # Only multi-env runs have per-env capacity to control; single-agent
+        # runs skip the controller. In streaming mode this branch runs once
+        # (when _ROLLOUT_GENERATOR is None), so the controller persists its
+        # window/EMA state across iterations.
+        if isinstance(agent, WeightedMultiTask):
+            _CAPACITY_CONTROLLER = OnlineCapacityController(
+                agent=agent,
+                lag=args.rl_generation_lag,
+                diagnostics=getattr(args, 'rl_capacity_diagnostics', False),
+            )
+        else:
+            _CAPACITY_CONTROLLER = None
     return _ROLLOUT_GENERATOR
 
 
@@ -829,9 +846,15 @@ def get_environment_rollouts(
                         logging.INFO,
                         f"Collecting rollouts, Iteration {args.curr_iteration}...",
                     )
-                    rollouts = [
-                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
-                    ]
+                    # Feed each group to the capacity controller as it exits the
+                    # consumer, while later groups of the same batch are still
+                    # being generated (hides the bookkeeping behind GPU work).
+                    rollouts = []
+                    for _ in range(n_prompts):
+                        group = loop.run_until_complete(anext(rollout_generator))
+                        rollouts.append(group)
+                        if _CAPACITY_CONTROLLER is not None:
+                            _CAPACITY_CONTROLLER.update_group(group)
                     # These groups are now consumed into the training batch: they
                     # leave the in-flight set (decrement here, where consumption is final,
                     # so buffered groups awaiting their batch peers stay counted).
@@ -853,6 +876,12 @@ def get_environment_rollouts(
                                 assert False, "Unexpected group left in generator."
                             except StopAsyncIteration:
                                 break
+                    # Batch fully collected: finalize the controller and stash the
+                    # metrics for the wandb-writer rank (see maybe_log_training_metrics).
+                    global _capacity_metrics
+                    _capacity_metrics = {}
+                    if _CAPACITY_CONTROLLER is not None:
+                        _capacity_metrics = _CAPACITY_CONTROLLER.finalize_batch()
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
@@ -2203,6 +2232,18 @@ def maybe_log_training_metrics(
         dist.broadcast_object_list(payload, src=0)
         pipeline_metrics = payload[0]
 
+    # Capacity metrics are also produced on rank 0 (see get_environment_rollouts).
+    # Consume-and-clear the module global so reuse iterations don't re-log stale
+    # values, then broadcast to the writer rank. This is a collective, so it must
+    # run on every rank before the early return.
+    global _capacity_metrics
+    capacity_metrics = _capacity_metrics
+    _capacity_metrics = {}
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        cap_payload = [capacity_metrics]
+        dist.broadcast_object_list(cap_payload, src=0)
+        capacity_metrics = cap_payload[0]
+
     if not wandb_writer:
         return
 
@@ -2285,6 +2326,12 @@ def maybe_log_training_metrics(
     metrics.update(pipeline_metrics)
 
     wandb_writer.log(metrics, step=current_iteration)
+
+    # Capacity controller metrics (per-env length EMAs, pushed weights, and
+    # optional tail-factor diagnostics), broadcast from rank 0 above. Logged at
+    # the same step; empty on non-collection iterations and single-env runs.
+    if capacity_metrics:
+        wandb_writer.log(capacity_metrics, step=current_iteration)
 
 
 def prepare_trajectories(
@@ -3583,12 +3630,14 @@ def rl_inference_interface_shutdown():
     global _INFERENCE_INTERFACE
     global _ROLLOUT_GENERATOR
     global _ROLLOUT_AGENT
+    global _CAPACITY_CONTROLLER
 
     if _ROLLOUT_GENERATOR is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
         _ROLLOUT_GENERATOR = None
     _ROLLOUT_AGENT = None
+    _CAPACITY_CONTROLLER = None
 
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()

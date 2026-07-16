@@ -2391,6 +2391,9 @@ def _add_rl_args(parser):
                             'G consumes groups as they complete. '
                             'B consumes complete trainer batches in submission order. '
                             'R is not currently supported.')
+    group.add_argument('--rl-capacity-diagnostics', action='store_true',
+                       help='Compute and log per-level tail factors and mode predictions '
+                            'to wandb each step (adds CPU overhead; timed and reported).')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.
