@@ -460,18 +460,21 @@ class HybridStack(MegatronModule):
         # unavailable (torch < 2.5) or the layout couldn't build a BlockMask.
         # The global tree BlockMask is for the cp=1 full-sequence path. Under CP the attention runs
         # gather-KV + local-query tree flex (step 6b-2); not yet wired, so guard below.
+        # The fused flash-composed path requires fp16/bf16 (flash kernels); fp32 runs (e.g.
+        # equivalence tests) take the flex path exactly as before the fused port.
+        fused_ok = (
+            cp_size == 1
+            and _sp_fused_tree_enabled()
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        )
         block_mask = (
             build_tree_block_mask(prefix_len, completion_lens, hidden_states.device)
-            if HAVE_FLEX_ATTENTION and cp_size == 1 and not _sp_fused_tree_enabled()
+            if HAVE_FLEX_ATTENTION and cp_size == 1 and not fused_ok
             else None
         )
         # Fused flash-composed path (CP=1): thread the star layout instead of a flex BlockMask;
         # _run_core_attention dispatches on `_sp_star`. NRL_SP_FUSED_TREE=0 restores flex.
-        sp_star = (
-            (prefix_len, list(completion_lens))
-            if cp_size == 1 and _sp_fused_tree_enabled()
-            else None
-        )
+        sp_star = (prefix_len, list(completion_lens)) if fused_ok else None
         for layer in self.layers:
             if isinstance(layer, MambaLayer):
                 hidden_states = layer(
