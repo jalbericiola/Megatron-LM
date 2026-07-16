@@ -124,6 +124,7 @@ class MambaLayer(GraphableMegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        shared_prefix_context=None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -152,9 +153,47 @@ class MambaLayer(GraphableMegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
 
-        mixer_out_with_bias = self.mixer(
-            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
-        )
+        if shared_prefix_context is not None:
+            # Shared-prefix packed forward: hidden_states is the packed [P, C_1, ..., C_G]
+            # (normed). A mask cannot isolate completion branches in a sequential scan, so we fork
+            # INTERNALLY: scan the prefix once (capturing this layer's conv + SSM end-state), then
+            # scan each completion from that captured state, and reassemble the packed output.
+            # Equivalent (fwd + bwd) to the dense [P + C_i] mixer forward; the shared prefix gets
+            # the summed gradient of all completions (see MambaMixer.fork_segment).
+            ctx = shared_prefix_context
+            Lp = ctx.prefix_len
+            y_p, out_bias, conv_ctx, ssm_final = self.mixer.fork_segment(
+                hidden_states[:Lp], capture=True, real_len=ctx.real_prefix_len
+            )
+            lcs = ctx.completion_lens
+            if lcs:
+                # Fork the G completions from the prefix end-state in ONE batched conv+scan
+                # (fork_branches): each batch element gets the prefix (conv_ctx, ssm_final) as its
+                # own initial_states. This REQUIRES the batch dim + right-padding to the batch max
+                # -- a true varlen (zero-pad) fork is impossible here: causal_conv1d_fn /
+                # mamba_chunk_scan_combined reset state to ZERO at varlen boundaries and reject
+                # per-segment initial_states ("initial_states must be None if seq_idx is not None").
+                # (Length-bucketing the pad was measured negligible -- the fork is not the
+                # ragged-case bottleneck; the flex attention + MLP over the full packed T are.)
+                Lmax = max(lcs)
+                d_model = hidden_states.shape[-1]
+                branches = hidden_states.new_zeros(Lmax, len(lcs), d_model)
+                cursor = Lp
+                for i, lc in enumerate(lcs):
+                    branches[:lc, i, :] = hidden_states[cursor:cursor + lc, 0, :]
+                    cursor += lc
+                out_b, _ = self.mixer.fork_branches(branches, ssm_final, conv_ctx)  # (Lmax,G,d)
+                parts = [y_p] + [out_b[:lc, i:i + 1, :] for i, lc in enumerate(lcs)]
+            else:
+                parts = [y_p]
+            # out_bias is the (y-independent) out_proj bias -- identical for every segment.
+            mixer_out_with_bias = (torch.cat(parts, dim=0), out_bias)
+        else:
+            mixer_out_with_bias = self.mixer(
+                hidden_states,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
 
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mamba_bda(

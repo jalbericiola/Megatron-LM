@@ -640,6 +640,11 @@ def _eager_train_comm_warmup():
         f'[EagerCommWarmup] initialized NCCL communicators for: {warmed}',
     )
 
+@contextmanager
+def rollout_quant_disabled(model):
+    """Compatibility no-op expected by train_rl.py."""
+    yield
+
 
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
@@ -704,6 +709,8 @@ async def _speculative_select_generator(base_generator, k, strategy):
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT
+    from megatron.rl.dynamic_maxlen import configure_from_args
+    configure_from_args(args)
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         # Fresh generator: clear the in-flight counter. Streaming generators persist
         # across iterations (and so does their in-flight count), so this only fires
@@ -751,6 +758,117 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         else:
             _ROLLOUT_GENERATOR = base_gen
     return _ROLLOUT_GENERATOR
+
+
+def _longest_common_prefix_len(seqs: list) -> int:
+    """Number of leading tokens shared by ALL sequences in ``seqs`` (token-id lists)."""
+    if not seqs:
+        return 0
+    n = min(len(s) for s in seqs)
+    first = seqs[0]
+    for i in range(n):
+        tok = first[i]
+        for s in seqs[1:]:
+            if s[i] != tok:
+                return i
+    return n
+
+
+def _log_shared_prefix_metrics(rollouts: 'GroupedRollouts', iteration: int) -> None:
+    """OBSERVATIONAL shared-prefix speedup measurement (Phase A go/no-go), no behavior change.
+
+    From the INTACT grouped rollouts (must run before the group->flat expansion), compute each
+    group's longest-common-prefix (the genuinely shared tokens -- the GRPO prompt for single-turn,
+    the shared initial context for multi-turn) and the per-completion suffix lengths, then report
+    the shared-prefix planner's lengths-only metrics: prompt_fraction_f, dedup_fraction,
+    predicted_linear_speedup, coverage. The shared-prefix win is ~1/((1-f)+f/G); it is large only
+    when prompts are a big fraction of the sequence (agentic / multi-turn), ~0 for short-prompt /
+    long-CoT -- so we log overall AND per-env to see where the win lives.
+    """
+    from megatron.rl.shared_prefix_packing import plan_shared_prefix_bins
+
+    args = get_args()
+    max_per_bin = getattr(args, 'rl_sequence_packing_max_sequences_per_bin', 50)
+    groups, per_env = [], {}
+    for g in rollouts:
+        seqs = [
+            [t for turn in r.trajectory for t in turn]
+            for r in g
+            if isinstance(r, TokenRollout) and r.trajectory
+        ]
+        seqs = [s for s in seqs if s]
+        if len(seqs) < 2:
+            continue
+        lcp = _longest_common_prefix_len(seqs)
+        comp_lens = [len(s) - lcp for s in seqs]
+        if lcp >= 1 and all(c > 0 for c in comp_lens):
+            groups.append((lcp, comp_lens))
+            per_env.setdefault(g[0].env_id, []).append((lcp, comp_lens))
+    if not groups:
+        return
+
+    _, m = plan_shared_prefix_bins(groups, args.seq_length, max_per_bin)
+    print(
+        f"[shared-prefix-f] iter={iteration} groups={int(m['shared_prefix/num_groups'])} "
+        f"f={m['shared_prefix/prompt_fraction_f']:.3f} "
+        f"dedup={m['shared_prefix/dedup_fraction']:.3f} "
+        f"predicted_speedup={m['shared_prefix/predicted_linear_speedup']:.3f} "
+        f"coverage_groups={m['shared_prefix/coverage_groups']:.3f} "
+        f"avg_prefix={m['shared_prefix/avg_prefix_len']:.0f} "
+        f"avg_G={m['shared_prefix/avg_group_size']:.1f}",
+        flush=True,
+    )
+    for env, gs in sorted(per_env.items()):
+        _, me = plan_shared_prefix_bins(gs, args.seq_length, max_per_bin)
+        print(
+            f"[shared-prefix-f]   env={env} groups={int(me['shared_prefix/num_groups'])} "
+            f"f={me['shared_prefix/prompt_fraction_f']:.3f} "
+            f"predicted_speedup={me['shared_prefix/predicted_linear_speedup']:.3f} "
+            f"avg_prefix={me['shared_prefix/avg_prefix_len']:.0f}",
+            flush=True,
+        )
+    writer = get_tensorboard_writer()
+    wandb_writer = get_wandb_writer()
+    if writer:
+        for k, v in m.items():
+            writer.add_scalar(k, v, iteration)
+    if wandb_writer:
+        wandb_writer.log(m, step=iteration)
+
+
+def _update_dynamic_maxlen_from_rollouts(rollouts: Rollouts, ceiling: int, iteration: int) -> None:
+    from megatron.rl.dynamic_maxlen import get_instance as _get_dynamic_maxlen
+
+    dml = _get_dynamic_maxlen()
+    if dml is None:
+        return
+    for group in rollouts:
+        if not group:
+            continue
+        for rollout in group:
+            if not isinstance(rollout, TokenRollout) or not rollout.generation_mask:
+                continue
+            gen_len = sum(int(b) for turn in rollout.generation_mask for b in turn)
+            reward = rollout.reward
+            if isinstance(reward, list):
+                reward = sum(float(r) for r in reward) / max(1, len(reward))
+            dml.update(
+                rollout.env_id,
+                gen_len,
+                reward=float(reward) if reward is not None else None,
+                metadata=getattr(rollout, 'dynamic_maxlen', None),
+                ceiling=ceiling,
+            )
+    metrics = dml.metrics()
+    if metrics:
+        writer = get_tensorboard_writer()
+        if writer:
+            for key, value in metrics.items():
+                writer.add_scalar(key, value, iteration)
+        wandb_writer = get_wandb_writer()
+        if wandb_writer:
+            wandb_writer.log(metrics, step=iteration)
+    dml.save_state()
 
 
 def get_environment_rollouts(
@@ -841,6 +959,14 @@ def get_environment_rollouts(
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
+                    _update_dynamic_maxlen_from_rollouts(
+                        rollouts, args.inference_max_seq_length, args.curr_iteration
+                    )
+                    if getattr(args, "rl_shared_prefix_log_metrics", False):
+                        # observational: measure the shared-prefix speedup opportunity (f) on the
+                        # live workload here, where rollouts are still GROUPED (before the flatten
+                        # in prepare_data_for_update). No behavior change.
+                        _log_shared_prefix_metrics(rollouts, args.curr_iteration)
                     if not args.rl_partial_rollouts:
                         while True:
                             try:
@@ -1091,6 +1217,25 @@ def _thd_partitioned_indices(
     offset = torch.where(i < half, cp_rank, 2 * (cp_size - 1) - cp_rank)
     return cu[seq] + i + half * offset
 
+def _zigzag_slice(x: torch.Tensor, cp_size: int, cp_rank: int) -> torch.Tensor:
+    """Pick chunks ``cp_rank`` and ``2*cp_size - cp_rank - 1`` after viewing
+    the sequence dim as ``2*cp_size`` equal chunks, then concatenate.
+
+    Mirrors ``get_batch_on_this_cp_rank`` in ``megatron/core/utils.py`` — the
+    canonical Megatron-LM load-balanced (zigzag) CP layout that TE ring
+    attention, RoPE-CP, and Mamba-CP all assume.
+    """
+    seq_len = x.shape[1]
+    chunk_size = seq_len // (2 * cp_size)
+    # [B, S, ...] -> [B, 2*CP, S/(2*CP), ...]
+    x = x.view(x.shape[0], 2 * cp_size, chunk_size, *x.shape[2:])
+    index = torch.tensor(
+        [cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.int64, device=x.device
+    )
+    x = x.index_select(1, index)
+    # [B, 2, S/(2*CP), ...] -> [B, S/CP, ...]
+    return x.reshape(x.shape[0], -1, *x.shape[3:]).contiguous()
+
 
 def _scatter_for_context_parallel(
     tokens: torch.Tensor,
@@ -1260,7 +1405,7 @@ def _gather_logprobs_context_parallel(
     return torch.cat(gathered, dim=1).index_select(1, cp_gather_index)
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None, shared_prefix_layout=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -1353,7 +1498,66 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     _VP_BIK_WARNED = True
                 use_vp_logprobs = False
 
-            if cp_size > 1:
+            # Shared-prefix bin: build the SharedPrefixParams (tree mask + prefix-continued
+            # positions) and slice to the packed [P, C_1..C_G] length, so HybridModel.forward
+            # routes to the two-pass forward instead of the dense decoder.
+            spp = None
+            cp_sp_layout = None
+            cp_real_idx = None
+            if shared_prefix_layout is not None:
+                from megatron.core.models.hybrid.shared_prefix import (
+                    HAVE_FLEX_ATTENTION,
+                    SharedPrefixParams,
+                )
+                L = shared_prefix_layout
+                T = L.total_len
+                # forward_shared_prefix builds a sparse FlexAttention BlockMask from the layout, so
+                # the dense [1,1,T,T] tree mask is only needed for the (rare) no-FlexAttention
+                # fallback. Skip materializing it otherwise -- it is O(T^2) (~386MB @ T=20k,
+                # infeasible at 49k) and unused on the flex path.
+                tree_mask = None
+                if not HAVE_FLEX_ATTENTION:
+                    from megatron.rl.shared_prefix_packing import dense_tree_mask
+
+                    tree_mask = (~dense_tree_mask(L, device=tokens.device)).view(1, 1, T, T)
+                spp = SharedPrefixParams(
+                    prefix_len=L.prefix_len, completion_lens=list(L.completion_lens),
+                    attention_mask=tree_mask, position_ids=L.position_ids.to(tokens.device),
+                )
+
+            if cp_size > 1 and spp is not None:
+                # CP + shared-prefix (Phase D): end-pad each segment to a multiple of 2*cp and all
+                # completions to a COMMON length (uniform Mamba fork), scatter per-segment-zigzag to
+                # this rank's local [1, T_pad/cp], and forward (the model forks Mamba + gathers
+                # attention K/V internally; real lengths drive the fork capture + attention pad-mask;
+                # FULL prefix-continued position_ids drive RoPE, sliced internally).
+                from megatron.core.models.hybrid.shared_prefix import (
+                    CPSharedPrefixLayout,
+                    SharedPrefixParams,
+                )
+                from megatron.rl.shared_prefix_packing import cp_pad_shared_inputs
+
+                Lp_r, lcs_r = spp.prefix_len, list(spp.completion_lens)
+                pad_toks, pad_pos, Lp_p, Lc_p, cp_real_idx = cp_pad_shared_inputs(
+                    tokens[0, :spp.total_len], None, Lp_r, lcs_r, cp_size, tokens.device)
+                Gn = len(lcs_r)
+                spp_pad = SharedPrefixParams(
+                    prefix_len=Lp_p, completion_lens=[Lc_p] * Gn, position_ids=pad_pos[0],
+                    real_prefix_len=Lp_r, real_completion_lens=lcs_r)
+                cp_sp_layout = CPSharedPrefixLayout(
+                    Lp_p, [Lc_p] * Gn, cp_size, mpu.get_context_parallel_rank(), tokens.device,
+                    real_prefix_len=Lp_r, real_completion_lens=lcs_r)
+                lgp = cp_sp_layout.local_global_pos
+                with torch.no_grad() if no_grad else nullcontext():
+                    logits_or_hidden_states = model(
+                        pad_toks[:, lgp],
+                        pad_pos[:, lgp],
+                        attention_mask_for_forward,
+                        runtime_gather_output=True,
+                        fp32_output=fp32_output,
+                        shared_prefix_params=spp_pad,
+                    )
+            elif cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
                 (
                     local_tokens,
@@ -1370,6 +1574,18 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                         packed_seq_params=cp_packed_seq_params,
                         runtime_gather_output=not use_vp_logprobs,
                         fp32_output=fp32_output,
+                    )
+            elif spp is not None:
+                # shared-prefix two-pass forward over the packed [P, C_1..C_G] (sliced to T)
+                with torch.no_grad() if no_grad else nullcontext():
+                    logits_or_hidden_states = model(
+                        tokens[:, :spp.total_len],
+                        position_ids[:, :spp.total_len],
+                        attention_mask_for_forward,
+                        packed_seq_params=packed_seq_params,
+                        runtime_gather_output=True,
+                        fp32_output=fp32_output,
+                        shared_prefix_params=spp,
                     )
             else:
                 with torch.no_grad() if no_grad else nullcontext():
@@ -1393,7 +1609,32 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
         logits = logits_or_hidden_states
         tp_group = pg_collection.tp if use_vp_logprobs else None
         with nvtx_range("rl/log-softmax", time=True):
-            if cp_size > 1:
+            if spp is not None:
+                # Shared-prefix fan-out: each completion's first token is scored from the SHARED
+                # prefix's last logit (not the previous packed token, which belongs to another
+                # branch). extract_completion_logprobs handles the fan-out; scatter the result back
+                # into a [1, bin_size-1] tensor at comp_positions-1 so the loss/advantage/mask
+                # machinery (which expects the next-token-shifted layout) is unchanged.
+                from megatron.rl.shared_prefix_packing import extract_completion_logprobs
+                L = shared_prefix_layout
+                if cp_size > 1:
+                    # CP: all-gather the rank-local logits to the FULL global-order PADDED sequence
+                    # (un-zigzag per segment; differentiable), drop the pads back to the REAL packed
+                    # order (cp_real_idx), then the unchanged cp=1 fan-out on the REAL layout.
+                    # NOTE: gathers full [T_pad, vocab] -- fine at moderate seq length; the
+                    # memory-optimal scattered fan-out (broadcast only logits[Lp-1]) is a follow-up.
+                    full_logits = cp_sp_layout._gather(logits[0], mpu.get_context_parallel_group())
+                    real_logits = full_logits[cp_real_idx]       # [T_pad,vocab] -> [T_real,vocab]
+                    comp_lp = extract_completion_logprobs(real_logits, tokens[0, :L.total_len], L)
+                else:
+                    comp_lp = extract_completion_logprobs(
+                        logits[0, :L.total_len, :], tokens[0, :L.total_len], L
+                    )
+                logprobs = torch.zeros(
+                    (1, tokens.shape[1] - 1), dtype=comp_lp.dtype, device=comp_lp.device
+                )
+                logprobs[0, L.comp_positions - 1] = comp_lp
+            elif cp_size > 1:
                 # Compute local logprobs then gather the full sequence.
                 if use_vp_logprobs:
                     local_logprobs = vocab_parallel_selective_log_softmax(
@@ -2382,13 +2623,19 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
     # the forward pass from training after it has been captured on the 1st iteration.
     model.eval()
 
+    shared_prefix_layout = None
     if packing_context is not None:
         # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
         bin_tensor = next(data_iterator)[0]
+        bin_idx = bin_tensor.item()
         #TODO(jalbericiola): change for named tuple
         (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
-            load_packed_data_by_index(bin_tensor.item(), packing_context, is_correction)
+            load_packed_data_by_index(bin_idx, packing_context, is_correction)
         )
+        # shared-prefix bin -> route the forward to the two-pass + fan-out logprob extraction
+        layouts = getattr(packing_context, "shared_prefix_layouts", None)
+        if layouts and bin_idx < len(layouts):
+            shared_prefix_layout = layouts[bin_idx]
     else:
         b_trajs, b_posids = next(data_iterator)
         b_packed_seq_params = None
@@ -2401,6 +2648,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             no_grad=True,
             sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
+            shared_prefix_layout=shared_prefix_layout,
         ),
         None,
     )
@@ -2521,6 +2769,20 @@ def prepare_data_for_update(
         num_turns = [nt for g in group_stats.num_turns for nt in g]
         total_turns_sampled = len(rollouts)
 
+        # Phase A (shared-prefix packing): per-trajectory GLOBAL group id, aligned 1:1 with
+        # `advantages` (group_stats.advantages). The group structure is destroyed by the flatten
+        # above and the DP-split below, so capture it here from group_stats.num_turns and carry it
+        # through the SAME DP-slice / pad / all-gather as advantages -- it then stays aligned with
+        # the globally-gathered trajectories in pack_all_trajectories, which can reconstruct each
+        # GRPO group (completions sharing a prompt) to build shared-prefix bins.
+        group_ids = None
+        if getattr(args, "rl_sequence_packing_shared_prefix", False):
+            group_ids = torch.tensor(
+                [gi for gi, grp in enumerate(group_stats.num_turns)
+                 for nt in grp for _ in range(int(nt))],
+                dtype=torch.long, device='cuda',
+            )
+
         # We might sample more than we consume in one step.
         samples_ratio_per_step = args.global_batch_size / (args.grpo_prompts_per_step * args.grpo_group_size)
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
@@ -2535,6 +2797,8 @@ def prepare_data_for_update(
             local_num_turns = sum(num_turns[data_split_range[0] : data_split_range[1]])
             steps_before = sum(num_turns[:data_split_range[0]])
             advantages = advantages[steps_before:steps_before+local_num_turns]
+            if group_ids is not None:
+                group_ids = group_ids[steps_before:steps_before+local_num_turns]
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
@@ -2628,6 +2892,32 @@ def prepare_data_for_update(
             )
             global_advantages = torch.cat(gathered_adv, dim=0)
 
+        # DP availability sync for inference logprobs (sequence-packing path).
+        #
+        # pack_all_trajectories() all-gathers inference_logprobs across the DP group, but
+        # only on ranks where inference_logprobs is not None. Whether logprobs are present
+        # is decided per-rank from local rollouts (prepare_trajectories, ~line 1574), so in
+        # multi-env / mixed-engine setups one rank can hold None while another holds a tensor
+        # -> the collective all_gather runs on some ranks and not others -> NCCL deadlock.
+        # Make the decision collective: if ANY rank has logprobs, every rank materializes a
+        # zero [N, seq_length] tensor (matching _pad_nonnull_with_zeros' shape/dtype) so the
+        # gather is uniform. The zero rows belong to rollouts that returned no logprobs; they
+        # are only consumed for logging stats (is-correction is disabled for such rows via the
+        # generation/loss mask) so the zeros never enter the training IS weights.
+        if sequence_packing and mpu.get_data_parallel_world_size() > 1:
+            have_lp = torch.tensor(
+                [1 if inference_logprobs is not None else 0],
+                device='cuda', dtype=torch.long,
+            )
+            torch.distributed.all_reduce(
+                have_lp, op=torch.distributed.ReduceOp.MAX,
+                group=mpu.get_data_parallel_group(),
+            )
+            if have_lp.item() > 0 and inference_logprobs is None:
+                inference_logprobs = torch.zeros(
+                    (trajs.shape[0], args.seq_length), dtype=torch.float, device='cpu',
+                )
+
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
         if sequence_packing:
@@ -2640,7 +2930,8 @@ def prepare_data_for_update(
                     global_advantages,
                     args.seq_length,
                     args.rl_sequence_packing_max_sequences_per_bin,
-                    args.rl_sequence_packing_algo
+                    args.rl_sequence_packing_algo,
+                    group_ids=group_ids,
                     )
 
                 compute_trajs = packing_context.packed_trajs
@@ -2798,6 +3089,12 @@ def prepare_data_for_update(
                         packing_info=packing_context.packing_info,
                         generation_masks=packing_context.original_generation_masks,
                         bin_size=args.seq_length,
+                        old_logprobs=old_logprobs,
+                        trajs=packing_context.original_trajs,
+                        eod_token=tokenizer.eod,
+                        shared_prefix_layouts=getattr(
+                            packing_context, "shared_prefix_layouts", None
+                        ),
                     )
 
                     # Compute statistics for logging using packed data
@@ -3090,6 +3387,7 @@ def calculate_grpo_loss(
     is_truncation_coef: float | None = None,
     seq_starts: list | None = None,
     seq_lengths: list | None = None,
+    is_shared_prefix: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Get GRPO loss, the kl term of the loss and the pi/pi_{old} ratios.
 
@@ -3138,10 +3436,22 @@ def calculate_grpo_loss(
         )
 
         for seq_idx, (start, seq_len) in enumerate(zip(seq_starts, seq_lengths)):
-            # Logprobs are 1 token shorter than sequences
-            end = min(start + seq_len - 1, bin_size)
-            if end > start:
-                packed_advantages[0, start:end] = advantages[seq_idx].item()
+            if is_shared_prefix:
+                # Shared-prefix bin: a completion of length Lc occupies packed positions
+                # [start : start+Lc] (start == its branch start), and its fan-out logprobs were
+                # scattered at comp_positions-1 == [start-1 : start-1+Lc]. So its advantage must
+                # land at the SAME indices (one LEFT of the block-diagonal convention, and the
+                # FULL Lc tokens -- the branch's first token is scored from the shared prefix logit
+                # and is a trained token too).
+                s = max(0, start - 1)
+                end = min(start - 1 + seq_len, bin_size)
+            else:
+                # Block-diagonal bin (established, correct convention): advantage index j <-> token
+                # j+1; logprobs are 1 token shorter than sequences.
+                s = start
+                end = min(start + seq_len - 1, bin_size)
+            if end > s:
+                packed_advantages[0, s:end] = advantages[seq_idx].item()
 
         advantages = packed_advantages
     else:

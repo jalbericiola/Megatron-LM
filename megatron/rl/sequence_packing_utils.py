@@ -67,6 +67,10 @@ class PackingContext:
     original_inference_logprobs: Optional[torch.Tensor] = None
     bin_advantages: List[torch.Tensor] = field(default_factory=list)
     cached_packed_seq_params: List[Optional[PackedSeqParams]] = field(default_factory=list)
+    # shared-prefix: per local bin, the SharedPrefixLayout if it is a shared [P, C_1..C_G] bin,
+    # else None (a normal block-diagonal bin). Indexed in lockstep with packed_trajs / bin_seq_indices
+    # (kept in sync through distribute_packed_bins). Drives the forward routing + logprob fan-out.
+    shared_prefix_layouts: List[Optional[object]] = field(default_factory=list)
 
 
 def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext, logprobs_is_correction: bool):
@@ -532,6 +536,10 @@ def pack_inference_logprobs(
     packing_info: PackingInfo,
     generation_masks: torch.Tensor,
     bin_size: int,
+    old_logprobs: Optional[torch.Tensor] = None,
+    trajs: Optional[torch.Tensor] = None,
+    eod_token: Optional[int] = None,
+    shared_prefix_layouts: Optional[List[Any]] = None,
 ) -> torch.Tensor:
     """Pack inference logprobs into bins aligned with packed sequences.
 
@@ -540,16 +548,36 @@ def pack_inference_logprobs(
         packing_info: PackingInfo object containing bin assignments and sequence positions
         generation_masks: Tensor indicating which tokens were generated
         bin_size: Size of each bin
+        old_logprobs: Packed policy logprobs [num_bins, bin_size - 1]. When provided, the
+            output is initialized from it so positions we do not overwrite (the train-side
+            EOD, prompt tokens, padding) keep the policy logprob -> IS weight == 1 there,
+            mirroring align_unpacked_inference_logprobs. Falls back to zeros if omitted.
+        trajs: Packed-source (global) token ids [num_seqs, seq_len], used only to detect
+            whether a trajectory ended in a generated EOD (which inference does not score).
+        eod_token: EOD token id, paired with ``trajs`` for the EOD detection above.
+        shared_prefix_layouts: per-local-bin SharedPrefixLayout (or None for block-diagonal bins).
+            For a shared-prefix bin the branch carries ONLY the completion (the prompt P is shared
+            and stored once), so the inference logprobs must land at the fan-out positions
+            comp_positions-1 == the contiguous run [seq_start-1 .. seq_start+Lc-2] -- the SAME slots
+            the training fan-out (extract_completion_logprobs) writes, so the IS ratio aligns.
+            None -> every bin is block-diagonal (legacy behavior).
 
     Returns:
         Packed inference logprobs tensor of shape [num_bins, bin_size - 1]
     """
     num_bins = len(packing_info.bin_seq_indices)
 
-    # Create packed inference logprobs tensor (logprobs are 1 token shorter than sequences)
-    packed_inference_logprobs = torch.zeros(
-        (num_bins, bin_size - 1), dtype=torch.float32, device='cpu'
-    )
+    # Initialize from old_logprobs so untouched positions (EOD / prompt / pad) keep the
+    # policy logprob and therefore yield IS weight exp(old - old) == 1, matching the
+    # unpacked aligner. Only fall back to zeros when old_logprobs is missing/mis-shaped.
+    if old_logprobs is not None and tuple(old_logprobs.shape) == (num_bins, bin_size - 1):
+        packed_inference_logprobs = (
+            old_logprobs.detach().to(dtype=torch.float32, device='cpu').clone()
+        )
+    else:
+        packed_inference_logprobs = torch.zeros(
+            (num_bins, bin_size - 1), dtype=torch.float32, device='cpu'
+        )
 
     # Create mapping from global sequence index to local bin index
     # This is needed because seq_to_bin_idx uses global bin indices,
@@ -575,6 +603,13 @@ def pack_inference_logprobs(
         gen_mask = generation_masks[seq_idx]
         # Find first generation token (accounting for the shift in get_logprobs)
         first_gen_idx = gen_mask.int().argmax().item() - 1
+        if first_gen_idx < 0:
+            # All-False generation mask (a retained turn that generated nothing) or
+            # generation starting at token 0. Nothing to align; leave at old_logprobs
+            # (mirrors align_unpacked_inference_logprobs' `if first_gen_idx < 0: continue`).
+            # Also avoids a negative pack_start writing into the previous trajectory /
+            # producing an empty destination slice (a hard RuntimeError).
+            continue
 
         # Get the inference logprobs for this sequence
         if isinstance(inference_logprobs[seq_idx], torch.Tensor):
@@ -582,11 +617,37 @@ def pack_inference_logprobs(
         else:
             continue  # Skip if no inference logprobs
 
-        # Calculate where to place inference logprobs in the packed tensor
-        # The inference logprobs start at the first generated token position
-        pack_start = seq_start + first_gen_idx
+        # Number of inference logprobs the engine actually scored: one per generated token,
+        # minus the train-side-appended EOD that inference does not return (mirrors the raw
+        # len used by align_unpacked_inference_logprobs). seq_inf_logprobs is zero-padded to
+        # seq_length, so bounding the write to this count (instead of the full trajectory
+        # span) avoids reading the zero tail and overwriting the EOD / post-generation
+        # positions with a spurious 0.0 -> exp(old - 0) IS weight.
+        gen_count = int(gen_mask.int().sum().item())
+        has_eod = (
+            eod_token is not None
+            and trajs is not None
+            and bool(((trajs[seq_idx].long() * gen_mask.long()) == eod_token).any().item())
+        )
+        raw_len = gen_count - (1 if has_eod else 0)
+        if raw_len <= 0:
+            continue
+
+        # Calculate where to place inference logprobs in the packed tensor.
+        # Block-diagonal bin: the branch is [prompt, completion]; generation starts at
+        # first_gen_idx within it. Shared-prefix bin: the branch is ONLY the completion (P is
+        # shared and stored once), so the logprobs land contiguously at the fan-out positions
+        # comp_positions-1 == [seq_start-1 .. seq_start+Lc-2] -- the SAME slots the training
+        # fan-out writes, so the IS ratio aligns. (first_gen_idx assumes an in-branch prompt and
+        # would over-shoot for a shared bin.)
+        is_shared_bin = (
+            shared_prefix_layouts is not None
+            and local_bin_idx < len(shared_prefix_layouts)
+            and shared_prefix_layouts[local_bin_idx] is not None
+        )
+        pack_start = (seq_start - 1) if is_shared_bin else (seq_start + first_gen_idx)
         pack_end = min(
-            pack_start + len(seq_inf_logprobs), seq_start + packing_info.seq_lengths[seq_idx] - 1
+            pack_start + raw_len, seq_start + packing_info.seq_lengths[seq_idx] - 1
         )
         actual_len = pack_end - pack_start
 
@@ -825,8 +886,13 @@ def distribute_packed_bins(
     packed_position_ids: torch.Tensor,
     packed_loss_mask: torch.Tensor,
     packing_info: PackingInfo,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
-    """Distribute packed bins across the data parallel ranks."""
+    shared_prefix_layouts: Optional[List[Optional[object]]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo, List[Optional[object]]]:
+    """Distribute packed bins across the data parallel ranks.
+
+    ``shared_prefix_layouts`` (per global bin: a SharedPrefixLayout or None) is reordered in
+    lockstep with the bins and padded with None for the empty bins, so the returned list stays
+    aligned with the per-rank packed_trajs (indexed by local bin index)."""
     rank = mpu.get_data_parallel_rank()
     world_size = mpu.get_data_parallel_world_size()
     tokenizer = get_tokenizer()
@@ -865,6 +931,7 @@ def distribute_packed_bins(
     my_packed_loss_mask = []
     my_bin_seq_indices = []
     my_seq_starts = {}
+    my_shared_prefix_layouts = []
 
 
     # Build the local data from the global indices
@@ -874,6 +941,9 @@ def distribute_packed_bins(
         my_packed_loss_mask.append(packed_loss_mask[old_idx])
         my_bin_seq_indices.append(packing_info.bin_seq_indices[old_idx])
         my_seq_starts[new_idx] = packing_info.seq_starts[old_idx]
+        my_shared_prefix_layouts.append(
+            shared_prefix_layouts[old_idx] if shared_prefix_layouts is not None else None
+        )
 
     # Stack the selected bins
     packed_trajs = (
@@ -975,11 +1045,13 @@ def distribute_packed_bins(
             bin_idx = current_bins + i
             new_packing_info.bin_seq_indices.append(entry['bin_seq_indices'])
             new_packing_info.seq_starts[bin_idx] = entry['seq_starts']
+            my_shared_prefix_layouts.append(None)   # empty padding bins are never shared-prefix
 
-    return packed_trajs, packed_position_ids, packed_loss_mask, new_packing_info
+    return (packed_trajs, packed_position_ids, packed_loss_mask, new_packing_info,
+            my_shared_prefix_layouts)
 
 
-def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
+def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo, group_ids=None):
     tokenizer = get_tokenizer()
     data_parallel_world_size = mpu.get_data_parallel_world_size()
     data_parallel_group = mpu.get_data_parallel_group()
@@ -996,6 +1068,8 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         generation_masks = _gather(generation_masks)
         if inference_logprobs is not None:
             inference_logprobs = _gather(inference_logprobs)
+        if group_ids is not None:
+            group_ids = _gather(group_ids)        # global group id per globally-gathered trajectory
 
     with nvtx_range("rl/pack-sequences", time=True):
         # Create packer with max sequences per bin limit to prevent extreme imbalance.
@@ -1010,26 +1084,46 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             seq_length_multiple=2 * cp_size if cp_size > 1 else 1,
         )
 
-        # Pack sequences with generation masks
-        (
-            packed_trajs,
-            packed_position_ids,
-            packed_loss_mask,
-            packing_info,
-        ) = packer.pack_sequences(trajs, generation_masks)
-        packing_info.packing_algo = packing_algo
+        shared_prefix = (
+            group_ids is not None
+            and getattr(get_args(), "rl_sequence_packing_shared_prefix", False)
+        )
+        if shared_prefix:
+            # Shared-prefix packing: reconstruct GRPO groups on the globally-gathered trajectories
+            # and pack each shared prompt ONCE ([P, C_subset] bins); leftover trajectories pack
+            # block-diagonally. The merged PackingInfo + per-bin layouts drive the two-pass forward
+            # (HybridModel.forward(shared_prefix_params=...)) + the logprob fan-out.
+            from megatron.rl.shared_prefix_packing import build_shared_prefix_bins
+            sp_bins, sp_blockdiag = build_shared_prefix_bins(
+                trajs, generation_masks, group_ids, bin_size, max_sequences_per_bin,
+                pad_token=tokenizer.pad,
+            )
+            (packed_trajs, packed_position_ids, packed_loss_mask, packing_info,
+             shared_prefix_layouts) = merge_shared_and_blockdiag_bins(
+                sp_bins, sp_blockdiag, trajs, generation_masks, packer, packing_algo,
+            )
+            n_shared_comp = sum(len(b.completion_lens) for b in sp_bins)
+            log_single_rank(
+                logger, logging.INFO,
+                f"[shared-prefix-pack] {len(sp_bins)} shared bins ({n_shared_comp} completions), "
+                f"{len(sp_blockdiag)} block-diagonal trajs",
+            )
+        else:
+            # Pack sequences with generation masks (block-diagonal only)
+            (packed_trajs, packed_position_ids, packed_loss_mask, packing_info) = (
+                packer.pack_sequences(trajs, generation_masks)
+            )
+            packing_info.packing_algo = packing_algo
+            shared_prefix_layouts = None
 
-        # Distribute packed bins across the data parallel ranks
-        (
+        # Distribute packed bins across the data parallel ranks (layouts reordered in lockstep)
+        (packed_trajs, packed_position_ids, packed_loss_mask, packing_info,
+         shared_prefix_layouts) = distribute_packed_bins(
             packed_trajs,
             packed_position_ids,
             packed_loss_mask,
             packing_info,
-        ) = distribute_packed_bins(
-            packed_trajs,
-            packed_position_ids,
-            packed_loss_mask,
-            packing_info,
+            shared_prefix_layouts=shared_prefix_layouts,
         )
 
     # Create bin_advantages list
@@ -1069,11 +1163,79 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         original_inference_logprobs=inference_logprobs,
         bin_advantages=bin_advantages,
         cached_packed_seq_params=cached_packed_seq_params,
+        shared_prefix_layouts=shared_prefix_layouts if shared_prefix_layouts is not None else [],
     )
 
     log_packing_efficiency(packing_context)
 
     return packing_context
+
+def merge_shared_and_blockdiag_bins(sp_bins, blockdiag_indices, trajs, generation_masks,
+                                    packer, packing_algo):
+    """Merge shared-prefix bins with block-diagonally-packed leftover trajectories into one set of
+    packed tensors + a global PackingInfo + a per-bin shared_prefix_layouts list.
+
+    The leftover (block-diagonal) trajectories are packed by the existing SequencePacker; the
+    shared bins (already complete [bin_size] sequences from build_shared_prefix_bins) are appended.
+    All bin_seq_indices are remapped to GLOBAL trajectory indices. For a block-diagonal bin a
+    sequence's (start, length) is the packer's; for a shared bin each completion's start is its
+    branch start in [P, C_1..C_G] and its length is the completion length -- which is exactly what
+    the GRPO advantage scatter consumes (loss_mask already zeroes the shared prefix).
+
+    Returns (packed_trajs, packed_position_ids, packed_loss_mask, packing_info, layouts), with
+    layouts[i] the SharedPrefixLayout for shared bin i or None for a block-diagonal bin.
+    """
+    N = trajs.shape[0]
+    device = trajs.device
+    bd_info = bd_packed = bd_pos = bd_loss = None
+    if blockdiag_indices:
+        bd_idx = torch.tensor(blockdiag_indices, device=device, dtype=torch.long)
+        bd_packed, bd_pos, bd_loss, bd_info = packer.pack_sequences(
+            trajs[bd_idx], generation_masks[bd_idx]
+        )
+
+    # global per-trajectory length: block-diagonal -> full [P+C] length (packer); shared -> the
+    # COMPLETION length (the prefix is shared and loss-masked, scored separately via the layout).
+    seq_lengths = [0] * N
+    if bd_info is not None:
+        for sub_j, L in enumerate(bd_info.seq_lengths):
+            seq_lengths[blockdiag_indices[sub_j]] = int(L)
+    for b in sp_bins:
+        for ti, lc in zip(b.traj_indices, b.completion_lens):
+            seq_lengths[int(ti)] = int(lc)
+
+    bin_seq_indices, seq_starts, layouts = [], {}, []
+    packed_list, pos_list, loss_list = [], [], []
+    if bd_info is not None:
+        for bi in range(len(bd_info.bin_seq_indices)):
+            bin_seq_indices.append([blockdiag_indices[j] for j in bd_info.bin_seq_indices[bi]])
+            seq_starts[len(bin_seq_indices) - 1] = list(bd_info.seq_starts[bi])
+            layouts.append(None)
+            packed_list.append(bd_packed[bi])
+            pos_list.append(bd_pos[bi])
+            loss_list.append(bd_loss[bi])
+    for b in sp_bins:
+        bi = len(bin_seq_indices)
+        bin_seq_indices.append([int(t) for t in b.traj_indices])
+        seq_starts[bi] = list(b.layout.branch_starts)
+        layouts.append(b.layout)
+        packed_list.append(b.tokens)
+        pos_list.append(b.position_ids.to(bd_pos.dtype) if bd_pos is not None else b.position_ids)
+        loss_list.append(b.loss_mask.to(bd_loss.dtype) if bd_loss is not None else b.loss_mask)
+
+    packed_trajs = torch.stack(packed_list)
+    packed_position_ids = torch.stack(pos_list)
+    packed_loss_mask = torch.stack(loss_list)
+    seq_to_bin_idx = [None] * N
+    for bi, idxs in enumerate(bin_seq_indices):
+        for ti in idxs:
+            seq_to_bin_idx[ti] = bi
+    info = PackingInfo(
+        bin_seq_indices=bin_seq_indices, seq_starts=seq_starts, seq_lengths=seq_lengths,
+        seq_to_bin_idx=seq_to_bin_idx, packing_algo=packing_algo,
+    )
+    return packed_trajs, packed_position_ids, packed_loss_mask, info, layouts
+
 
 def update_microbatch_calculator(
     samples_ratio_per_step: float,

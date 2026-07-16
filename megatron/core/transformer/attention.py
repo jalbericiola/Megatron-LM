@@ -1234,7 +1234,13 @@ class Attention(MegatronModule, ABC):
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
-                            cp_group=self.pg_collection.cp,
+                            # shared-prefix CP path: rotary_pos_emb is already pre-sliced to this
+                            # rank's per-segment-zigzag tokens, so skip the standard single-sequence
+                            # CP zigzag slice (which assumes one global zigzag, not per-segment).
+                            cp_group=(
+                                None if getattr(self, "_sp_cp_ctx", None) is not None
+                                else self.pg_collection.cp
+                            ),
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1247,7 +1253,10 @@ class Attention(MegatronModule, ABC):
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
                         mscale=_yarn_get_concentration_factor_from_config(self.config),
-                        cp_group=self.pg_collection.cp,
+                        cp_group=(
+                            None if getattr(self, "_sp_cp_ctx", None) is not None
+                            else self.pg_collection.cp
+                        ),
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
@@ -1265,7 +1274,42 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
-        if self.checkpoint_core_attention and self.training:
+        sp_cp_ctx = getattr(self, "_sp_cp_ctx", None)
+        sp_block_mask = getattr(self, "_sp_block_mask", None)
+        sp_star = getattr(self, "_sp_star", None)
+        if sp_cp_ctx is not None:
+            # Shared-prefix under CONTEXT PARALLELISM: query/key/value are this rank's local
+            # per-segment-zigzag shard (post-RoPE). All-gather the (GQA-cheap) K/V to the full
+            # global-order sequence, then run the validated tree mask over (local queries x full
+            # K/V). The gather is differentiable, so the K/V gradient reduce-scatters back.
+            from megatron.core.models.hybrid.shared_prefix import local_tree_attention
+
+            layout, cp_group = sp_cp_ctx
+            key_full, value_full = layout.gather_kv(key, value, cp_group)
+            core_attn_out = local_tree_attention(query, key_full, value_full, layout.local_block_mask())
+        elif sp_star is not None:
+            # Shared-prefix (CP=1) via the fused flash-composed kernel: 2 flash calls + Triton
+            # LSE merge with the EXACT backward, instead of FlexAttention. ~1.5x training step
+            # on star groups at GB200 (see shared_prefix_fused module docstring); flex remains
+            # the fallback (NRL_SP_FUSED_TREE=0 or missing flash/triton).
+            from megatron.core.models.hybrid.shared_prefix_fused import (
+                flash_composed_forest_attention,
+            )
+
+            core_attn_out = flash_composed_forest_attention(
+                query, key, value, [(0, sp_star[0], sp_star[1])]
+            )
+        elif sp_block_mask is not None:
+            # Shared-prefix ("tree") packing (CP=1): run the tree-masked attention via FlexAttention
+            # (sparse BlockMask skips the fully-masked sibling-branch blocks) instead of the
+            # configured core_attention, which would need the dense O(T^2) mask -- measured ~2x
+            # slower than not sharing at all, vs flex's ~5x speedup. Intercept here so BOTH the
+            # checkpointed and non-checkpointed dispatch below are covered. Returns [sq, b, h*hn],
+            # matching the static core_attention output shape.
+            from megatron.core.models.hybrid.shared_prefix import flex_tree_attention
+
+            core_attn_out = flex_tree_attention(query, key, value, sp_block_mask)
+        elif self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,

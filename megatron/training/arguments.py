@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import warnings
 import types
 
 import torch
@@ -543,6 +544,27 @@ def validate_args(args, defaults={}):
                 "syncs vary across bins, so a captured whole-iteration graph would "
                 "replay bin-0 metadata for every bin."
             )
+            if not args.calculate_per_token_loss:
+                warnings.warn(
+                    "Sequence packing without --calculate-per-token-loss: loss is normalized "
+                    "per bin (and averaged over padded empty bins), which reweights "
+                    "trajectories by packing density (shared-prefix lineage treats this as "
+                    "a hard error; under audit for the flagship packed path).")
+        if getattr(args, 'rl_sequence_packing_shared_prefix', False):
+            assert args.rl_use_sequence_packing, \
+                "--rl-sequence-packing-shared-prefix requires --rl-use-sequence-packing."
+            # The two-pass forward (MambaMixer.fork_segment + tree-mask attention) is wired into
+            # HybridModel.forward and get_logprobs, validated CP=1 AND CP>1 (Phase D: the Mamba fork
+            # routes through pre/post_conv_ssm and attention gathers K/V + local-query tree flex on
+            # the segment-local-zigzag transport; forward+backward bit-exact vs CP=1). The CP>1
+            # logprob path all-gathers the local logits (approach a; memory-optimal scattered fan-out
+            # is a follow-up), so it is best for high-prompt-fraction envs at moderate seq length.
+            if getattr(args, 'rl_inference_logprobs_is_correction', False):
+                warnings.warn(
+                    "--rl-sequence-packing-shared-prefix with IS-correction: inference logprobs "
+                    "for shared bins are not yet re-aligned to the fan-out layout; IS weights on "
+                    "shared bins may be slightly off until that lands. Policy/old/ref logprobs ARE "
+                    "fan-out-correct.")
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '
@@ -2443,6 +2465,64 @@ def _add_rl_args(parser):
                             'persist: leave KV cache in GPU memory (default), '
                             'offload: offload KV cache to CPU during training, '
                             'recompute: deallocate KV cache and recompute from scratch each cycle')
+    group.add_argument('--rl-dynamic-maxlen-alpha', type=float, default=None,
+                       help='Enable per-environment dynamic generation max length.')
+    group.add_argument('--rl-dynamic-maxlen-alpha-min', type=float, default=None,
+                       help='Lower asymptote for length-dependent alpha.')
+    group.add_argument('--rl-dynamic-maxlen-alpha-scale', type=float, default=4096.0,
+                       help='Length scale for alpha decay.')
+    group.add_argument('--rl-dynamic-maxlen-ema-decay', type=float, default=0.9,
+                       help='EMA decay for length/reward estimates.')
+    group.add_argument('--rl-dynamic-maxlen-warmup-frac', type=float, default=0.5,
+                       help='Warmup cap fraction of inference max sequence length.')
+    group.add_argument('--rl-dynamic-maxlen-controller', type=str, default='length',
+                       choices=['length', 'bandit', 'reward'],
+                       help='Dynamic max-len controller. "reward": generate UNCAPPED during a '
+                            'per-env warmup, then set the cap to the length that captures the '
+                            'reward (a percentile of the reward-weighted length distribution) '
+                            'rather than the global max.')
+    group.add_argument('--rl-dynamic-maxlen-reward-warmup-samples', type=int, default=512,
+                       help='reward controller: per-env rollouts observed UNCAPPED before a cap '
+                            'is established.')
+    group.add_argument('--rl-dynamic-maxlen-reward-percentile', type=float, default=0.9,
+                       help='reward controller: fraction of reward MASS the cap must retain '
+                            '(cap = smallest length below which this much reward was earned).')
+    group.add_argument('--rl-dynamic-maxlen-reward-cap-margin', type=float, default=1.1,
+                       help='reward controller: safety multiplier applied to the reward-percentile '
+                            'length before capping.')
+    group.add_argument('--rl-dynamic-maxlen-reward-min-cap', type=int, default=256,
+                       help='reward controller: never cap below this many tokens.')
+    group.add_argument('--rl-dynamic-maxlen-reward-window', type=int, default=4096,
+                       help='reward controller: per-env sliding window of (length, reward) '
+                            'observations used to (re)estimate the cap.')
+    group.add_argument('--rl-dynamic-maxlen-reward-refresh-frac', type=float, default=0.05,
+                       help='reward controller: probability of generating UNCAPPED post-warmup, to '
+                            'keep observing the true (uncensored) length tail as the policy drifts.')
+    group.add_argument('--rl-dynamic-maxlen-reward-protect-delta', type=float, default=0.03,
+                       help='reward controller protection guard: if an env\'s UNCAPPED-phase reward '
+                            'exceeds its CAPPED-phase reward by more than this, the cap is '
+                            'suppressing reward (e.g. multi-turn envs whose responses get '
+                            'truncated) -> revert that env to ~uncapped. Prevents the reward-mass '
+                            'percentile from getting stuck in a low-reward local optimum.')
+    group.add_argument('--rl-dynamic-maxlen-reward-protect-min-samples', type=int, default=32,
+                       help='reward controller protection guard: min capped AND uncapped rollout '
+                            'samples per env before the guard can trip.')
+    group.add_argument('--rl-dynamic-maxlen-reward-protect-percentile', type=float, default=0.99,
+                       help='reward controller protection guard: when it fires, cap at THIS '
+                            'percentile of the env\'s true uncapped completion lengths instead of '
+                            'going fully uncapped -- trims the runaway-long tail while preserving '
+                            'the reward-bearing bulk (1.0 == fully uncapped).')
+    group.add_argument('--rl-dynamic-maxlen-bandit-arms', type=str,
+                       default='0.75,1.0,1.25,1.5,2.0,3.0',
+                       help='Comma-separated cap multiplier arms for bandit controller.')
+    group.add_argument('--rl-dynamic-maxlen-bandit-token-cost', type=float, default=0.0,
+                       help='Bandit token cost in reward - cost * generated_tokens / ceiling.')
+    group.add_argument('--rl-dynamic-maxlen-bandit-exploration', type=float, default=0.25,
+                       help='Bandit Gaussian exploration scale.')
+    group.add_argument('--rl-dynamic-maxlen-bandit-min-samples-per-arm', type=int, default=1,
+                       help='Round-robin samples per arm before exploitation.')
+    group.add_argument('--rl-dynamic-maxlen-state-path', type=str, default=None,
+                       help='Optional JSON path for dynamic max-len controller state.')
     group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Persist CUDA graphs when the inference engine is suspended. '
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
@@ -2471,6 +2551,25 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--rl-sequence-packing-shared-prefix', action=argparse.BooleanOptionalAction,
+                       type=bool, default=False,
+                       help='[EXPERIMENTAL, Milestone 1 / not yet wired into the training forward] '
+                            'Share the common GRPO prompt (and, generally, common prefixes) once per '
+                            'group instead of duplicating it per completion (see '
+                            'docs/sequence_packing_prefix_sharing.md). The packing-layout helpers '
+                            '(megatron/rl/shared_prefix_packing.py) and the numerical oracle '
+                            '(mrl_extras/test/test_shared_prefix_equivalence.py) exist; the '
+                            'shared-prefix attention forward is NOT yet integrated, so enabling this '
+                            'flag currently raises until that oracle passes on GPU (Milestone 1b).')
+    group.add_argument('--rl-shared-prefix-log-metrics', action=argparse.BooleanOptionalAction,
+                       type=bool, default=False,
+                       help='OBSERVATIONAL ONLY (no behavior change): each update step, compute the '
+                            'per-group longest-common-prefix and log the shared-prefix planner '
+                            'metrics (prompt_fraction_f, dedup_fraction, predicted_linear_speedup, '
+                            'coverage). Measures the shared-prefix speedup OPPORTUNITY on the live '
+                            'workload (go/no-go for the feature) without packing or routing the '
+                            'forward. Safe to combine with any config; not gated by the '
+                            '--rl-sequence-packing-shared-prefix NotImplementedError.')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
                        help='If set, do not toggle CUDA graphs on/off between inference and training phases.')

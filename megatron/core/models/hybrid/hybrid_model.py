@@ -13,6 +13,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid.shared_prefix import SharedPrefixParams
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -423,6 +424,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
+        shared_prefix_params: Optional[SharedPrefixParams] = None,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -485,6 +487,24 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
             )
 
+        # Shared-prefix ("tree") packing: standard RoPE indexes the rotary table by packed
+        # position, but each completion C_i must continue from the prefix's positions (P->0..Lp-1,
+        # C_i->Lp..). Gather the table at the prefix-continued position_ids so RoPE is correct for
+        # the packed [P, C_1, ..., C_G] sequence (validated by test_shared_prefix_real_model.py).
+        if (
+            shared_prefix_params is not None
+            and shared_prefix_params.position_ids is not None
+            and rotary_pos_emb is not None
+        ):
+            if self.position_embedding_type != 'rope':
+                raise NotImplementedError(
+                    "shared-prefix position-aware RoPE is only wired for position_embedding_type"
+                    " == 'rope'"
+                )
+            pos = shared_prefix_params.position_ids
+            emb = self.rotary_pos_emb.get_emb(int(pos.max().item()) + 1)
+            rotary_pos_emb = emb.index_select(0, pos.to(emb.device))
+
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
         # reference held by this caller function, enabling early garbage collection
         # for inference.
@@ -502,14 +522,32 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
         # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-        )
+        if shared_prefix_params is not None:
+            # Shared-prefix two-pass: one forward over packed [P, C_1, ..., C_G] -- scan the prompt
+            # once, fork the G completions (Mamba state + tree-mask attention). Equivalent to the
+            # dense per-completion forward but without recomputing the shared prompt G times.
+            hidden_states = self.decoder.forward_shared_prefix(
+                decoder_input,
+                shared_prefix_params.prefix_len,
+                shared_prefix_params.completion_lens,
+                attention_mask=(
+                    shared_prefix_params.attention_mask
+                    if shared_prefix_params.attention_mask is not None
+                    else attention_mask
+                ),
+                rotary_pos_emb=rotary_pos_emb,
+                real_prefix_len=shared_prefix_params.real_prefix_len,
+                real_completion_lens=shared_prefix_params.real_completion_lens,
+            )
+        else:
+            hidden_states = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+            )
 
         output_weight = None
         if self.share_embeddings_and_output_weights:

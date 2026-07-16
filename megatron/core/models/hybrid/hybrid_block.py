@@ -21,7 +21,14 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.shared_prefix import (
+    HAVE_FLEX_ATTENTION,
+    CPSharedPrefixLayout,
+    SharedPrefixContext,
+    build_tree_block_mask,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
@@ -361,6 +368,178 @@ class HybridStack(MegatronModule):
 
         return hidden_states
 
+    def forward_shared_prefix(
+        self,
+        hidden_states: Tensor,
+        prefix_len: int,
+        completion_lens,
+        attention_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        real_prefix_len: Optional[int] = None,
+        real_completion_lens=None,
+    ):
+        """Shared-prefix ("tree") packed forward for a GRPO group.
+
+        Runs a SINGLE forward over the packed sequence ``[P, C_1, ..., C_G]`` (the shared prompt P
+        stored once). Equivalent (fwd + bwd) to running the stack on the G duplicated ``[P + C_i]``
+        sequences, but without re-computing P for every completion. The shared prompt receives the
+        summed gradient of all its completions (autograd, via the per-layer state/KV that fans out
+        to every branch).
+
+        Layer handling:
+          * MambaLayer: forks internally -- scans P once, then each C_i from P's captured conv +
+            SSM end-state, reassembling the packed output (a mask cannot isolate branches in a
+            sequential scan).
+          * Attention TransformerLayer: runs normally on the packed sequence with the TREE mask
+            (each token attends causally to the prefix + its own branch) and position-aware RoPE
+            (``rotary_pos_emb`` built from the layout's prefix-continued positions). Mask + RoPE
+            express the sharing; no attention-module surgery.
+          * MLP / MoE TransformerLayer (IdentityOp self-attention): stateless, runs normally.
+          * GatedDeltaNet / other recurrence: not yet wired (own state fork needed).
+
+        Args:
+            hidden_states: (total_len, 1, D) packed embedded ``[P, C_1, ..., C_G]``.
+            prefix_len: Lp (length of the shared prefix P).
+            completion_lens: list of per-completion lengths [Lc_1, ..., Lc_G].
+            attention_mask: the tree mask (Megatron convention, True == masked), e.g.
+                ``shared_prefix_packing.build_packed_group``'s ``attn_mask``.
+            rotary_pos_emb: position-aware RoPE built from the layout's ``position_ids``.
+
+        Returns:
+            (total_len, 1, D) packed output (post final-norm); slice per the layout to recover each
+            completion's hidden states / logits.
+        """
+        from megatron.core import parallel_state as _ps
+
+        cp_size = _ps.get_context_parallel_world_size()
+        if cp_size > 1:
+            # Context-parallel (Phase D): the packed sequence is sharded per-segment via the
+            # load-balanced zigzag (each segment independently), so hidden_states is the rank-local
+            # [T/cp]. MambaLayer slices the LOCAL segment shards and fork_segment/fork_branches
+            # all_to_all them to head-parallel full-segment internally (pre/post_conv_ssm); hence the
+            # ctx carries LOCAL segment lengths. Each segment must be a multiple of 2*cp (the zigzag).
+            assert prefix_len % (2 * cp_size) == 0 and all(
+                c % (2 * cp_size) == 0 for c in completion_lens
+            ), f"shared-prefix CP={cp_size}: each segment must be a multiple of 2*cp_size"
+            # real_prefix_len is in FULL (post-pre_conv_ssm) coords -- default to the full padded
+            # prefix_len (NOT the local prefix_len//cp), so fork_segment scans the whole real prefix.
+            ctx = SharedPrefixContext(
+                prefix_len // cp_size, [c // cp_size for c in completion_lens],
+                real_prefix_len=(real_prefix_len if real_prefix_len is not None else prefix_len))
+            cp_group = _ps.get_context_parallel_group()
+            cp_layout = CPSharedPrefixLayout(
+                prefix_len, completion_lens, cp_size, _ps.get_context_parallel_rank(),
+                hidden_states.device, real_prefix_len=real_prefix_len,
+                real_completion_lens=real_completion_lens,
+            )
+            # rotary_pos_emb arrives FULL [T, ...] (built from the global prefix-continued
+            # position_ids); slice it to this rank's local tokens so attention applies the right
+            # per-token RoPE with no further CP slicing.
+            rotary_local = (
+                rotary_pos_emb.index_select(0, cp_layout.local_global_pos)
+                if rotary_pos_emb is not None else None
+            )
+        else:
+            ctx = SharedPrefixContext(prefix_len, completion_lens, real_prefix_len=real_prefix_len)
+            cp_layout = cp_group = rotary_local = None
+        # Under TP sequence-parallel the residual stream BETWEEN layers is sharded along the sequence
+        # dim across the TP group (each layer's in_proj/QKV all-gathers it back to ctx.total_len for
+        # the Mamba fork + tree attention, then out_proj reduce-scatters it; the output layer gathers
+        # it before the vocab projection). So the entry hidden_states here is ctx.total_len // tp_sp.
+        # The fork/attention/output therefore see the FULL ctx.total_len sequence -- identical to the
+        # TP=1 path -- and need no SP-specific handling beyond this length bookkeeping.
+        sp = bool(getattr(self.config, "sequence_parallel", False))
+        tp_sp = _ps.get_tensor_model_parallel_world_size() if sp else 1
+        assert hidden_states.shape[0] * tp_sp == ctx.total_len, (
+            f"packed length {hidden_states.shape[0]} * tp_sp {tp_sp} != Lp+sum(Lc) {ctx.total_len} "
+            f"(cp={cp_size}, sequence_parallel={sp})"
+        )
+        # Prefer FlexAttention for the tree mask: a sparse BlockMask that skips the fully-masked
+        # sibling-branch blocks (~5x faster than the un-shared baseline, ~11x faster than the dense
+        # [T,T]-mask SDPA path). Fall back to the dense `attention_mask` only if FlexAttention is
+        # unavailable (torch < 2.5) or the layout couldn't build a BlockMask.
+        # The global tree BlockMask is for the cp=1 full-sequence path. Under CP the attention runs
+        # gather-KV + local-query tree flex (step 6b-2); not yet wired, so guard below.
+        block_mask = (
+            build_tree_block_mask(prefix_len, completion_lens, hidden_states.device)
+            if HAVE_FLEX_ATTENTION and cp_size == 1 and not _sp_fused_tree_enabled()
+            else None
+        )
+        # Fused flash-composed path (CP=1): thread the star layout instead of a flex BlockMask;
+        # _run_core_attention dispatches on `_sp_star`. NRL_SP_FUSED_TREE=0 restores flex.
+        sp_star = (
+            (prefix_len, list(completion_lens))
+            if cp_size == 1 and _sp_fused_tree_enabled()
+            else None
+        )
+        for layer in self.layers:
+            if isinstance(layer, MambaLayer):
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    shared_prefix_context=ctx,
+                )
+            elif isinstance(layer, TransformerLayer):
+                if isinstance(layer.self_attention, IdentityOp):
+                    # MLP / MoE (stateless) -- runs per-token, CP-agnostic on the local [T/cp]
+                    hidden_states = layer(
+                        hidden_states=hidden_states, attention_mask=attention_mask
+                    )
+                elif cp_size > 1:
+                    # Real attention under CP: gather-KV + local-query tree flex. The local q/k get
+                    # per-token RoPE from rotary_local (no further CP slice); the hook gathers K/V.
+                    layer.self_attention._sp_cp_ctx = (cp_layout, cp_group)
+                    try:
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=None,
+                            rotary_pos_emb=rotary_local,
+                        )
+                    finally:
+                        layer.self_attention._sp_cp_ctx = None
+                elif sp_star is not None:
+                    layer.self_attention._sp_star = sp_star
+                    try:
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=None,
+                            rotary_pos_emb=rotary_pos_emb,
+                        )
+                    finally:
+                        layer.self_attention._sp_star = None
+                elif block_mask is not None:
+                    # real attention via FlexAttention tree BlockMask (+ position-aware RoPE). The
+                    # dense mask is not materialized; _run_core_attention reads `_sp_block_mask`.
+                    layer.self_attention._sp_block_mask = block_mask
+                    try:
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=None,
+                            rotary_pos_emb=rotary_pos_emb,
+                        )
+                    finally:
+                        layer.self_attention._sp_block_mask = None
+                else:
+                    # dense fallback: tree mask + position-aware RoPE express the prefix sharing
+                    hidden_states = layer(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                    )
+            else:
+                # GatedDeltaNet (and any other stateful recurrence) needs its own state fork.
+                raise NotImplementedError(
+                    f"shared-prefix not wired for layer type {type(layer).__name__}"
+                )
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+
+        if self.post_process and self.post_layer_norm:
+            hidden_states = self.final_norm(hidden_states)
+        return make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
     def sharded_state_dict(
         self,
         prefix: str = '',
@@ -423,3 +602,10 @@ class HybridStack(MegatronModule):
 # Backward-compatible aliases
 MambaStackSubmodules = HybridStackSubmodules
 MambaStack = HybridStack
+
+
+def _sp_fused_tree_enabled() -> bool:
+    """Gate for the fused flash-composed shared-prefix attention (vs FlexAttention)."""
+    import os
+
+    return os.environ.get("NRL_SP_FUSED_TREE", "1") not in ("0", "", "false", "False")

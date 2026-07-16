@@ -83,6 +83,14 @@ _MAMBA_SPLIT_HAS_STATE_DTYPE = (
     mamba_split_conv1d_scan_combined is not None
     and "state_dtype" in inspect.signature(mamba_split_conv1d_scan_combined).parameters
 )
+# mamba_chunk_scan_combined gained state_dtype support independently of the split kernel above
+# (some installed mamba_ssm builds have it on the split path but not the chunk path). The static
+# (non-mem-eff) training-fallback scan and fork_segment both call mamba_chunk_scan_combined, so
+# they must gate state_dtype on this function's own signature -- not _MAMBA_SPLIT_HAS_STATE_DTYPE.
+_MAMBA_CHUNK_SCAN_HAS_STATE_DTYPE = (
+    mamba_chunk_scan_combined is not None
+    and "state_dtype" in inspect.signature(mamba_chunk_scan_combined).parameters
+)
 
 try:
     from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
@@ -1099,6 +1107,211 @@ class MambaMixer(MegatronModule):
             y = self.norm(y, z)
 
         return y
+
+    def fork_segment(
+        self,
+        hidden_states: torch.Tensor,
+        conv_ctx: Optional[torch.Tensor] = None,
+        ssm_init: Optional[torch.Tensor] = None,
+        capture: bool = False,
+        real_len: Optional[int] = None,
+    ):
+        """Shared-prefix ("tree") two-pass SSM segment: scan one segment of a sequence with the
+        conv + SSM state forked from a prefix, and (optionally) capture this segment's end-states.
+
+        This is the production, gradient-preserving primitive for shared-prefix GRPO packing: a
+        prompt P shared by a group of G completions is scanned ONCE (capture=True) and each
+        completion C_i is then scanned from P's captured (conv_ctx, ssm_final) -- equivalent
+        (fwd + bwd) to the standard forward on the duplicated ``[P + C_i]`` but without re-scanning
+        P for every completion.
+
+        Mirrors the static (non-dynamic-batching) branch of ``_ssm_prefill``: in_proj -> split
+        z/xBC/dt -> causal_conv1d_fn (silu) -> split x/B/C -> mamba_chunk_scan_combined (with
+        ``initial_states`` / ``return_final_states``) -> gated RMSNorm -> out_proj. Conv state is
+        threaded by prepending P's last ``d_conv-1`` conv-input columns; SSM state via the kernel's
+        differentiable ``initial_states``. Both are kept in the autograd graph so the branch's
+        gradient flows back into P.
+
+        Validated equivalent to the dense forward (fwd exact in fp32, weight-grad cos 0.9999) by
+        mrl_extras/test/test_mamba_mixer_fork.py and test_hybrid_stack_mamba_fork.py.
+
+        Args:
+            hidden_states: (L, 1, d_model) one segment (prefix P, or one completion C_i).
+            conv_ctx: (b, conv_dim, d_conv-1) prefix conv-input columns to prepend (branch pass),
+                or None (prefix pass / no fork).
+            ssm_init: (b, nheads, headdim, d_state) forked SSM initial state, or None.
+            capture: if True, also return this segment's (conv_ctx_out, ssm_final) end-states.
+
+        Returns:
+            (out, out_bias, conv_ctx_out, ssm_final). ``out``/``out_bias`` are the out_proj results
+            (out_bias is the y-independent bias, consumed by MambaLayer's mamba_bda);
+            ``conv_ctx_out``/``ssm_final`` are None unless ``capture``.
+
+        Context parallelism (cp_size>1): mirrors the production prefill exactly -- in_proj ->
+        ``cp.pre_conv_ssm`` (all_to_all the sequence-sharded ``[L/cp,1,pd]`` to head-sharded full
+        ``[L,1,pd//cp]``) -> conv/scan on the rank's HEAD slice (so the WHOLE segment is local per
+        rank, no cross-rank scan) -> gated RMSNorm AFTER ``cp.post_conv_ssm`` (back to ``[L/cp]``)
+        -> out_proj. The captured ``(conv_ctx_out, ssm_final)`` are head-local and forked head-local
+        by ``fork_branches``; the fork is independent per head so cp2hp makes it correct with no
+        state relay. Identity at cp_size==1 (pre/post_conv_ssm are no-ops, ``*_local_tpcp == *_local_tp``).
+        Uses cp-local dims throughout (also corrects the previous TP>1 dims, which used global).
+        """
+        assert self.rmsnorm, "fork_segment requires rmsnorm (gated-norm applied after the scan)"
+        cp = self.cp
+        # cp-local (TP- and CP-sharded) dims, matching _ssm_prefill (L849-936). d_state/headdim/
+        # d_conv are not CP-sharded.
+        ng, ds, nh, hd, dconv = (
+            cp.ngroups_local_tpcp, self.d_state, cp.nheads_local_tpcp, self.headdim, self.d_conv)
+        d_inner = cp.d_inner_local_tpcp
+
+        zxBCdt, _ = self.in_proj(hidden_states)                       # (L/cp,1,pd_tp)
+        zxBCdt = cp.pre_conv_ssm(zxBCdt)                              # (L,1,pd_tpcp) head-sharded
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+        A = -torch.exp(cp.get_A_log().float())
+        z, xBC, dt = torch.split(zxBCdt, [d_inner, d_inner + 2 * ng * ds, nh], dim=-1)
+
+        # --- conv (silu) with prefix-context prepended (== causal_conv1d initial_states) ---
+        xBC = rearrange(xBC, "b l d -> b d l").contiguous()           # (b, conv_dim, l)
+        # real_len: when the segment is end-padded to a multiple of 2*cp (Phase D, arbitrary
+        # prefix lengths), the scan output is causal so real positions are unaffected by trailing
+        # pads -- but the CAPTURED conv_ctx/ssm_final must be taken at the REAL last token, not the
+        # padded end (the SSM state would otherwise evolve over the pad tokens). So capture at
+        # real_len and scan only [:real_len].
+        L_full = xBC.shape[-1]
+        rl = L_full if real_len is None else int(real_len)
+        # NOT detached: the branch's conv sees P's last conv-input columns, so gradient must flow
+        # back through them to P -- exactly as the SSM initial_states path does.
+        conv_ctx_out = xBC[:, :, rl - (dconv - 1):rl].clone() if capture else None
+        w = rearrange(cp.get_conv1d_weight(), "d 1 w -> d w")
+        b = cp.get_conv1d_bias()
+        if conv_ctx is not None:
+            xin = torch.cat([conv_ctx.to(xBC.dtype), xBC], dim=-1)
+            conv = causal_conv1d_fn(xin, w, b, activation=self.activation)[:, :, conv_ctx.shape[-1]:]
+        else:
+            conv = causal_conv1d_fn(xBC, w, b, activation=self.activation)
+        xBC = rearrange(conv, "b d l -> b l d").contiguous()
+
+        x, B, C = torch.split(xBC, [d_inner, ng * ds, ng * ds], dim=-1)
+        x = rearrange(x, "b l (h p) -> b l h p", p=hd).contiguous()
+        B = rearrange(B, "b l (g n) -> b l g n", n=ds).contiguous()
+        C = rearrange(C, "b l (g n) -> b l g n", n=ds).contiguous()
+        z4 = rearrange(z, "b l (h p) -> b l h p", p=hd).contiguous()
+
+        # Scan only the REAL tokens [:rl] -- causal, so real-position outputs equal the full-scan's,
+        # and the captured ssm_final is at the real last token (not the padded end). The pad
+        # positions' output is zero-filled (discarded downstream by the completion-only loss mask).
+        scan = mamba_chunk_scan_combined(
+            x[:, :rl].contiguous(), dt[:, :rl].contiguous(), A, B[:, :rl].contiguous(),
+            C[:, :rl].contiguous(), self.chunk_size,
+            D=(rearrange(cp.get_D().float(), "(h p) -> h p", p=hd) if self.D_has_hdim
+               else cp.get_D()),
+            z=None, dt_bias=cp.get_dt_bias().float(), dt_softplus=True,
+            initial_states=ssm_init, return_final_states=capture,
+            **({} if self.mamba_training_ssm_states_dtype is None
+               or not _MAMBA_CHUNK_SCAN_HAS_STATE_DTYPE
+               else {"state_dtype": self.mamba_training_ssm_states_dtype}),
+        )
+        if capture:
+            y, ssm_final = scan
+        else:
+            y, ssm_final = scan, None
+        if rl < L_full:                                              # restore padded length (zeros)
+            y_full = y.new_zeros(y.shape[0], L_full, *y.shape[2:])
+            y_full[:, :rl] = y
+            y = y_full
+
+        # gated RMSNorm AFTER post_conv_ssm (on the seq-sharded full-feature tensor), exactly as
+        # _ssm_prefill L1081-1087, so the norm's group_size sees the full d_inner_local_tp.
+        y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+        y = cp.post_conv_ssm(y)
+        zr = rearrange(z4, "b l h p -> l b (h p)").contiguous()
+        zr = cp.post_conv_ssm(zr)
+        y = self.norm(y, zr)                                          # gated RMSNorm
+        out, out_bias = self.out_proj(y)
+        return out, out_bias, conv_ctx_out, ssm_final
+
+    def fork_branches(
+        self,
+        branches: torch.Tensor,
+        ssm_init: torch.Tensor,
+        conv_ctx: torch.Tensor,
+    ):
+        """BATCHED shared-prefix fork: scan all G completions of a group in ONE pass, each forked
+        from the prefix's captured ``(conv_ctx, ssm_init)``.
+
+        Equivalent (fwd + bwd) to calling ``fork_segment`` G times -- a Mamba scan is independent
+        across the batch dimension, so stacking the G completions into a batch (right-padded to the
+        longest) and broadcasting the single prefix end-state as every branch's ``initial_states``
+        gives bit-identical per-branch outputs, but amortizes kernel/launch overhead (1 conv + 1
+        scan over the batch instead of G small ones -- the per-completion sequential loop was the
+        shared-prefix forward's bottleneck). Right-padding is safe: the scan/conv are causal so pad
+        tokens (placed after the real ones, and zero-valued) never affect a real token's output, and
+        completion segments do not capture an end-state.
+
+        Args:
+            branches: ``(Lmax, G, d_model)`` the G completions, sequence-first, right-padded with
+                zeros to the longest completion length.
+            ssm_init: ``(1, nheads, headdim, d_state)`` the prefix's captured SSM end-state.
+            conv_ctx: ``(1, conv_dim, d_conv-1)`` the prefix's last conv-input columns.
+
+        Returns:
+            ``(out, out_bias)`` with ``out`` ``(Lmax, G, d_model)`` -- the caller slices each
+            branch to its true length and reassembles into the packed completion region.
+
+        Context parallelism (cp_size>1): identical routing to ``fork_segment`` -- the G completions
+        are the batch dim ``b`` through ``cp.pre_conv_ssm``/``post_conv_ssm`` (the cp2hp all_to_all
+        is rectangular-batch-safe), so each rank scans the FULL ``Lmax`` over its head slice and
+        forks from the head-local ``(conv_ctx, ssm_init)`` captured by ``fork_segment``. Input/output
+        are sequence-sharded along ``Lmax`` (``[Lmax/cp, G, d_model]``); ``Lmax`` must be a multiple
+        of ``2*cp``. Identity at cp_size==1.
+        """
+        assert self.rmsnorm, "fork_branches requires rmsnorm (gated-norm applied after the scan)"
+        cp = self.cp
+        ng, ds, nh, hd = cp.ngroups_local_tpcp, self.d_state, cp.nheads_local_tpcp, self.headdim
+        d_inner = cp.d_inner_local_tpcp
+        Lmax, G, _ = branches.shape                                   # Lmax is LOCAL (Lmax_global/cp)
+
+        zxBCdt, _ = self.in_proj(branches)                            # (Lmax/cp, G, pd_tp)
+        zxBCdt = cp.pre_conv_ssm(zxBCdt)                              # (Lmax, G, pd_tpcp) head-sharded
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()     # (G, Lmax, pd_tpcp)
+        A = -torch.exp(cp.get_A_log().float())
+        z, xBC, dt = torch.split(zxBCdt, [d_inner, d_inner + 2 * ng * ds, nh], dim=-1)
+
+        # conv (silu) with the prefix conv-context prepended to EVERY branch (broadcast over G);
+        # NOT detached -- gradient flows back through it to P, as the SSM initial_states path does.
+        xBC = rearrange(xBC, "b l d -> b d l").contiguous()           # (G, conv_dim, Lmax)
+        w = rearrange(cp.get_conv1d_weight(), "d 1 w -> d w")
+        b = cp.get_conv1d_bias()
+        cc = conv_ctx.to(xBC.dtype).expand(G, -1, -1)                 # (G, conv_dim, d_conv-1)
+        xin = torch.cat([cc, xBC], dim=-1)
+        conv = causal_conv1d_fn(xin, w, b, activation=self.activation)[:, :, cc.shape[-1]:]
+        xBC = rearrange(conv, "b d l -> b l d").contiguous()
+
+        x, B, C = torch.split(xBC, [d_inner, ng * ds, ng * ds], dim=-1)
+        x = rearrange(x, "b l (h p) -> b l h p", p=hd).contiguous()
+        B = rearrange(B, "b l (g n) -> b l g n", n=ds).contiguous()
+        C = rearrange(C, "b l (g n) -> b l g n", n=ds).contiguous()
+        z4 = rearrange(z, "b l (h p) -> b l h p", p=hd).contiguous()
+        ssm_b = ssm_init.expand(G, *ssm_init.shape[1:]).contiguous()  # (G, nh, hd, ds)
+
+        y = mamba_chunk_scan_combined(
+            x, dt.contiguous(), A, B, C, self.chunk_size,
+            D=(rearrange(cp.get_D().float(), "(h p) -> h p", p=hd) if self.D_has_hdim
+               else cp.get_D()),
+            z=None, dt_bias=cp.get_dt_bias().float(), dt_softplus=True,
+            initial_states=ssm_b, return_final_states=False,
+            **({} if self.mamba_training_ssm_states_dtype is None
+               or not _MAMBA_CHUNK_SCAN_HAS_STATE_DTYPE
+               else {"state_dtype": self.mamba_training_ssm_states_dtype}),
+        )
+        # gated RMSNorm AFTER post_conv_ssm (seq-sharded full-feature), mirroring _ssm_prefill.
+        y = rearrange(y, "b l h p -> l b (h p)").contiguous()         # (Lmax, G, d_inner_tpcp)
+        y = cp.post_conv_ssm(y)                                       # (Lmax/cp, G, d_inner_tp)
+        zr = rearrange(z4, "b l h p -> l b (h p)").contiguous()
+        zr = cp.post_conv_ssm(zr)
+        y = self.norm(y, zr)                                          # gated RMSNorm
+        out, out_bias = self.out_proj(y)                              # (Lmax/cp, G, d_model)
+        return out, out_bias
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
         """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
