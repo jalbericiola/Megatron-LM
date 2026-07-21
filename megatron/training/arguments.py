@@ -2553,14 +2553,12 @@ def _add_rl_args(parser):
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
     group.add_argument('--rl-sequence-packing-shared-prefix', action=argparse.BooleanOptionalAction,
                        type=bool, default=False,
-                       help='[EXPERIMENTAL, Milestone 1 / not yet wired into the training forward] '
-                            'Share the common GRPO prompt (and, generally, common prefixes) once per '
-                            'group instead of duplicating it per completion (see '
-                            'docs/sequence_packing_prefix_sharing.md). The packing-layout helpers '
-                            '(megatron/rl/shared_prefix_packing.py) and the numerical oracle '
-                            '(mrl_extras/test/test_shared_prefix_equivalence.py) exist; the '
-                            'shared-prefix attention forward is NOT yet integrated, so enabling this '
-                            'flag currently raises until that oracle passes on GPU (Milestone 1b).')
+                       help='[EXPERIMENTAL] Share the common GRPO prompt (and, generally, common '
+                            'prefixes) once per group instead of duplicating it per completion (see '
+                            'docs/sequence_packing_prefix_sharing.md). Requires '
+                            '--rl-use-sequence-packing. The two-pass shared-prefix forward '
+                            '(Mamba fork + tree attention) is wired into HybridModel.forward and '
+                            'get_logprobs, validated for CP=1 and CP>1 (mrl_extras suite).')
     group.add_argument('--rl-shared-prefix-log-metrics', action=argparse.BooleanOptionalAction,
                        type=bool, default=False,
                        help='OBSERVATIONAL ONLY (no behavior change): each update step, compute the '
@@ -2568,8 +2566,7 @@ def _add_rl_args(parser):
                             'metrics (prompt_fraction_f, dedup_fraction, predicted_linear_speedup, '
                             'coverage). Measures the shared-prefix speedup OPPORTUNITY on the live '
                             'workload (go/no-go for the feature) without packing or routing the '
-                            'forward. Safe to combine with any config; not gated by the '
-                            '--rl-sequence-packing-shared-prefix NotImplementedError.')
+                            'forward. Safe to combine with any config.')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
                        help='If set, do not toggle CUDA graphs on/off between inference and training phases.')

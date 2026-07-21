@@ -2851,6 +2851,16 @@ def prepare_data_for_update(
                     pad_n, dtype=advantages.dtype, device=advantages.device,
                 )
                 advantages = torch.cat([advantages, pad_adv])
+                # Shared-prefix group ids travel through the same DP all_gather as
+                # trajs (pack_all_trajectories requires equal per-rank lengths).
+                # -1 is the documented padding sentinel: build_shared_prefix_bins
+                # routes gid < 0 rows to the block-diagonal path before bucketing.
+                if group_ids is not None:
+                    pad_gid = torch.full(
+                        (pad_n,), -1,
+                        dtype=group_ids.dtype, device=group_ids.device,
+                    )
+                    group_ids = torch.cat([group_ids, pad_gid])
                 # inference_logprobs is None, OR a list of per-traj tensors (no-packing path),
                 # OR a [N, S] padded tensor (sequence-packing path — `_pad_nonnull_with_zeros`
                 # at ~prepare_trajectories line 1376 returns a 2D tensor).
