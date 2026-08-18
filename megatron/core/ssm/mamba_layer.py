@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Protocol, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -21,16 +21,10 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormInterface
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
-
-
-class LayerNormBuilder(Protocol):
-    """A protocol showing how MambaLayer expects to construct its LayerNorm."""
-
-    def __call__(self, config: TransformerConfig, hidden_size: int, /) -> LayerNormInterface: ...
 
 
 @dataclass
@@ -81,6 +75,7 @@ class MambaLayer(GraphableMegatronModule):
         """
         super().__init__(config)
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
+        self.tp_group = pg_collection.tp
 
         self.config = config
         self.submodules_config = submodules
@@ -95,7 +90,11 @@ class MambaLayer(GraphableMegatronModule):
             pp_layer_offset=pp_layer_offset,
             name=(name + f".mixer") if name is not None else None,
         )
-        self.norm = submodules.norm(self.config, self.config.hidden_size)
+        self.norm = submodules.norm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
@@ -162,8 +161,30 @@ class MambaLayer(GraphableMegatronModule):
             # the summed gradient of all completions (see MambaMixer.fork_segment).
             ctx = shared_prefix_context
             Lp = ctx.prefix_len
+            # With TP sequence parallelism, hidden_states is a shard of the complete packed stream;
+            # ctx lengths are CP-local but not TP-local. Splitting that shard at ctx boundaries can
+            # therefore cut through arbitrary segments. Run in_proj once first: its sequence-
+            # parallel all-gather restores the complete CP-local packed stream. Fork the projected
+            # segments, concatenate their pre-out_proj features, then run out_proj once so its
+            # reduce-scatter recreates the original packed-stream layout for the residual add.
+            tp_sequence_parallel = (
+                bool(getattr(self.config, "sequence_parallel", False))
+                and self.mixer.pg_collection.tp.size() > 1
+            )
+            if tp_sequence_parallel:
+                segment_states, _ = self.mixer.in_proj(hidden_states)
+            else:
+                segment_states = hidden_states
+            assert segment_states.shape[0] == ctx.total_len, (
+                f"shared-prefix segment stream has length {segment_states.shape[0]}, "
+                f"expected {ctx.total_len} after TP sequence gather"
+            )
             y_p, out_bias, conv_ctx, ssm_final = self.mixer.fork_segment(
-                hidden_states[:Lp], capture=True, real_len=ctx.real_prefix_len
+                segment_states[:Lp],
+                capture=True,
+                real_len=ctx.real_prefix_len,
+                input_is_projected=tp_sequence_parallel,
+                project_output=not tp_sequence_parallel,
             )
             lcs = ctx.completion_lens
             if lcs:
@@ -176,18 +197,28 @@ class MambaLayer(GraphableMegatronModule):
                 # (Length-bucketing the pad was measured negligible -- the fork is not the
                 # ragged-case bottleneck; the flex attention + MLP over the full packed T are.)
                 Lmax = max(lcs)
-                d_model = hidden_states.shape[-1]
-                branches = hidden_states.new_zeros(Lmax, len(lcs), d_model)
+                feature_dim = segment_states.shape[-1]
+                branches = segment_states.new_zeros(Lmax, len(lcs), feature_dim)
                 cursor = Lp
                 for i, lc in enumerate(lcs):
-                    branches[:lc, i, :] = hidden_states[cursor:cursor + lc, 0, :]
+                    branches[:lc, i, :] = segment_states[cursor:cursor + lc, 0, :]
                     cursor += lc
-                out_b, _ = self.mixer.fork_branches(branches, ssm_final, conv_ctx)  # (Lmax,G,d)
+                out_b, _ = self.mixer.fork_branches(
+                    branches,
+                    ssm_final,
+                    conv_ctx,
+                    input_is_projected=tp_sequence_parallel,
+                    project_output=not tp_sequence_parallel,
+                )  # (Lmax,G,d)
                 parts = [y_p] + [out_b[:lc, i:i + 1, :] for i, lc in enumerate(lcs)]
             else:
                 parts = [y_p]
-            # out_bias is the (y-independent) out_proj bias -- identical for every segment.
-            mixer_out_with_bias = (torch.cat(parts, dim=0), out_bias)
+            packed_mixer_output = torch.cat(parts, dim=0)
+            if tp_sequence_parallel:
+                mixer_out_with_bias = self.mixer.out_proj(packed_mixer_output)
+            else:
+                # out_bias is the (y-independent) out_proj bias -- identical for every segment.
+                mixer_out_with_bias = (packed_mixer_output, out_bias)
         else:
             mixer_out_with_bias = self.mixer(
                 hidden_states,

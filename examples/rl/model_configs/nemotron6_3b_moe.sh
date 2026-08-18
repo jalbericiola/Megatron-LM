@@ -58,6 +58,7 @@ MODEL_OPTIONS="\
   --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
+  --rl-partial-rollouts \
   --inference-dynamic-batching-max-tokens 8192 \
   --inference-dynamic-batching-max-requests 128 \
   --inference-dynamic-batching-num-cuda-graphs 2 \
@@ -84,7 +85,7 @@ MODEL_OPTIONS="\
   --inference-max-seq-length $MAX_SEQ_LENGTH \
   --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
-  --distributed-timeout-minutes 240 \
+  --distributed-timeout-minutes 60 \
   --use-mcore-models \
   --no-mmap-bin-files \
   --disable-bias-linear \
@@ -113,7 +114,6 @@ MODEL_OPTIONS="\
   --min-lr 3e-6 \
   --lr-decay-style constant \
   --lr-warmup-samples 640 \
-  --lr-warmup-init 0.3e-7 "
-
-  # --moe-pad-experts-for-cuda-graph-inference \
-# 
+  --lr-warmup-init 0.3e-7 \
+  --no-load-optim \
+  --no-load-rng "

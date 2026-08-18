@@ -32,6 +32,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -193,6 +194,9 @@ class HybridStack(MegatronModule):
                 else:
                     raise ValueError("unexpected layer_type")
             self.layers.append(layer)
+
+        if self.config.cuda_graph_impl == "local":
+            annotate_first_last_layer(self.layers)
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -415,12 +419,17 @@ class HybridStack(MegatronModule):
         if cp_size > 1:
             # Context-parallel (Phase D): the packed sequence is sharded per-segment via the
             # load-balanced zigzag (each segment independently), so hidden_states is the rank-local
-            # [T/cp]. MambaLayer slices the LOCAL segment shards and fork_segment/fork_branches
-            # all_to_all them to head-parallel full-segment internally (pre/post_conv_ssm); hence the
-            # ctx carries LOCAL segment lengths. Each segment must be a multiple of 2*cp (the zigzag).
+            # [T/cp] before any additional TP sequence sharding. MambaLayer first applies in_proj to
+            # all-gather that TP shard, then slices the CP-local segments and all_to_all's them to
+            # head-parallel full segments internally (pre/post_conv_ssm). The context therefore
+            # carries CP-local lengths. Each segment must be a multiple of 2*cp (the zigzag).
             assert prefix_len % (2 * cp_size) == 0 and all(
                 c % (2 * cp_size) == 0 for c in completion_lens
             ), f"shared-prefix CP={cp_size}: each segment must be a multiple of 2*cp_size"
+            assert not completion_lens or len(set(completion_lens)) == 1, (
+                f"shared-prefix CP={cp_size} requires uniformly padded completion lengths; "
+                f"got {completion_lens}"
+            )
             # real_prefix_len is in FULL (post-pre_conv_ssm) coords -- default to the full padded
             # prefix_len (NOT the local prefix_len//cp), so fork_segment scans the whole real prefix.
             ctx = SharedPrefixContext(
@@ -442,8 +451,17 @@ class HybridStack(MegatronModule):
         else:
             ctx = SharedPrefixContext(prefix_len, completion_lens, real_prefix_len=real_prefix_len)
             cp_layout = cp_group = rotary_local = None
-        assert hidden_states.shape[0] == ctx.total_len, (
-            f"packed length {hidden_states.shape[0]} != Lp+sum(Lc) {ctx.total_len} (cp={cp_size})"
+        # Under TP sequence-parallel the residual stream BETWEEN layers is sharded along the sequence
+        # dim across the TP group (each layer's in_proj/QKV all-gathers it back to ctx.total_len for
+        # the Mamba fork + tree attention, then out_proj reduce-scatters it; the output layer gathers
+        # it before the vocab projection). So the entry hidden_states here is ctx.total_len // tp_sp.
+        # The fork/attention/output therefore see the FULL ctx.total_len sequence -- identical to the
+        # TP=1 path -- and need no SP-specific handling beyond this length bookkeeping.
+        sp = bool(getattr(self.config, "sequence_parallel", False))
+        tp_sp = _ps.get_tensor_model_parallel_world_size() if sp else 1
+        assert hidden_states.shape[0] * tp_sp == ctx.total_len, (
+            f"packed length {hidden_states.shape[0]} * tp_sp {tp_sp} != Lp+sum(Lc) {ctx.total_len} "
+            f"(cp={cp_size}, sequence_parallel={sp})"
         )
         # Prefer FlexAttention for the tree mask: a sparse BlockMask that skips the fully-masked
         # sibling-branch blocks (~5x faster than the un-shared baseline, ~11x faster than the dense
@@ -451,11 +469,21 @@ class HybridStack(MegatronModule):
         # unavailable (torch < 2.5) or the layout couldn't build a BlockMask.
         # The global tree BlockMask is for the cp=1 full-sequence path. Under CP the attention runs
         # gather-KV + local-query tree flex (step 6b-2); not yet wired, so guard below.
+        # The fused flash-composed path requires fp16/bf16 (flash kernels); fp32 runs (e.g.
+        # equivalence tests) take the flex path exactly as before the fused port.
+        fused_ok = (
+            cp_size == 1
+            and _sp_fused_tree_enabled()
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        )
         block_mask = (
             build_tree_block_mask(prefix_len, completion_lens, hidden_states.device)
-            if HAVE_FLEX_ATTENTION and cp_size == 1
+            if HAVE_FLEX_ATTENTION and cp_size == 1 and not fused_ok
             else None
         )
+        # Fused flash-composed path (CP=1): thread the star layout instead of a flex BlockMask;
+        # _run_core_attention dispatches on `_sp_star`. NRL_SP_FUSED_TREE=0 restores flex.
+        sp_star = (prefix_len, list(completion_lens)) if fused_ok else None
         for layer in self.layers:
             if isinstance(layer, MambaLayer):
                 hidden_states = layer(
@@ -481,6 +509,16 @@ class HybridStack(MegatronModule):
                         )
                     finally:
                         layer.self_attention._sp_cp_ctx = None
+                elif sp_star is not None:
+                    layer.self_attention._sp_star = sp_star
+                    try:
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=None,
+                            rotary_pos_emb=rotary_pos_emb,
+                        )
+                    finally:
+                        layer.self_attention._sp_star = None
                 elif block_mask is not None:
                     # real attention via FlexAttention tree BlockMask (+ position-aware RoPE). The
                     # dense mask is not materialized; _run_core_attention reads `_sp_block_mask`.
@@ -576,3 +614,10 @@ class HybridStack(MegatronModule):
 # Backward-compatible aliases
 MambaStackSubmodules = HybridStackSubmodules
 MambaStack = HybridStack
+
+
+def _sp_fused_tree_enabled() -> bool:
+    """Gate for the fused flash-composed shared-prefix attention (vs FlexAttention)."""
+    import os
+
+    return os.environ.get("NRL_SP_FUSED_TREE", "1") not in ("0", "", "false", "False")

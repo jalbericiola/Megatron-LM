@@ -181,6 +181,7 @@ class CPSharedPrefixLayout:
         real_lens = [int(real_prefix_len) if real_prefix_len is not None else int(prefix_len)] + (
             [int(c) for c in real_completion_lens] if real_completion_lens is not None
             else [int(c) for c in completion_lens])
+        self.real_seg_lens = real_lens
         ispad = []
         for L, rl in zip(self.global_seg_lens, real_lens):
             ispad += [0] * rl + [1] * (L - rl)
@@ -231,6 +232,8 @@ class CPSharedPrefixLayout:
 def two_term_tree_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
     prefix_len: int, completion_lens: List[int], scale=None,
+    real_prefix_len: Optional[int] = None,
+    real_completion_lens: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """CP-compatible shared-prefix attention as TWO flash terms + an online-softmax (LSE) merge,
     instead of one FlexAttention tree BlockMask. Numerically equals ``flex_tree_attention`` but uses
@@ -257,23 +260,48 @@ def two_term_tree_attention(
     T, b, nq, hd = query.shape
     assert b == 1, "two_term_tree_attention expects a packed group with batch=1"
     Lp = int(prefix_len)
+    real_lp = int(real_prefix_len) if real_prefix_len is not None else Lp
+    padded_lcs = [int(length) for length in completion_lens]
+    real_lcs = (
+        [int(length) for length in real_completion_lens]
+        if real_completion_lens is not None
+        else padded_lcs
+    )
+    assert len(real_lcs) == len(padded_lcs)
+    assert real_lp <= Lp and all(
+        real <= padded for real, padded in zip(real_lcs, padded_lcs)
+    )
     q, k, v = query[:, 0], key[:, 0], value[:, 0]                 # [T, n*, hd]
-    kp, vp = k[:Lp], v[:Lp]                                       # prefix K/V (full)
+    kp, vp = k[:real_lp], v[:real_lp]                              # real prefix K/V
 
     # prefix region: causal self-attention within the prefix
-    op = flash_attn_func(q[:Lp][None], kp[None], vp[None], softmax_scale=scale, causal=True)[0]
+    op = flash_attn_func(
+        q[:real_lp][None], kp[None], vp[None], softmax_scale=scale, causal=True
+    )[0]
 
-    parts = [op]
-    if completion_lens:
-        qc, kc, vc = q[Lp:], k[Lp:], v[Lp:]                      # [Lc_sum, n*, hd]
+    output = query.new_zeros(T, nq, hd).index_copy(
+        0, torch.arange(real_lp, device=query.device), op
+    )
+    if padded_lcs:
+        q_parts, k_parts, v_parts, real_positions = [], [], [], []
+        offset = Lp
+        for padded_len, real_len in zip(padded_lcs, real_lcs):
+            q_parts.append(q[offset : offset + real_len])
+            k_parts.append(k[offset : offset + real_len])
+            v_parts.append(v[offset : offset + real_len])
+            real_positions.append(
+                torch.arange(offset, offset + real_len, device=query.device)
+            )
+            offset += padded_len
+        qc, kc, vc = torch.cat(q_parts), torch.cat(k_parts), torch.cat(v_parts)
         # term1: every completion query attends the FULL prefix (non-causal; all prefix precedes it)
         o1, l1, _ = flash_attn_func(qc[None], kp[None], vp[None], softmax_scale=scale,
                                     causal=False, return_attn_probs=True)
         o1, l1 = o1[0], l1[0]                                     # o1 [Lc,nq,hd], l1 [nq,Lc]
         # term2: per-completion causal self-attention (varlen block-diagonal over the G branches)
-        cu = torch.zeros(len(completion_lens) + 1, device=q.device, dtype=torch.int32)
-        cu[1:] = torch.tensor(completion_lens, device=q.device, dtype=torch.int32).cumsum(0)
-        maxl = max(completion_lens)
+        cu = torch.zeros(len(real_lcs) + 1, device=q.device, dtype=torch.int32)
+        cu[1:] = torch.tensor(real_lcs, device=q.device, dtype=torch.int32).cumsum(0)
+        maxl = max(real_lcs)
         o2, l2, _ = flash_attn_varlen_func(qc, kc, vc, cu, cu, maxl, maxl, softmax_scale=scale,
                                            causal=True, return_attn_probs=True)
         # online-softmax merge of the two disjoint key sets (LSE in fp32 for stability)
@@ -282,9 +310,11 @@ def two_term_tree_attention(
         m = torch.maximum(l1t, l2t)
         w1, w2 = (l1t - m).exp(), (l2t - m).exp()
         oc = (o1.float() * w1 + o2.float() * w2) / (w1 + w2)     # [Lc,nq,hd]
-        parts.append(oc.to(query.dtype))
+        output = output.index_copy(
+            0, torch.cat(real_positions), oc.to(query.dtype)
+        )
 
-    return torch.cat(parts, dim=0).reshape(T, 1, nq * hd).contiguous()   # [sq, b, nq*hd]
+    return output.reshape(T, 1, nq * hd).contiguous()               # [sq, b, nq*hd]
 
 
 @dataclass

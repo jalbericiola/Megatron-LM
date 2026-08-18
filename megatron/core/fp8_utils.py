@@ -12,16 +12,13 @@ import torch
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.tensor_parallel import (
+    ColumnParallelLinear,
+    RowParallelLinear,
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import (
-    get_te_version,
-    is_column_parallel_linear,
-    is_row_parallel_linear,
-    is_te_min_version,
-)
+from megatron.core.utils import get_te_version, is_te_min_version
 
 # Check if Transformer Engine is installed
 HAVE_TE = False
@@ -174,6 +171,27 @@ def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
         return 32
     else:
         return 16
+
+
+def is_column_parallel_linear(module):
+    """Returns whether the given module is a ColumnParallelLinear layer."""
+    if HAVE_TE and (
+        isinstance(module, TEColumnParallelLinear)
+        or isinstance(module, TELayerNormColumnParallelLinear)
+    ):
+        return True
+    elif isinstance(module, ColumnParallelLinear):
+        return True
+    return False
+
+
+def is_row_parallel_linear(module):
+    """Returns whether the given module is a RowParallelLinear layer."""
+    if HAVE_TE and isinstance(module, TERowParallelLinear):
+        return True
+    elif isinstance(module, RowParallelLinear):
+        return True
+    return False
 
 
 """
@@ -509,6 +527,24 @@ def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
         return True
     else:
         return False
+
+
+def is_mxfp8_output_proj_active(config) -> bool:
+    """Return True when the LM-head output projection should run under MXFP8.
+
+    Active when ``fp8_output_proj=True``, ``fp8=True``, ``fp8_recipe='mxfp8'``,
+    and Transformer Engine is installed.
+    """
+    if not HAVE_TE:
+        return False
+    if not getattr(config, "fp8_output_proj", False):
+        return False
+    if not getattr(config, "fp8", False):
+        return False
+
+    fp8_recipe = getattr(config, "fp8_recipe", None)
+    recipe_value = getattr(fp8_recipe, "value", fp8_recipe)
+    return str(recipe_value).lower() == "mxfp8" or str(fp8_recipe).lower().endswith(".mxfp8")
 
 
 if HAVE_TE:

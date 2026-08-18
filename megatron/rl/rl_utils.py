@@ -1,20 +1,20 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import gc
 
-import copy
-from functools import partial
 # Keep this to make the env registered.
 import itertools
-import math
-import logging
 import json
+import logging
+import math
 import os
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional 
+from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 import torch
@@ -22,46 +22,40 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
+from wandb import wandb_run
 
 from megatron.core import mpu
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
-from megatron.core.optimizer import MegatronOptimizer
-from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
-from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
-from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.utils import (
-    toggle_cuda_graphs,
-    transition_moe_cudagraphs,
-)
-from megatron.core.inference.utils import set_decode_expert_padding
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,
 )
-from megatron.core.inference.utils import device_memory_summary
-from megatron.core.utils import get_asyncio_loop, log_single_rank
-from megatron.rl.sequence_packing_utils import (
-    get_microbatch_dataloader,
-    pack_inference_logprobs,
-    compute_packed_inference_logprobs_stats,
-    pack_all_trajectories,
-    load_packed_data_by_index,
-    get_sequence_packing_tensorboard_metrics,
-    get_sequence_packing_log_info,
-    get_default_packed_seq_params,
-    get_packing_actual_tokens,
-    get_packing_compute_tokens,
-    get_packing_efficiency,
-    get_packing_avg_seq_length,
-    update_microbatch_calculator,
+from megatron.core.inference.utils import device_memory_summary, set_decode_expert_padding
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
+from megatron.core.optimizer import MegatronOptimizer
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_stage
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
+from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
+from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.utils import toggle_cuda_graphs, transition_moe_cudagraphs
+from megatron.core.utils import (
+    get_asyncio_loop,
+    get_attr_wrapped_model,
+    get_pg_rank,
+    get_pg_size,
+    log_single_rank,
+    unwrap_model,
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -78,6 +72,22 @@ from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
+from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
+from megatron.rl.sequence_packing_utils import (
+    compute_packed_inference_logprobs_stats,
+    get_default_packed_seq_params,
+    get_microbatch_dataloader,
+    get_packing_actual_tokens,
+    get_packing_avg_seq_length,
+    get_packing_compute_tokens,
+    get_packing_efficiency,
+    get_sequence_packing_log_info,
+    get_sequence_packing_tensorboard_metrics,
+    load_packed_data_by_index,
+    pack_all_trajectories,
+    pack_inference_logprobs,
+    update_microbatch_calculator,
+)
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
 from megatron.training.global_vars import (
     get_args,
@@ -85,19 +95,8 @@ from megatron.training.global_vars import (
     get_tokenizer,
     get_wandb_writer,
 )
-from megatron.training.utils import (
-    get_ltor_masks_and_position_ids,
-    get_nvtx_range,
-    print_rank_0,
-)
-from megatron.core.utils import get_pg_rank, get_pg_size, get_attr_wrapped_model, unwrap_model
-from megatron.core.process_groups_config import ProcessGroupCollection
-from wandb import wandb_run
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    is_batch_invariant_mode_enabled,
-)
+from megatron.training.utils import get_ltor_masks_and_position_ids, get_nvtx_range, print_rank_0
 
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 if HAVE_TORCH_MEMORY_SAVER:
     from torch_memory_saver import torch_memory_saver
 
@@ -257,7 +256,7 @@ def verify_model_weights_swap(
             assert train_output.shape == inf_output.shape, (
                 f"Output shape mismatch: train={train_output.shape}, infer={inf_output.shape}"
             )
-            
+
             max_diff = (train_output - inf_output).abs().max().item()
             assert torch.allclose(train_output, inf_output, atol=atol, rtol=rtol), (
                 f"Forward pass outputs do not match: max_diff={max_diff:.6e}, atol={atol}, rtol={rtol}"
@@ -495,10 +494,7 @@ def align_unpacked_inference_logprobs(
 
     # We need to align old_logprobs and inference logprobs as the latter are only for generations
     for i, inf_logprobs in enumerate(inference_logprobs):
-        first_gen_idx = int(first_gen_tok[i])
-        if first_gen_idx < 0:
-            # No generation tokens (dropped/placeholder rollout) — nothing to align.
-            continue
+        first_gen_idx = first_gen_tok[i]
         # We subtract -1 here because we append eod token on the train side, and we do not
         # get it from the inference. For the eod token, we reuse old_logprobs value.
         end_idx = min(first_gen_idx + len(inf_logprobs), padded_inference_logprobs.shape[1])
@@ -562,35 +558,9 @@ def rollout_quant_disabled(model):
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
-        inference_model = model[0]
-
-        # Speculative rollout: back the inference engine with a fast early-exit
-        # draft model that shares weights with the full model and exits after the
-        # first `rl_speculative_exit_layer` transformer blocks.  The training
-        # forward pass (get_logprobs) always uses the full model, so no IS
-        # correction is required.
-        exit_layer = getattr(args, 'rl_speculative_exit_layer', None)
-        if exit_layer is not None:
-            from megatron.rl.inference.draft_model import EarlyExitGPTModel
-            full_gpt = unwrap_model(inference_model)
-            total_layers = len(full_gpt.decoder.layers)
-            if not (1 <= exit_layer < total_layers):
-                raise ValueError(
-                    f"--rl-speculative-exit-layer={exit_layer} must satisfy "
-                    f"1 <= exit_layer < {total_layers} (total transformer layers)."
-                )
-            inference_model = EarlyExitGPTModel(full_gpt, exit_layer)
-            log_single_rank(
-                logger, logging.INFO,
-                f"[Speculative Rollout] Inference engine uses "
-                f"EarlyExitGPTModel (exit_layer={exit_layer}/{total_layers}). "
-                f"Draft generates {args.rl_speculative_oversample_factor}x rollouts; "
-                f"selection strategy: {args.rl_speculative_selection_strategy}."
-            )
-
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
-                inference_model,
+                model[0],
                 host='0.0.0.0',
                 port=8294,
                 verbose=args.inference_text_gen_server_logging)
@@ -599,51 +569,20 @@ def get_inference_interface(args, loop, model):
 
 
 _ROLLOUT_GENERATOR = None
-
-
-async def _speculative_select_generator(base_generator, k, strategy):
-    """Async generator wrapper that down-selects oversampled rollout groups.
-
-    Consumes groups of ``k * oversample_factor`` rollouts from ``base_generator``
-    and yields groups of exactly ``k`` rollouts, selected by ``strategy``.
-    Skips falsy groups (``None`` or empty), which can be emitted by upstream
-    filters (e.g. ``filter_groups_with_same_reward``).
-    """
-    from megatron.rl.agent.speculative_mixin import select_rollouts, SelectionStrategy
-    strat = SelectionStrategy(strategy)
-    async for group in base_generator:
-        if not group:
-            yield group
-            continue
-        yield select_rollouts(list(group), k, strat)
+_ROLLOUT_AGENT = None
 
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
-    global _ROLLOUT_GENERATOR
+    global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT
     from megatron.rl.dynamic_maxlen import configure_from_args
     configure_from_args(args)
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
-        agent = get_agent(
-            args,
-            parallel_generation_tasks=args.rl_parallel_generation_tasks if streaming else n_prompts,
-        )
-
-        # When speculative rollout is enabled, inflate rollouts_per_group so the
-        # draft engine generates oversample_factor * samples_per_group candidates.
-        # A thin async wrapper then down-selects to the original samples_per_group
-        # before the rollouts reach the training pipeline.
-        exit_layer = getattr(args, 'rl_speculative_exit_layer', None)
-        effective_rollouts_per_group = (
-            samples_per_group * args.rl_speculative_oversample_factor
-            if exit_layer is not None
-            else samples_per_group
-        )
-
-
+        parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
+        agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
         request = GroupedRolloutRequest(
-            num_groups=args.rl_generation_batch_size if streaming else n_prompts,
+            num_groups=n_prompts,
             streaming=streaming,
-            rollouts_per_group=effective_rollouts_per_group,
+            rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
                 'temperature': args.rl_default_temperature,
@@ -652,18 +591,13 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
-            enforce_order=args.rl_enforce_generation_order,
+            submission_granularity=args.rl_submission_granularity,
+            consumption_granularity=args.rl_consumption_granularity,
         )
-        base_gen = agent.get_grouped_rollouts(request)
-
-        if exit_layer is not None:
-            _ROLLOUT_GENERATOR = _speculative_select_generator(
-                base_gen,
-                k=samples_per_group,
-                strategy=args.rl_speculative_selection_strategy,
-            )
-        else:
-            _ROLLOUT_GENERATOR = base_gen
+        # Keep the agent handle so metric logging can read the live rollout
+        # pipelines (see _collect_rollout_pipeline_metrics).
+        _ROLLOUT_AGENT = agent
+        _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR
 
 
@@ -939,6 +873,180 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
+def _scattered_shared_prefix_logprobs(
+    logits_local: torch.Tensor,
+    packed_tokens: torch.Tensor,
+    layout,
+    cp_layout,
+    real_idx: torch.Tensor,
+    cp_group,
+    no_grad: bool,
+    tp_group=None,
+) -> torch.Tensor:
+    """Extract shared-prefix completion logprobs without gathering ``[T, vocab]``.
+
+    Every predicting position belongs to exactly one context-parallel rank. Each rank evaluates
+    only the rows it owns, scatters those scalar logprobs into completion-token order, and reduces
+    the compact vector across CP. This replaces the prohibitively large full-vocabulary gather.
+    """
+
+    device = logits_local.device
+    packed_tokens = packed_tokens.reshape(-1).to(device)
+    comp_positions = layout.comp_positions.to(device)
+    prev_positions = layout.prev_positions.to(device)
+    real_idx = real_idx.to(device)
+
+    # Map each real predecessor to its padded global position, then to this rank's local row.
+    prev_padded_positions = real_idx.index_select(0, prev_positions)
+    global_to_local = torch.full(
+        (cp_layout.total_global,), -1, dtype=torch.long, device=device
+    )
+    global_to_local[cp_layout.local_global_pos] = torch.arange(
+        cp_layout.total_local, dtype=torch.long, device=device
+    )
+    local_rows = global_to_local.index_select(0, prev_padded_positions)
+    owned_output_rows = torch.nonzero(local_rows >= 0, as_tuple=False).flatten()
+
+    tp_size = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
+    local_values = torch.zeros(
+        comp_positions.numel(),
+        dtype=torch.float32 if tp_size > 1 else logits_local.dtype,
+        device=device,
+    )
+    if owned_output_rows.numel() > 0:
+        owned_local_rows = local_rows.index_select(0, owned_output_rows)
+        all_targets = packed_tokens.index_select(0, comp_positions)
+        owned_targets = all_targets.index_select(0, owned_output_rows)
+
+        if tp_size > 1:
+            # Keep vocabulary logits sharded across TP. Process contiguous sequence-row views so
+            # activation checkpointing retains only the original logits plus tiny target vectors,
+            # not another multi-GiB copy of every selected row.
+            from megatron.core.tensor_parallel.cross_entropy import (
+                vocab_parallel_cross_entropy,
+            )
+            from torch.utils.checkpoint import checkpoint
+
+            output_rows_cpu = owned_output_rows.detach().cpu().tolist()
+            local_rows_cpu = owned_local_rows.detach().cpu().tolist()
+            targets_cpu = owned_targets.detach().cpu().tolist()
+            primary_by_local = {}
+            extras = []
+            for output_row, local_row, target in zip(
+                output_rows_cpu, local_rows_cpu, targets_cpu
+            ):
+                if local_row in primary_by_local:
+                    extras.append((output_row, local_row, target))
+                else:
+                    primary_by_local[local_row] = (output_row, target)
+
+            target_by_local = torch.zeros(
+                logits_local.shape[0], dtype=torch.long, device=device
+            )
+            output_by_local = torch.full(
+                (logits_local.shape[0],), -1, dtype=torch.long, device=device
+            )
+            if primary_by_local:
+                primary_local_rows = torch.tensor(
+                    list(primary_by_local), dtype=torch.long, device=device
+                )
+                primary_output_rows = torch.tensor(
+                    [value[0] for value in primary_by_local.values()],
+                    dtype=torch.long,
+                    device=device,
+                )
+                primary_targets = torch.tensor(
+                    [value[1] for value in primary_by_local.values()],
+                    dtype=torch.long,
+                    device=device,
+                )
+                target_by_local[primary_local_rows] = primary_targets
+                output_by_local[primary_local_rows] = primary_output_rows
+
+            def distributed_logprobs(logit_rows, target_rows):
+                return -vocab_parallel_cross_entropy(
+                    logit_rows, target_rows, tp_group=tp_group
+                )
+
+            value_parts = []
+            output_parts = []
+            for start in range(0, logits_local.shape[0], 256):
+                end = min(start + 256, logits_local.shape[0])
+                logit_chunk = logits_local[start:end]
+                target_chunk = target_by_local[start:end]
+                chunk_values = (
+                    distributed_logprobs(logit_chunk, target_chunk)
+                    if no_grad
+                    else checkpoint(
+                        distributed_logprobs,
+                        logit_chunk,
+                        target_chunk,
+                        use_reentrant=False,
+                    )
+                )
+                chunk_output_rows = output_by_local[start:end]
+                keep = chunk_output_rows >= 0
+                if keep.any():
+                    value_parts.append(chunk_values[keep])
+                    output_parts.append(chunk_output_rows[keep])
+
+            if extras:
+                extra_output_rows = torch.tensor(
+                    [item[0] for item in extras], dtype=torch.long, device=device
+                )
+                extra_local_rows = torch.tensor(
+                    [item[1] for item in extras], dtype=torch.long, device=device
+                )
+                extra_targets = torch.tensor(
+                    [item[2] for item in extras], dtype=torch.long, device=device
+                )
+                extra_logits = logits_local.index_select(0, extra_local_rows)
+                extra_values = (
+                    distributed_logprobs(extra_logits, extra_targets)
+                    if no_grad
+                    else checkpoint(
+                        distributed_logprobs,
+                        extra_logits,
+                        extra_targets,
+                        use_reentrant=False,
+                    )
+                )
+                value_parts.append(extra_values)
+                output_parts.append(extra_output_rows)
+
+            local_values = local_values.index_copy(
+                0, torch.cat(output_parts), torch.cat(value_parts)
+            )
+        else:
+            # Avoid materializing all owned ``[n, vocab]`` rows at once.
+            selected_chunks = []
+            for row_chunk, target_chunk in zip(
+                owned_local_rows.split(256), owned_targets.split(256)
+            ):
+                selected_chunks.append(
+                    selective_log_softmax(
+                        logits_local.index_select(0, row_chunk), target_chunk
+                    )
+                )
+            selected = torch.cat(selected_chunks)
+            local_values = local_values.index_copy(0, owned_output_rows, selected)
+    else:
+        # Keep a differentiable zero on ranks that happen to own no predicting positions.
+        local_values = local_values + logits_local.sum() * 0.0
+
+    if no_grad:
+        torch.distributed.all_reduce(
+            local_values, op=torch.distributed.ReduceOp.SUM, group=cp_group
+        )
+        return local_values.to(logits_local.dtype)
+
+    from torch.distributed.nn.functional import all_reduce as differentiable_all_reduce
+
+    return differentiable_all_reduce(
+        local_values, op=torch.distributed.ReduceOp.SUM, group=cp_group
+    ).to(logits_local.dtype)
+
+
 def _zigzag_slice(x: torch.Tensor, cp_size: int, cp_rank: int) -> torch.Tensor:
     """Pick chunks ``cp_rank`` and ``2*cp_size - cp_rank - 1`` after viewing
     the sequence dim as ``2*cp_size`` equal chunks, then concatenate.
@@ -1086,12 +1194,8 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             Required when packed_seq_params is provided to avoid CPU-GPU synchronization.
 
     Returns:
-        Logprobs of input sequences  [batch, seq_len - 1].
+        Logprobs of input sequences.
 
-        With context parallelism (cp_size > 1) each rank runs the forward pass
-        on its ``seq_len // cp_size`` token slice.  Logprobs are all-gathered
-        after the log-softmax so the returned tensor always has the full
-        sequence length, matching the cp_size == 1 interface exactly.
     """
 
     args = get_args()
@@ -1118,7 +1222,6 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 total_tokens=tokens.shape[1],
             )
 
-    cp_size    = mpu.get_context_parallel_world_size()
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("rl/get-logprobs", time=True):
@@ -1135,6 +1238,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             # Shared-prefix bin: build the SharedPrefixParams (tree mask + prefix-continued
             # positions) and slice to the packed [P, C_1..C_G] length, so HybridModel.forward
             # routes to the two-pass forward instead of the dense decoder.
+            cp_size = mpu.get_context_parallel_world_size()
             spp = None
             cp_sp_layout = None
             cp_real_idx = None
@@ -1187,7 +1291,9 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                         pad_toks[:, lgp],
                         pad_pos[:, lgp],
                         attention_mask_for_forward,
-                        runtime_gather_output=True,
+                        # Keep vocab logits TP-sharded; scattered fan-out below computes only the
+                        # requested target logprobs with vocab-parallel cross entropy.
+                        runtime_gather_output=False,
                         fp32_output=fp32_output,
                         shared_prefix_params=spp_pad,
                     )
@@ -1247,14 +1353,19 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 from megatron.rl.shared_prefix_packing import extract_completion_logprobs
                 L = shared_prefix_layout
                 if cp_size > 1:
-                    # CP: all-gather the rank-local logits to the FULL global-order PADDED sequence
-                    # (un-zigzag per segment; differentiable), drop the pads back to the REAL packed
-                    # order (cp_real_idx), then the unchanged cp=1 fan-out on the REAL layout.
-                    # NOTE: gathers full [T_pad, vocab] -- fine at moderate seq length; the
-                    # memory-optimal scattered fan-out (broadcast only logits[Lp-1]) is a follow-up.
-                    full_logits = cp_sp_layout._gather(logits[0], mpu.get_context_parallel_group())
-                    real_logits = full_logits[cp_real_idx]       # [T_pad,vocab] -> [T_real,vocab]
-                    comp_lp = extract_completion_logprobs(real_logits, tokens[0, :L.total_len], L)
+                    # Each CP rank scores only the predecessor rows it owns, then all-reduces the
+                    # compact completion-logprob vector. Never gather the full [T_pad, vocab]
+                    # tensor: at 49k context that requires roughly 28 GiB of extra device memory.
+                    comp_lp = _scattered_shared_prefix_logprobs(
+                        logits[0],
+                        tokens[0, :L.total_len],
+                        L,
+                        cp_sp_layout,
+                        cp_real_idx,
+                        mpu.get_context_parallel_group(),
+                        no_grad=no_grad,
+                        tp_group=mpu.get_tensor_model_parallel_group(),
+                    )
                 else:
                     comp_lp = extract_completion_logprobs(
                         logits[0, :L.total_len, :], tokens[0, :L.total_len], L
@@ -1270,14 +1381,10 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             else:
                 # We do not need logprobs for the n+1 token.
                 logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
-        return logprobs
+            return logprobs
 
 
-def calculate_grpo_advantages(
-    rewards: list[list[float]],
-    num_turns: list[list[int]],
-    advantage_overrides: list[list[float | None]] | None = None,
-) -> np.ndarray:
+def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]]) -> np.ndarray:
     """Calculate GRPO advantages from rewards/num_turns.
 
     For multiturn rollouts, the logic is a bit more involved.
@@ -1301,17 +1408,7 @@ def calculate_grpo_advantages(
     # @vitalyk: this will go away when we start sending env-based sample reqs.
     rewards = rewards.flatten().repeat(num_turns.flatten())
 
-    advantages = (rewards - reward_means) / (1e-4 + reward_stds)
-
-    if advantage_overrides is not None:
-        overrides = np.array(
-            [[np.nan if o is None else o for o in group] for group in advantage_overrides],
-            dtype=np.float64,
-        )
-        overrides = overrides.flatten().repeat(num_turns.flatten())
-        advantages = np.where(np.isnan(overrides), advantages, overrides)
-
-    return advantages.tolist()
+    return ((rewards - reward_means) / (1e-4 + reward_stds)).tolist()
 
 
 def compute_group_stats(
@@ -1336,7 +1433,6 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
-    advantage_overrides = []
     all_policy_epoch = []
     all_kv_cache_epoch = []
     all_completed_epochs = []
@@ -1346,7 +1442,6 @@ def compute_group_stats(
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
-        group_advantage_overrides = []
         group_policy_epoch = []
         group_kv_epoch = []
         group_completed_epochs = []
@@ -1356,14 +1451,10 @@ def compute_group_stats(
                 for turn_traj in rollout.trajectory:
                     detokenized_traj = tokenizer.detokenize(turn_traj)
                     lang_rl_log(
-                        f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} tokens] {detokenized_traj}"
+                        f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(turn_traj)} tokens] {detokenized_traj}"
                     )
-                    # Multi-turn agents can terminate a turn on a tool-call boundary,
-                    # which is neither tokenizer.eod (11) nor a hit-seq_len truncation.
-                    # The downstream packing/loss code only requires len <= seq_len;
-                    # the strict EOD/full-length check was a single-turn assumption.
-                    # TODO(vitalyk): tighten this with a per-agent terminator set if
-                    # we want to keep some sanity check on multi-turn boundaries.
+                    # Multi-turn agents can terminate on a tool-call boundary rather than EOD.
+                    # Downstream packing only requires that the cumulative turn fits.
                     assert len(turn_traj) <= seq_len, (
                         f"Rollout too long: {len(turn_traj)} > {seq_len} "
                         f"(last token {turn_traj[-1]})\n{detokenized_traj}"
@@ -1374,10 +1465,17 @@ def compute_group_stats(
                 )
             group_num_turns.append(len(rollout.trajectory))
             group_rewards.append(rollout.reward)
-            group_advantage_overrides.append(getattr(rollout, 'advantage_override', None))
-            roll_turn_lens = [len(t) for t in rollout.trajectory]
-            group_turn_lengths.extend(roll_turn_lens)
-            group_traj_lengths.append(sum(roll_turn_lens))
+            # Multi-turn trajectories are cumulative (prompt + all turns so far); report deltas.
+            cumulative_turn_lens = [len(t) for t in rollout.trajectory]
+            group_turn_lengths.extend(
+                current - previous
+                for previous, current in zip(
+                    [0] + cumulative_turn_lens[:-1], cumulative_turn_lens
+                )
+            )
+            group_traj_lengths.append(
+                cumulative_turn_lens[-1] if cumulative_turn_lens else 0
+            )
             assert rollout.policy_epoch, "Rollout has no policy_epoch data"
             assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
             group_policy_epoch.append([epoch for turn in rollout.policy_epoch for _, epoch in turn])
@@ -1389,13 +1487,9 @@ def compute_group_stats(
         all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
-        # Guard against an all-placeholder group (every sub-request failed, e.g.
-        # workplace_assistant prompts already exceeding seq_length at turn 1).
-        # turn_lens drives min/max/mean stats downstream; max([]) crashes.
-        turn_lens.append(group_turn_lengths or [0])
+        turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
         rewards.append(group_rewards)
-        advantage_overrides.append(group_advantage_overrides)
         # https://arxiv.org/abs/2504.21233 reports that lens variance hurts.
         # Let's track this.
         num_turns.append(group_num_turns)
@@ -1409,7 +1503,7 @@ def compute_group_stats(
         # with the inner list being the group data.
         env_ids=env_ids,
         num_turns=num_turns,
-        advantages=calculate_grpo_advantages(rewards, num_turns, advantage_overrides),
+        advantages=calculate_grpo_advantages(rewards, num_turns),
         min_piold_to_inf_prob=None,
         max_piold_to_inf_prob=None,
         mean_piold_to_inf_prob=None,
@@ -1573,6 +1667,95 @@ def prep_wandb_metrics(
     return metrics
 
 
+def _collect_rollout_pipeline_metrics() -> dict:
+    """Snapshot per-pipeline instrumentation into wandb-loggable scalars.
+
+    Walks the live rollout agent (set by get_rollout_generator) and, for each
+    sub-agent with an active _RolloutPipeline, reads queue sizes, gate state,
+    per-stage dwell times, and rate counters. Accumulators are reset after
+    reading; point-in-time values (queue sizes, gate held) are re-read next
+    call. Keys follow the existing f"{env_id}_{metric}" convention.
+    """
+    if _ROLLOUT_AGENT is None:
+        return {}
+    sub_agents = (
+        _ROLLOUT_AGENT.agents
+        if isinstance(_ROLLOUT_AGENT, WeightedMultiTask)
+        else [_ROLLOUT_AGENT]
+    )
+    metrics: dict = {}
+    for sub_agent in sub_agents:
+        pipeline = getattr(sub_agent, "_active_pipeline", None)
+        if pipeline is None:
+            continue
+        env_id = getattr(sub_agent, "env_id", "") or "rollout"
+        gate = pipeline.gate
+        metrics.update({
+            # Queue sizes and gate held are point-in-time reads.
+            f"{env_id}_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
+            f"{env_id}_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
+            f"{env_id}_pipeline_output_queue_size": pipeline.output_queue.qsize(),
+            f"{env_id}_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
+            f"{env_id}_pipeline_consume_pending_groups": len(pipeline._consume_pending),
+            f"{env_id}_pipeline_gate_capacity": gate.capacity,
+            f"{env_id}_pipeline_gate_held": gate.held,
+            f"{env_id}_pipeline_gate_utilization": (
+                gate.held / gate.capacity if gate.capacity else 0.0
+            ),
+            # Counters below accumulate since the previous collection.
+            f"{env_id}_pipeline_gate_prepare_blocked_seconds": gate.prepare_blocked_seconds,
+            f"{env_id}_pipeline_gate_acquire_calls": gate.acquire_calls,
+            f"{env_id}_pipeline_gate_release_calls": gate.release_calls,
+            f"{env_id}_pipeline_prepared_count": pipeline.prepared_count,
+            f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
+            f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
+            f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
+        })
+        for name, samples in (
+            ("infer_queue_dwell", pipeline.infer_queue_dwell),
+            ("engine_dwell", pipeline.engine_dwell),
+            ("assemble_queue_dwell", pipeline.assemble_queue_dwell),
+            ("output_queue_dwell", pipeline.output_queue_dwell),
+        ):
+            if samples:
+                arr = np.asarray(samples, dtype=np.float64)
+                metrics[f"{env_id}_pipeline_mean_{name}_s"] = float(arr.mean())
+                metrics[f"{env_id}_pipeline_max_{name}_s"] = float(arr.max())
+                metrics[f"{env_id}_pipeline_p50_{name}_s"] = float(np.percentile(arr, 50))
+                metrics[f"{env_id}_pipeline_p99_{name}_s"] = float(np.percentile(arr, 99))
+        # Reset accumulators; queue sizes and gate held are point-in-time.
+        pipeline.infer_queue_dwell = []
+        pipeline.engine_dwell = []
+        pipeline.assemble_queue_dwell = []
+        pipeline.output_queue_dwell = []
+        pipeline.prepared_count = 0
+        pipeline.inferred_count = 0
+        pipeline.assembled_count = 0
+        pipeline.yielded_count = 0
+        gate.prepare_blocked_seconds = 0.0
+        gate.acquire_calls = 0
+        gate.release_calls = 0
+
+    # WeightedMultiTask work distribution (agent_slots / agent_pgts).
+    dist = getattr(_ROLLOUT_AGENT, "latest_distribution", None)
+    if dist:
+        # An env_id can appear more than once in the config (e.g. an active
+        # entry plus an evaluation-only twin with zero weight). Sum per
+        # env_id so the zero twin does not overwrite the active entry.
+        per_env: dict = {}
+        for env_id, groups, pgt, slots in zip(
+            dist["env_ids"], dist["agent_groups"], dist["agent_pgts"], dist["agent_slots"]
+        ):
+            g, p, s = per_env.get(env_id, (0, 0, 0.0))
+            per_env[env_id] = (g + groups, p + pgt, s + slots)
+        for env_id, (groups, pgt, slots) in per_env.items():
+            metrics[f"{env_id}_agent_groups"] = groups
+            metrics[f"{env_id}_agent_pgts"] = pgt
+            metrics[f"{env_id}_agent_slots"] = slots
+        metrics["multitask_total_pgt"] = dist["total_pgt"]
+    return metrics
+
+
 def maybe_log_training_metrics(
     group_stats: RolloutStats,
     current_iteration: int,
@@ -1592,6 +1775,17 @@ def maybe_log_training_metrics(
     tb_writer = get_tensorboard_writer()
     if tb_writer:
         tb_writer.add_scalar('mean_reward', np.mean([np.mean(g) for g in group_stats.rewards]), current_iteration)
+
+    # Pipeline instrumentation lives on rank 0 (the only rank that drives
+    # rollout generation), while the wandb writer lives on the last rank.
+    # Collect on rank 0 and broadcast so the writer rank can log it. This is
+    # a collective, so it must run on every rank before the early return.
+    pipeline_metrics = _collect_rollout_pipeline_metrics()
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        payload = [pipeline_metrics]
+        dist.broadcast_object_list(payload, src=0)
+        pipeline_metrics = payload[0]
+
     if not wandb_writer:
         return
 
@@ -1650,6 +1844,11 @@ def maybe_log_training_metrics(
         )
         for k, v in env_metrics.items():
             metrics[f"{env_id}_{k}"] = v
+
+    # Per-pipeline instrumentation (queue sizes, gate state, per-stage
+    # timings) and the multi-task work distribution, collected on rank 0
+    # and broadcast above.
+    metrics.update(pipeline_metrics)
 
     wandb_writer.log(metrics, step=current_iteration)
 
@@ -1720,13 +1919,10 @@ def prepare_trajectories(
             generation_mask = rollout.generation_mask[turn_idx] if isinstance(rollout, TokenRollout) else None
             length = len(trajectory)
             assert length <= seq_length, "Rollout too long, how did this happen?"
-            # Multi-turn agents can terminate a turn on a tool-call boundary which is
-            # neither tokenizer.eod nor seq_length truncation. Padding logic below
-            # handles any short trajectory regardless of terminator. See companion
-            # relaxation in compute_group_stats (~line 1013).
-            # Old strict check:
-            #     if len(trajectory) < seq_length:
-            #         assert trajectory[-1] == tokenizer.eod, ...
+            if len(trajectory) < seq_length:
+                assert (
+                    trajectory[-1] == tokenizer.eod
+                ), "Trajectories under a seq_length limit should have eod token at the end."
 
             if length < seq_length:
                 trajectory.extend([tokenizer.pad] * (seq_length - length))
@@ -1752,19 +1948,6 @@ def prepare_trajectories(
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
     trajs = torch.tensor(trajs, device='cpu')
 
-    if trajs.ndim == 1:
-        # trajs is 1D (shape (0,)) when every rollout had trajectory=[] — i.e. all inference
-        # requests returned empty-trajectory placeholders (e.g. 500/TokenOverflowError from KV-cache
-        # exhaustion or a chunked-prefill wedge).  The downstream trajs[:, 0] assert would give a
-        # confusing IndexError; raise an actionable message here instead.
-        rank_str = str(dist.get_rank()) if torch.distributed.is_initialized() else "0"
-        raise RuntimeError(
-            f"[rank {rank_str}] prepare_trajectories: 0 usable trajectories from {len(rollouts)} rollout(s). "
-            f"All rollouts have trajectory=[] (empty-trajectory placeholders). "
-            f"Likely cause: inference server returned only 500/TokenOverflowError — check for "
-            f"KV-cache exhaustion (too many parallel generations at this SL) or --enable-chunked-prefill wedge."
-        )
-
     # Only process if we have inference_logprobs
     if inference_logprobs and any(lp is not None for lp in inference_logprobs):
         # We need to pad all logprobs to the same size for sequence packing.
@@ -1783,7 +1966,7 @@ def prepare_trajectories(
     else:
         assert (
             tokenizer.bos is None or (trajs[:, 0] != tokenizer.bos).all()
-        ), "First token should not be bos"  
+        ), "First token should not be bos"
     assert (
         tokenizer.bos is None or (trajs[:, 1] != tokenizer.bos).all()
     ), "Second token should not be bos"
@@ -1927,8 +2110,8 @@ def prepare_data_for_update(
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
-        # Note :- For EP, do not use the expert data parallel group here. Always 
-        # use the regular data parallel group. 
+        # Note :- For EP, do not use the expert data parallel group here. Always
+        # use the regular data parallel group.
 
         # Get example group per environment to log their rollouts.
         example_groups = {}
@@ -2007,108 +2190,13 @@ def prepare_data_for_update(
                     (trajs.shape[0], args.seq_length), dtype=torch.float, device='cpu',
                 )
 
-        # DP-split divergence fix for multi-turn rollouts.
-        #
-        # The DP split above slices `rollouts` evenly across DP ranks, but multi-turn
-        # rollouts produce 1..max_steps trajectories EACH (one per turn). Per-rank
-        # trajectory counts therefore vary: one rank may get all 1-turn rollouts
-        # (32 trajs), another may get all 6-turn (192 trajs).
-        #
-        # Downstream `compute_logprobs_batch` iterates `len(data_loader)` times —
-        # variable per rank — and each iter calls `forward_backward_no_pipelining`
-        # which fires `Timers.start(barrier=True)` on default_pg. Ranks with fewer
-        # trajectories race ahead to the next barrier while slower ranks are still
-        # in their loop → deadlock at the world-level barrier.
-        #
-        # Pad each rank's trajectories up to the global max across DP ranks so
-        # all ranks loop the same number of times. Padded entries have
-        # generation_mask=False everywhere → zero loss / zero grad contribution.
-        if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 1:
-            local_count = trajs.shape[0]
-            max_count_t = torch.tensor([local_count], device='cuda', dtype=torch.long)
-            torch.distributed.all_reduce(
-                max_count_t,
-                op=torch.distributed.ReduceOp.MAX,
-                group=mpu.get_data_parallel_group(),
-            )
-            target_count = int(max_count_t.item())
-
-            if target_count > local_count:
-                pad_n = target_count - local_count
-                seq_len = trajs.shape[1]
-                pad_trajs = torch.full(
-                    (pad_n, seq_len), tokenizer.pad,
-                    dtype=trajs.dtype, device=trajs.device,
-                )
-                pad_gen_masks = torch.zeros(
-                    (pad_n, seq_len),
-                    dtype=generation_masks.dtype, device=generation_masks.device,
-                )
-                trajs = torch.cat([trajs, pad_trajs], dim=0)
-                generation_masks = torch.cat([generation_masks, pad_gen_masks], dim=0)
-                # advantages was sliced to local_num_turns above; pad with zeros.
-                pad_adv = torch.zeros(
-                    pad_n, dtype=advantages.dtype, device=advantages.device,
-                )
-                advantages = torch.cat([advantages, pad_adv])
-                # group_ids likewise: pad with -1 (a sentinel for "padding trajectory, no group")
-                # so build_shared_prefix_bins ignores the dummy rows.
-                if group_ids is not None:
-                    group_ids = torch.cat([
-                        group_ids,
-                        torch.full((pad_n,), -1, dtype=group_ids.dtype, device=group_ids.device),
-                    ])
-                # inference_logprobs is None, OR a list of per-traj tensors (no-packing path),
-                # OR a [N, S] padded tensor (sequence-packing path — `_pad_nonnull_with_zeros`
-                # at ~prepare_trajectories line 1376 returns a 2D tensor).
-                if inference_logprobs is not None:
-                    if isinstance(inference_logprobs, torch.Tensor):
-                        # Tensor path: concatenate zero rows of matching shape/dtype/device.
-                        pad_lp = torch.zeros(
-                            (pad_n, *inference_logprobs.shape[1:]),
-                            dtype=inference_logprobs.dtype,
-                            device=inference_logprobs.device,
-                        )
-                        inference_logprobs = torch.cat([inference_logprobs, pad_lp], dim=0)
-                    else:
-                        # List path: append zero tensors matching existing non-None entry shape.
-                        non_none = next(
-                            (lp for lp in inference_logprobs if lp is not None), None
-                        )
-                        if non_none is not None:
-                            dummy_lp = torch.zeros_like(non_none)
-                        else:
-                            dummy_lp = torch.zeros(seq_len - 1, dtype=torch.float)
-                        inference_logprobs.extend(
-                            [dummy_lp.clone() for _ in range(pad_n)]
-                        )
-
-            # Rebuild global_advantages from padded local advantages so that
-            # `pack_all_trajectories` (sequence-packing path) — which all-gathers
-            # local trajs into a global concat — has a global_advantages tensor
-            # that matches the post-gather length. Without this, the dummy
-            # trajectories shift indices and `global_advantages[seq_indices]`
-            # would go out of range.
-            gathered_adv = [
-                torch.empty_like(advantages)
-                for _ in range(data_parallel_world_size)
-            ]
-            torch.distributed.all_gather(
-                gathered_adv, advantages,
-                group=mpu.get_data_parallel_group(),
-            )
-            global_advantages = torch.cat(gathered_adv, dim=0)
-            # NOTE: group_ids stays LOCAL (post-pad) here and is gathered INSIDE
-            # pack_all_trajectories alongside trajs (the _gather there), so it lands in the exact
-            # same rank-concatenated global order as the globally-gathered trajectories.
-
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
         if sequence_packing:
             with nvtx_range("rl/sequence-packing", time=True):
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
-                    trajs, 
-                    generation_masks, 
+                    trajs,
+                    generation_masks,
                     inference_logprobs,
                     global_advantages,
                     args.seq_length,
@@ -2116,7 +2204,7 @@ def prepare_data_for_update(
                     args.rl_sequence_packing_algo,
                     group_ids=group_ids,
                     )
-    
+
                 compute_trajs = packing_context.packed_trajs
                 compute_position_ids = packing_context.packed_position_ids
                 # Use batch_size=1 for packed computation to enable proper attention masking
@@ -2124,50 +2212,18 @@ def prepare_data_for_update(
                 dataset = TensorDataset(torch.arange(len(compute_trajs)))
                 data_loader = DataLoader(dataset, batch_size=1)
                 logprobs_batch_size = 1
-
-            my_real_tokens = sum(
-                packing_context.packing_info.seq_lengths[idx]
-                for indices in packing_context.packing_info.bin_seq_indices
-                for idx in indices
-            )
-            real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
-            torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
-            global_real_tokens = real_tokens_tensor.item()
-            try:
-                from megatron.training.mfu_tracker import get_mfu_tracker
-                get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
-            except Exception:
-                pass
         else:
-            # Always compute standard masks for the original data (we'll need them later).
-            # We discard the attention_mask, but get_ltor_masks_and_position_ids allocates a
-            # [1, seq_length, seq_length] tril tensor unconditionally — that's 68 GB at
-            # seq_length=131072 in fp32 and OOMs on iter 2's data prep. Skip the helper in
-            # the common case (no EOD-based reset) and compute loss_mask + position_ids
-            # inline without the seq^2 allocation. Fall through to the helper if either
-            # reset flag is set, since that path needs the attention_mask buffer to mark
-            # the inter-document boundaries.
-            with nvtx_range("get_ltor_masks_and_position_ids", time=True):
-                if args.reset_position_ids or args.reset_attention_mask:
-                    _, original_loss_mask, original_position_ids = get_ltor_masks_and_position_ids(
-                        trajs,
-                        tokenizer.eod,
-                        tokenizer.pad,
-                        args.reset_position_ids,
-                        args.reset_attention_mask,
-                        eod_mask_loss=False,
-                        pad_mask_loss=True,
-                    )
-                else:
-                    # Mirror the helper's behaviour for eod_mask_loss=False, pad_mask_loss=True.
-                    original_loss_mask = torch.ones_like(trajs, dtype=torch.float)
-                    original_loss_mask[trajs == tokenizer.pad] = 0.0
-                    _, seq_len = trajs.size()
-                    original_position_ids = (
-                        torch.arange(seq_len, dtype=torch.long, device=trajs.device)
-                        .unsqueeze(0)
-                        .expand_as(trajs)
-                    )
+            # Always compute standard masks for the original data (we'll need them later)
+            with nvtx_range("rl/get-ltor-masks", time=True):
+                _, original_loss_mask, original_position_ids = get_ltor_masks_and_position_ids(
+                    trajs,
+                    tokenizer.eod,
+                    tokenizer.pad,
+                    args.reset_position_ids,
+                    args.reset_attention_mask,
+                    eod_mask_loss=False,
+                    pad_mask_loss=True,
+                )
                 original_loss_mask[~generation_masks] = 0.0
                 compute_trajs = trajs
                 compute_position_ids = original_position_ids
@@ -2177,18 +2233,6 @@ def prepare_data_for_update(
                 )
                 logprobs_batch_size = args.micro_batch_size
 
-            # Without sequence packing, training.py defaults to GBS*seq_length which
-            # counts padding tokens and inflates TPS metrics.  Report only the real
-            # (non-padding) tokens so the metric is comparable to the SP path.
-            my_real_tokens = int((trajs != tokenizer.pad).sum().item())
-            real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
-            torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
-            global_real_tokens = real_tokens_tensor.item()
-            try:
-                from megatron.training.mfu_tracker import get_mfu_tracker
-                get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
-            except Exception:
-                pass
 
         with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
@@ -2757,7 +2801,7 @@ def megatron_rl_inference_mode(
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they
         # don't consume GPU memory during training.
-        with nvtx_range("prefetch-inference-model-weights-to-cpu", time=True):
+        with nvtx_range("prefetch-inference-model-weights-to-cpu"):
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
@@ -2781,11 +2825,13 @@ def megatron_rl_inference_mode(
 def rl_inference_interface_shutdown():
     global _INFERENCE_INTERFACE
     global _ROLLOUT_GENERATOR
+    global _ROLLOUT_AGENT
 
     if _ROLLOUT_GENERATOR is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
         _ROLLOUT_GENERATOR = None
+    _ROLLOUT_AGENT = None
 
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
@@ -2810,7 +2856,7 @@ def get_iteration_sequence_count(args):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
     return int(sequences_tensor.item())
-    
+
 def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) -> torch.Tensor:
     """Pad each element of a list of tensors to the length required.
     Args:

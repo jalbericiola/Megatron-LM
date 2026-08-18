@@ -2,7 +2,6 @@
 
 import inspect
 import os
-import sys
 from contextlib import nullcontext
 from functools import partial
 
@@ -26,7 +25,7 @@ from megatron.rl.rl_utils import (
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
 from model_provider import model_provider
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -142,9 +141,8 @@ def loss_func(
     masked_truncated_from_above = torch.sum(loss_mask_flat * truncated_from_above_flat)
     masked_truncated_from_below = torch.sum(loss_mask_flat * truncated_from_below_flat)
 
-    # With context parallelism every rank holds the full logprobs (gathered after the
-    # CP forward pass in get_logprobs) and therefore computes the identical loss.
-    # No cross-CP reduction is required here.
+    if args.context_parallel_size > 1:
+        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -191,7 +189,7 @@ def loss_func(
     # Note: This information needs to be determined in forward_step where we have access to the batch data
     # The loss_func doesn't have direct access to this information
 
-    return (loss[0], total_tokens.int(), output_dict)
+    return (loss[0] * args.context_parallel_size, total_tokens.int(), output_dict)
 
 
 def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
@@ -400,21 +398,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
-    def _exit_hard_on_uncaught(exc_type, exc, tb):
-        # A fatal error (e.g. rank-0 OOM) must kill this task so slurm tears
-        # the step down. Normal interpreter shutdown hangs forever here:
-        # aiohttp session finalizers raise cross-event-loop errors and leave
-        # non-daemon threads blocking Py_Finalize, so the step sits "running"
-        # on all nodes until preemption. Print and exit without finalizers.
-        import traceback
-
-        traceback.print_exception(exc_type, exc, tb)
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(1)
-
-    sys.excepthook = _exit_hard_on_uncaught
-
     from megatron.inference.utils import add_inference_args
 
     # Temporary for transition to core datasets
@@ -446,11 +429,15 @@ if __name__ == "__main__":
         extra_args_provider=add_inference_args,
         args_defaults={},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    if is_hybrid_model(args):
+        model_cfg = hybrid_config_from_args(args)
+    else:
+        model_cfg = gpt_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,
         None,  # we don't need to build any datasets for RL training
-        partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,
         forward_step,
+        partial(model_provider, _model_builder),
     )
