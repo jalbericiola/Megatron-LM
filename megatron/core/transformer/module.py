@@ -41,6 +41,14 @@ class MegatronModule(torch.nn.Module):
         super().__init__()
         self.config = config
 
+    def post_refit(self) -> None:
+        """Refresh state derived from parameters after an in-place weight refit.
+
+        Refit bypasses the normal checkpoint-load and train/eval lifecycles. Modules
+        that cache values derived from parameters can override this hook; the refit
+        receiver calls it after all parameter and buffer transfers have completed.
+        """
+
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """Override state dict for saving checkpoints Use this function to override the
         state dict for saving checkpoints.
