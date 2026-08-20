@@ -306,15 +306,15 @@ def _collect_weight_fingerprints(core: torch.nn.Module) -> dict:
     if pgc is not None and getattr(pgc, 'tp', None) is not None:
         tp_rank = torch.distributed.get_rank(pgc.tp)
     else:
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
     ep_group = getattr(pgc, 'ep', None) if pgc is not None else None
     if ep_group is not None:
         ep_rank = torch.distributed.get_rank(ep_group)
         ep_size = torch.distributed.get_world_size(ep_group)
     else:
         try:
-            ep_rank = parallel_state.get_expert_model_parallel_rank()
-            ep_size = parallel_state.get_expert_model_parallel_world_size()
+            ep_rank = mpu.get_expert_model_parallel_rank()
+            ep_size = mpu.get_expert_model_parallel_world_size()
         except (AssertionError, AttributeError):
             pass
 
@@ -353,7 +353,7 @@ def verify_model_weights_swap_weight_level(
     train_core = unwrap_model(train_lm)
     inf_core = unwrap_model(inf_lm)
 
-    if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
         raise RuntimeError(
             "verify_model_weights_swap_weight_level currently supports PP=1 only "
             "(param names need layer-offset canonicalization under PP>1)."
