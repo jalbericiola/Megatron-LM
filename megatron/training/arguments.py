@@ -1891,6 +1891,15 @@ def _add_inference_args(parser):
                        'number of cuda graphs may not equal this argument.'
                        'The user can also pass -1, in which case we automatically determine the number of graphs ' \
                        'to capture based on the `max_requests`.')
+    group.add_argument('--inference-dynamic-batching-cuda-graph-spacing',
+                       type=str, default='linear',
+                       choices=['linear', 'exponential', 'quasi'],
+                       help='Spacing of cuda graph sizes when num-cuda-graphs >= 1 '
+                       '(ignored for -1): linear = evenly spaced (default); '
+                       'exponential = geometric ladder from max(8, tp) to max, fine '
+                       'granularity at small decode batches; quasi = geometric ladder '
+                       'floored at the smallest legal batch (tp), covering tiny sizes '
+                       'within the given graph budget.')
     group.add_argument('--inference-dynamic-batching-track-paused-request-events',
                        action='store_true',
                        help='Track paused request ids by adding \'paused\' events '
@@ -2558,11 +2567,15 @@ def _add_rl_args(parser):
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
     group.add_argument('--rl-overlong-filtering', action=argparse.BooleanOptionalAction, type=bool, default=False,
-                        help='DAPO-style overlong filtering: exclude from the loss any trajectory turn that '
-                             'reached --seq-length without emitting an EOS token (truncated at the sequence-length '
-                             'boundary), so the policy is not penalised for a possibly-good generation that simply '
-                             'ran out of room. Implemented by zeroing those turns generation mask (zero loss/grad); '
-                             'advantages are computed earlier and are unaffected. Default is False.')
+                        help='DAPO-style overlong filtering: exclude from the loss any trajectory turn whose '
+                             'generation was stopped by a length cap rather than by the model, so the policy is '
+                             'not penalised for a possibly-good generation that simply ran out of room. Detected '
+                             'from the rollout source truncated_turns flags (finish_reason=length propagated from '
+                             'the inference engine); a turn that reached --seq-length without an EOS token is also '
+                             'treated as truncated (legacy detector, unreachable below the engine generation-room '
+                             'ceiling of seq_length - block_size - 1). Implemented by zeroing those turns '
+                             'generation mask (zero loss/grad); advantages are computed earlier and are '
+                             'unaffected. Default is False.')
     group.add_argument('--rl-profile', action='store_true', default=False,
                         help='Enable RL profiling to collect detailed timer data (JSONL + CSV).')
     group.add_argument('--rl-profile-dir', type=str, default=None,

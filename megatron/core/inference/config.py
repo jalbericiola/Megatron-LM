@@ -196,6 +196,15 @@ class InferenceConfig:
     Due to rounding, the actual number of cuda graphs may not equal this argument.
     """
 
+    cuda_graph_spacing: str = "linear"
+    """
+    Spacing of cuda graph token counts when num_cuda_graphs >= 1 (ignored for
+    the -1 dense auto mode): "linear" = evenly spaced (historical default);
+    "exponential" = geometric ladder from max(8, tp) to max, fine granularity
+    at small decode batches; "quasi" = geometric ladder floored at the smallest
+    legal batch (tp), covering tiny sizes with a bounded graph budget.
+    """
+
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     """ 
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.

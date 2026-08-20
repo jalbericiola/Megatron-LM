@@ -80,6 +80,87 @@ def _assert_consistent_across_ranks(result, ep_group):
         ), f"Token count mismatch across EP ranks: min={tc_min.item()}, max={tc_max.item()}"
 
 
+class TestCUDAGraphSpacingModes:
+    """Verify the exponential/quasi geometric ladders and linear default."""
+
+    @pytest.mark.parametrize("tp_size", [1, 2, 8])
+    @pytest.mark.parametrize("num_cuda_graphs", [4, 16])
+    def test_exponential_ladder(self, tp_size, num_cuda_graphs):
+        counts = CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+            tp_size=tp_size,
+            num_cuda_graphs=num_cuda_graphs,
+            cuda_graph_max_tokens=MAX_TOKENS,
+            cuda_graph_spacing="exponential",
+        )
+        assert counts == sorted(counts, reverse=True)
+        assert len(counts) <= num_cuda_graphs + 1
+        assert counts[0] == (MAX_TOKENS // tp_size) * tp_size
+        assert all(c % tp_size == 0 for c in counts)
+        # geometric spacing: successive ratios roughly constant and > 1
+        if len(counts) >= 4:
+            ratios = [counts[i] / counts[i + 1] for i in range(len(counts) - 1)]
+            assert all(r > 1.0 for r in ratios)
+            # denser at the bottom than a linear ladder: the smallest gap must be
+            # far below the linear step size
+            linear_step = MAX_TOKENS / num_cuda_graphs
+            assert (counts[-2] - counts[-1]) < linear_step
+
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    def test_quasi_ladder_covers_tiny_batches(self, tp_size):
+        counts = CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+            tp_size=tp_size,
+            num_cuda_graphs=16,
+            cuda_graph_max_tokens=MAX_TOKENS,
+            cuda_graph_spacing="quasi",
+        )
+        rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
+        assert counts[-1] == tp_size  # ladder floor = smallest legal batch
+        assert any(c < rounder for c in counts)  # tiny sizes present
+        assert rounder in counts  # nearest-rounding must keep the 8 rung
+        assert counts[0] == (MAX_TOKENS // tp_size) * tp_size
+        # budgeted: far fewer than the -1 dense auto mode would produce
+        dense = CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+            tp_size=tp_size, num_cuda_graphs=-1, cuda_graph_max_tokens=MAX_TOKENS
+        )
+        assert len(counts) < len(dense) / 2
+
+    def test_linear_default_unchanged(self):
+        default = CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+            tp_size=2, num_cuda_graphs=4, cuda_graph_max_tokens=1000
+        )
+        explicit = CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+            tp_size=2, num_cuda_graphs=4, cuda_graph_max_tokens=1000, cuda_graph_spacing="linear"
+        )
+        assert default == explicit == [1000, 752, 504, 256]
+
+    def test_edge_cases(self):
+        for spacing in ("exponential", "quasi"):
+            assert CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+                tp_size=2, num_cuda_graphs=1, cuda_graph_max_tokens=1000, cuda_graph_spacing=spacing
+            ) == [1000]
+            # max below the ladder floor collapses to a single graph
+            assert CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+                tp_size=2, num_cuda_graphs=4, cuda_graph_max_tokens=4, cuda_graph_spacing=spacing
+            ) == [4]
+
+    def test_generate_accepts_spacing(self):
+        graph_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            tp_size=1,
+            num_cuda_graphs=8,
+            cuda_graph_max_tokens=MAX_TOKENS,
+            cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+            max_requests=MAX_REQUESTS,
+            max_tokens=MAX_TOKENS,
+            max_sequence_length=MAX_SEQ_LEN,
+            use_cuda_graphs_for_non_decode_steps=True,
+            cuda_graph_spacing="quasi",
+        )
+        decode_counts = sorted(
+            {bd.token_count for bd in graph_list if bd.prefill_req_count == 0}
+        )
+        assert decode_counts[0] <= CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
+
+
 class TestCUDAGraphTokenCountAlignment:
     """Verify that mixed/prefill graph token counts are a subset of decode graph token counts."""
 

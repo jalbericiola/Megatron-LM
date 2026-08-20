@@ -351,6 +351,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
             if args.inference_cuda_graph_scope != InferenceCudaGraphScope.none
             else None
         ),
+        cuda_graph_spacing=args.inference_dynamic_batching_cuda_graph_spacing,
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,

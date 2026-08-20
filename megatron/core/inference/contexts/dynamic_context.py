@@ -89,6 +89,7 @@ DEPRECATED_ARGS = [
     "kv_lora_rank",
     "qk_pos_emb_head_dim",
     "num_cuda_graphs",
+    "cuda_graph_spacing",
     "materialize_only_last_token_logits",
     "mamba_inference_state_config",
     "use_cuda_graphs_for_non_decode_steps",
@@ -670,6 +671,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=inference_config.num_cuda_graphs,
+                cuda_graph_spacing=getattr(inference_config, "cuda_graph_spacing", "linear"),
                 cuda_graph_max_tokens=cuda_graph_max_tokens,
                 cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,

@@ -216,19 +216,63 @@ class CUDAGraphBatchDimensionBuilder:
     CUDA_GRAPH_ROUNDER = 8
 
     @staticmethod
+    def _calculate_geometric_token_counts(
+        tp_size: int, num_cuda_graphs: int, cuda_graph_max_tokens: int, min_count: int
+    ) -> List[int]:
+        """Geometric ladder of ~num_cuda_graphs token counts over [min_count, max].
+
+        Entries are spaced by a constant ratio (max/min)^(1/(N-1)), then rounded:
+        values >= CUDA_GRAPH_ROUNDER round up to the rounder, everything rounds up
+        to the TP size, and duplicates created by rounding are collapsed (so the
+        result may hold slightly fewer than N entries). The max count is always
+        present. Returned in descending order, matching the linear builder.
+        """
+        rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
+        max_aligned = max((cuda_graph_max_tokens // tp_size) * tp_size, tp_size)
+        min_count = min(max(min_count, 1), max_aligned)
+        if num_cuda_graphs == 1 or min_count >= max_aligned:
+            return [max_aligned]
+        ratio = (max_aligned / min_count) ** (1.0 / (num_cuda_graphs - 1))
+        counts = set()
+        for i in range(num_cuda_graphs):
+            v = int(round(min_count * ratio**i))
+            if v >= rounder:
+                # Nearest multiple (floored at the rounder itself): rounding UP
+                # here erases the low rungs (9.6 -> 16 skips the 8 graph, which
+                # small decode batches need most).
+                v = max(rounder, rounder * int(round(v / rounder)))
+            v = round_up_to_nearest_multiple(v, tp_size)
+            counts.add(min(v, max_aligned))
+        counts.add(max_aligned)
+        return sorted(counts, reverse=True)
+
+    @staticmethod
     def _calculate_cuda_graph_token_counts(
-        tp_size: int, num_cuda_graphs: int, cuda_graph_max_tokens: int
+        tp_size: int,
+        num_cuda_graphs: int,
+        cuda_graph_max_tokens: int,
+        cuda_graph_spacing: str = "linear",
     ) -> List[int]:
         """
         Calculate CUDA graph token counts for a given configuration.
 
-        This method computes evenly-spaced token counts from step_size up to
-        cuda_graph_max_tokens, ensuring proper rounding and TP alignment.
+        Spacing modes (ignored for num_cuda_graphs == -1, which keeps the legacy
+        dense auto ladder):
+          - "linear" (default): evenly-spaced counts from step_size up to
+            cuda_graph_max_tokens — the historical behavior.
+          - "exponential": ~N counts geometrically spaced from
+            max(CUDA_GRAPH_ROUNDER, tp_size) up to max — fine granularity for
+            small decode batches (where padding waste dominates latency), coarse
+            at the top.
+          - "quasi": like "exponential" but the ladder floor is the smallest
+            legal batch (tp_size), so tiny sizes (e.g. 2, 4 at tp=2) get their
+            own graphs — a budgeted, far less dense cousin of the -1 auto mode.
 
         Args:
             tp_size: Tensor parallel size (for alignment)
             num_cuda_graphs: Number of CUDA graphs to generate (must be >= 1)
             cuda_graph_max_tokens: Maximum token count for CUDA graphs (must be > 0)
+            cuda_graph_spacing: "linear" | "exponential" | "quasi"
 
         Returns:
             List of token counts in descending order
@@ -237,6 +281,10 @@ class CUDAGraphBatchDimensionBuilder:
             >>> _calculate_cuda_graph_token_counts
             (tp_size=2, num_cuda_graphs=4, cuda_graph_max_tokens=1000)
             [1000, 752, 504, 256]
+            >>> _calculate_cuda_graph_token_counts
+            (tp_size=2, num_cuda_graphs=8, cuda_graph_max_tokens=1000,
+             cuda_graph_spacing="quasi")
+            [1000, 504, 252, 128, 64, 32, 16, 8, 4, 2][:...]  # geometric, deduped
         """
         if num_cuda_graphs == -1:
             # automatically determine the number of CUDA graphs to
@@ -263,6 +311,19 @@ class CUDAGraphBatchDimensionBuilder:
         assert (
             cuda_graph_max_tokens > 0
         ), f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
+
+        if cuda_graph_spacing == "exponential":
+            return CUDAGraphBatchDimensionBuilder._calculate_geometric_token_counts(
+                tp_size,
+                num_cuda_graphs,
+                cuda_graph_max_tokens,
+                min_count=max(CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER, tp_size),
+            )
+        elif cuda_graph_spacing == "quasi":
+            return CUDAGraphBatchDimensionBuilder._calculate_geometric_token_counts(
+                tp_size, num_cuda_graphs, cuda_graph_max_tokens, min_count=tp_size
+            )
+        assert cuda_graph_spacing == "linear", f"unknown cuda_graph_spacing {cuda_graph_spacing!r}"
 
         # Cuda graph step size.
         cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
@@ -304,6 +365,7 @@ class CUDAGraphBatchDimensionBuilder:
         max_sequence_length: int,
         use_cuda_graphs_for_non_decode_steps: bool,
         num_speculative_tokens: int = 0,
+        cuda_graph_spacing: str = "linear",
     ) -> Tuple[List[InferenceBatchDimensions], Optional[List[int]]]:
         """
         Generate CUDA graph batch dimensions.
@@ -387,6 +449,7 @@ class CUDAGraphBatchDimensionBuilder:
                     tp_size=tp_size,
                     num_cuda_graphs=num_cuda_graphs,
                     cuda_graph_max_tokens=cuda_graph_max_tokens,
+                    cuda_graph_spacing=cuda_graph_spacing,
                 )
             )
 
@@ -399,6 +462,7 @@ class CUDAGraphBatchDimensionBuilder:
                     tp_size=tp_size,
                     num_cuda_graphs=num_cuda_graphs,
                     cuda_graph_max_tokens=cuda_graph_max_tokens_decode,
+                    cuda_graph_spacing=cuda_graph_spacing,
                 )
             )
 
