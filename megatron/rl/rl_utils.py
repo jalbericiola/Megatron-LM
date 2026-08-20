@@ -212,35 +212,8 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
         print_rank_0(f"[Rank 0] prefetched {nbytes / 1024**2:.2f} MB of separate RL inference model weights to GPU (other ranks may vary)")
 
 
-_VERIFY_EXPERT_PARAM_RE = re.compile(r"^(weight|bias)(\d+)$")
-
-
-def _weight_fingerprint_key(name: str, is_expert: bool, is_tp: bool, tp_rank: int,
-                            ep_rank: int, ep_size: int, num_experts: int) -> str:
-    """Layout-independent identity for a parameter shard.
-
-    Per-expert ``weightK``/``biasK`` components are renamed to the GLOBAL
-    expert index using the owning model's own EP rank/size (the same scheme
-    the reshard planner's resolved names use), so a training rank's expert
-    and its post-refit copy on an engine with a different EP size produce the
-    same key. Dense TP-sharded params carry their tp rank (both sides run the
-    same TP width here); DP/CP replicas of a shard map to the same key and
-    are cross-checked for equality.
-    """
-    if is_expert and num_experts and ep_size:
-        parts = []
-        for p in name.split('.'):
-            m = _VERIFY_EXPERT_PARAM_RE.match(p)
-            if m:
-                local_idx = int(m.group(2))
-                global_idx = ep_rank * (num_experts // ep_size) + local_idx
-                parts.append(f"{m.group(1)}{global_idx}")
-            else:
-                parts.append(p)
-        name = '.'.join(parts)
-    if is_tp:
-        name = f"{name}::tp{tp_rank}"
-    return name
+# (weight-level verify keys are built from the resharding module's own
+# ParameterMetadata resolved names — see _collect_weight_fingerprints.)
 
 
 def _compare_weight_fingerprints(gathered: list, max_report: int = 10) -> list[str]:
@@ -298,38 +271,58 @@ def _compare_weight_fingerprints(gathered: list, max_report: int = 10) -> list[s
 
 
 def _collect_weight_fingerprints(core: torch.nn.Module) -> dict:
-    """Fingerprint every named parameter of ``core`` under layout-free keys."""
-    num_experts = getattr(getattr(core, 'config', None), 'num_moe_experts', None) or 0
-    pgc = getattr(core, 'pg_collection', None)
-    tp_rank = 0
-    ep_rank, ep_size = 0, 1
-    if pgc is not None and getattr(pgc, 'tp', None) is not None:
-        tp_rank = torch.distributed.get_rank(pgc.tp)
-    else:
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-    ep_group = getattr(pgc, 'ep', None) if pgc is not None else None
-    if ep_group is not None:
-        ep_rank = torch.distributed.get_rank(ep_group)
-        ep_size = torch.distributed.get_world_size(ep_group)
-    else:
-        try:
-            ep_rank = mpu.get_expert_model_parallel_rank()
-            ep_size = mpu.get_expert_model_parallel_world_size()
-        except (AssertionError, AttributeError):
-            pass
+    """Fingerprint every refit-covered tensor of ``core`` under layout-free keys.
 
+    Uses the resharding module's OWN metadata machinery (named_refit_tensors +
+    extract_param_metadata, which assigns planner resolved names) so keys agree
+    exactly with how the refit matches tensors across models: per-expert
+    weightK/biasK renamed to global expert indices via the model's own EP
+    group, expert TP taken from expt_tp (TE clears parallel_mode under
+    explicit expert comm, so attribute-based detection differs between model
+    builds), PP layer indices canonicalized. Tensors sharded across a >1-wide
+    TP group get a ``::tp{index}`` suffix keyed by actual group width, not the
+    (build-dependent) tensor_model_parallel stamp; equal TP widths on both
+    sides assumed — width-changing refits would need shard-aware comparison.
+    Persistent buffers (e.g. MoE router expert_bias) are covered too, matching
+    the refit's transfer set.
+    """
+    from megatron.core.resharding.utils import (
+        _build_layer_module_prefix_map,
+        extract_param_metadata,
+        named_refit_tensors,
+    )
+
+    pgc = getattr(core, 'pg_collection', None)
+    if pgc is None:
+        raise RuntimeError(
+            "weight-level refit verification requires the model core to expose pg_collection"
+        )
+    num_experts = getattr(getattr(core, 'config', None), 'num_moe_experts', None)
+    rank = torch.distributed.get_rank()
+    layer_prefix_map = _build_layer_module_prefix_map(core)
+    cache: dict = {}
     fps = {}
-    for name, param in core.named_parameters():
-        data = param.data
-        is_expert = not getattr(param, 'allreduce', True)
-        is_tp = bool(getattr(param, 'tensor_model_parallel', False))
-        key = _weight_fingerprint_key(name, is_expert, is_tp, tp_rank, ep_rank, ep_size, num_experts)
-        d64 = data.detach().double()
+    for name, tensor in named_refit_tensors(core):
+        meta = extract_param_metadata(
+            tensor,
+            name,
+            rank,
+            pgc,
+            num_experts=num_experts,
+            layer_module_prefix_map=layer_prefix_map,
+            _rank_list_cache=cache,
+        )
+        key = meta.resolved_name
+        tp_ranks = meta.tensor_parallel_group_ranks
+        if meta.is_tp and tp_ranks and len(tp_ranks) > 1:
+            key = f"{key}::tp{tp_ranks.index(rank)}"
+        data = tensor.detach()
+        d64 = data.double()
         fps[key] = (
             tuple(data.shape),
             d64.sum().item(),
             d64.abs().sum().item(),
-            [float(x) for x in data.detach().flatten()[:4].float().tolist()],
+            [float(x) for x in data.flatten()[:4].float().tolist()],
         )
     return fps
 
