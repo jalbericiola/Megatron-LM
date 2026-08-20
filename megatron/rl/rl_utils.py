@@ -10,6 +10,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -211,6 +212,178 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
         print_rank_0(f"[Rank 0] prefetched {nbytes / 1024**2:.2f} MB of separate RL inference model weights to GPU (other ranks may vary)")
 
 
+_VERIFY_EXPERT_PARAM_RE = re.compile(r"^(weight|bias)(\d+)$")
+
+
+def _weight_fingerprint_key(name: str, is_expert: bool, is_tp: bool, tp_rank: int,
+                            ep_rank: int, ep_size: int, num_experts: int) -> str:
+    """Layout-independent identity for a parameter shard.
+
+    Per-expert ``weightK``/``biasK`` components are renamed to the GLOBAL
+    expert index using the owning model's own EP rank/size (the same scheme
+    the reshard planner's resolved names use), so a training rank's expert
+    and its post-refit copy on an engine with a different EP size produce the
+    same key. Dense TP-sharded params carry their tp rank (both sides run the
+    same TP width here); DP/CP replicas of a shard map to the same key and
+    are cross-checked for equality.
+    """
+    if is_expert and num_experts and ep_size:
+        parts = []
+        for p in name.split('.'):
+            m = _VERIFY_EXPERT_PARAM_RE.match(p)
+            if m:
+                local_idx = int(m.group(2))
+                global_idx = ep_rank * (num_experts // ep_size) + local_idx
+                parts.append(f"{m.group(1)}{global_idx}")
+            else:
+                parts.append(p)
+        name = '.'.join(parts)
+    if is_tp:
+        name = f"{name}::tp{tp_rank}"
+    return name
+
+
+def _compare_weight_fingerprints(gathered: list, max_report: int = 10) -> list[str]:
+    """Compare gathered per-rank fingerprint maps; return mismatch strings.
+
+    ``gathered`` is a list (one element per rank) of
+    ``{"src": {key: (shape, sum, abs_sum, first4)}, "dst": {...}}``.
+    Checks: every dst key exists among src keys; shapes exactly equal;
+    sums/abs-sums/first-values close (loose enough to survive dtype-cast
+    copies, tight enough that a stale replica or swapped expert — the actual
+    refit failure classes — cannot pass); and all replicas of the same key on
+    the SAME side agree with each other.
+    """
+    import math
+
+    def close(a: float, b: float, rtol: float = 1e-3, atol: float = 1e-5) -> bool:
+        return math.isfinite(a) and math.isfinite(b) and abs(a - b) <= atol + rtol * max(abs(a), abs(b))
+
+    problems: list[str] = []
+
+    def build(side: str) -> dict:
+        merged: dict = {}
+        for rank, entry in enumerate(gathered):
+            for key, fp in (entry.get(side) or {}).items():
+                if key in merged:
+                    ref, ref_rank = merged[key]
+                    if tuple(ref[0]) != tuple(fp[0]) or not (
+                        close(ref[1], fp[1]) and close(ref[2], fp[2])
+                        and all(close(x, y, 1e-2, 1e-4) for x, y in zip(ref[3], fp[3]))
+                    ):
+                        problems.append(
+                            f"{side} replica mismatch for {key}: rank{ref_rank}={ref[:3]} "
+                            f"vs rank{rank}={fp[:3]}"
+                        )
+                else:
+                    merged[key] = (fp, rank)
+        return {k: v[0] for k, v in merged.items()}
+
+    src = build("src")
+    dst = build("dst")
+    for key, fp in dst.items():
+        if key not in src:
+            problems.append(f"dst param {key} has NO source counterpart")
+            continue
+        sfp = src[key]
+        if tuple(sfp[0]) != tuple(fp[0]):
+            problems.append(f"shape mismatch for {key}: src={tuple(sfp[0])} dst={tuple(fp[0])}")
+        elif not (close(sfp[1], fp[1]) and close(sfp[2], fp[2])
+                  and all(close(x, y, 1e-2, 1e-4) for x, y in zip(sfp[3], fp[3]))):
+            problems.append(
+                f"value mismatch for {key}: src(sum,abs,first)={sfp[1]:.6e},{sfp[2]:.6e},{sfp[3]}"
+                f" dst={fp[1]:.6e},{fp[2]:.6e},{fp[3]}"
+            )
+    return problems[:max_report] if len(problems) > max_report else problems
+
+
+def _collect_weight_fingerprints(core: torch.nn.Module) -> dict:
+    """Fingerprint every named parameter of ``core`` under layout-free keys."""
+    num_experts = getattr(getattr(core, 'config', None), 'num_moe_experts', None) or 0
+    pgc = getattr(core, 'pg_collection', None)
+    tp_rank = 0
+    ep_rank, ep_size = 0, 1
+    if pgc is not None and getattr(pgc, 'tp', None) is not None:
+        tp_rank = torch.distributed.get_rank(pgc.tp)
+    else:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    ep_group = getattr(pgc, 'ep', None) if pgc is not None else None
+    if ep_group is not None:
+        ep_rank = torch.distributed.get_rank(ep_group)
+        ep_size = torch.distributed.get_world_size(ep_group)
+    else:
+        try:
+            ep_rank = parallel_state.get_expert_model_parallel_rank()
+            ep_size = parallel_state.get_expert_model_parallel_world_size()
+        except (AssertionError, AttributeError):
+            pass
+
+    fps = {}
+    for name, param in core.named_parameters():
+        data = param.data
+        is_expert = not getattr(param, 'allreduce', True)
+        is_tp = bool(getattr(param, 'tensor_model_parallel', False))
+        key = _weight_fingerprint_key(name, is_expert, is_tp, tp_rank, ep_rank, ep_size, num_experts)
+        d64 = data.detach().double()
+        fps[key] = (
+            tuple(data.shape),
+            d64.sum().item(),
+            d64.abs().sum().item(),
+            [float(x) for x in data.detach().flatten()[:4].float().tolist()],
+        )
+    return fps
+
+
+def verify_model_weights_swap_weight_level(
+    train_model: LanguageModule,
+    inference_model: LanguageModule,
+) -> None:
+    """Verify a weight refit by comparing parameter fingerprints, not forwards.
+
+    Topology-independent: valid under any (TP, CP, EP, DP) combination on
+    either side, unlike the forward comparison (invalid under CP>1 training).
+    Every rank fingerprints both models' parameters under layout-free keys
+    (global-expert renaming mirrors the reshard planner's resolved names);
+    rank 0 checks that every destination shard matches its source and that
+    all replicas agree — exactly the refit failure classes (missing
+    replication, wrong expert-to-rank mapping, stale copies).
+    """
+    train_lm = train_model[0] if isinstance(train_model, (list, tuple)) else train_model
+    inf_lm = inference_model[0] if isinstance(inference_model, (list, tuple)) else inference_model
+    train_core = unwrap_model(train_lm)
+    inf_core = unwrap_model(inf_lm)
+
+    if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+        raise RuntimeError(
+            "verify_model_weights_swap_weight_level currently supports PP=1 only "
+            "(param names need layer-offset canonicalization under PP>1)."
+        )
+
+    local = {
+        "src": _collect_weight_fingerprints(train_core),
+        "dst": _collect_weight_fingerprints(inf_core),
+    }
+    world = torch.distributed.get_world_size()
+    gathered: list = [None] * world
+    torch.distributed.all_gather_object(gathered, local)
+
+    problems: list[str] = []
+    if torch.distributed.get_rank() == 0:
+        problems = _compare_weight_fingerprints(gathered)
+    holder = [problems]
+    torch.distributed.broadcast_object_list(holder, src=0)
+    problems = holder[0]
+    if problems:
+        raise AssertionError(
+            "weight-level refit verification FAILED:\n  " + "\n  ".join(problems)
+        )
+    if torch.distributed.get_rank() == 0:
+        logger.info(
+            "weight-level refit verification passed: %d dst shards matched",
+            sum(len(e["dst"]) for e in gathered if e),
+        )
+
+
 def verify_model_weights_swap(
     train_model: LanguageModule,
     inference_model: LanguageModule,
@@ -238,6 +411,23 @@ def verify_model_weights_swap(
         AssertionError: If forward pass outputs do not match within tolerance.
     """
     args = get_args()
+
+    if getattr(args, 'context_parallel_size', 1) > 1:
+        # The training model has CP baked in at module construction (TE ring
+        # attention cp_group, MambaContextParallel all-to-alls, RoPE seq_len
+        # x cp). Feeding it a full, unscattered sequence replicated to every
+        # rank makes each rank compute chunk-logits of a fictitious
+        # seq_len*cp-token zigzag sequence, while a CP=1 inference model
+        # computes true seq_len-token logits — a guaranteed logits-scale
+        # mismatch for ANY refit quality (observed max_diff ~22 on a
+        # byte-correct swap). The training forward is only valid on inputs
+        # scattered per the zigzag CP contract (_scatter_for_context_parallel).
+        raise RuntimeError(
+            "verify_model_weights_swap's forward comparison is invalid when the "
+            "training model uses context parallelism (CP="
+            f"{args.context_parallel_size}); use "
+            "verify_model_weights_swap_weight_level instead."
+        )
 
     # Unwrap models to get the core module
     train_lm = train_model[0] if isinstance(train_model, (list, tuple)) else train_model
@@ -838,12 +1028,18 @@ def get_environment_rollouts(
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
         swap_model_weights(model, inference_model, args.refit_method)
         if args.rl_verify_model_weights_swap:
-            verify_model_weights_swap(
-                train_model=model,
-                inference_model=inference_model,
-                atol=.1,
-                rtol=5e-4,
-            )
+            if args.context_parallel_size > 1:
+                # Forward comparison is invalid under CP>1 training (the
+                # training forward demands zigzag CP-scattered inputs);
+                # compare parameter fingerprints instead.
+                verify_model_weights_swap_weight_level(model, inference_model)
+            else:
+                verify_model_weights_swap(
+                    train_model=model,
+                    inference_model=inference_model,
+                    atol=.1,
+                    rtol=5e-4,
+                )
     else:
         inference_model = model
 
@@ -2591,8 +2787,11 @@ def prepare_trajectories(
     generation_masks = []
     inference_logprobs = []
     # DAPO-style overlong filtering (gated by --rl-overlong-filtering): drop from the
-    # loss any turn truncated at the sequence-length boundary (filled the window without
-    # an EOS). See the per-turn check below.
+    # loss any turn whose generation was stopped by a length cap. Detected from the
+    # rollout's truncated_turns flags (finish_reason='length' propagated by the rollout
+    # source); the legacy length == seq_length detector is kept as a fallback but is
+    # unreachable behind the engine's generation-room clamp (ceiling is
+    # seq_length - block_size - 1). See the per-turn check below.
     overlong_filtering = getattr(get_args(), "rl_overlong_filtering", False)
     overlong_filtered = 0
     for rollout in rollouts:
@@ -2622,17 +2821,28 @@ def prepare_trajectories(
                 trajectory.extend([tokenizer.pad] * (seq_length - length))
                 if generation_mask:
                     generation_mask.extend([False] * (seq_length - length))
-            # DAPO-style overlong filtering: a turn that filled the entire window
-            # (length == seq_length) without ending in EOS was truncated at the
-            # sequence-length boundary. Exclude it from the loss by zeroing its
-            # generation mask -- the same zero-loss/zero-grad mechanism the DP-split
-            # padding below relies on. Advantages were computed upstream (see the
-            # data-parallel split) and are unaffected.
+            # DAPO-style overlong filtering: exclude length-truncated turns from the
+            # loss by zeroing their generation mask -- the same zero-loss/zero-grad
+            # mechanism the DP-split padding below relies on. Advantages were computed
+            # upstream (see the data-parallel split) and are unaffected.
+            # Primary detector: the rollout source's truncated_turns flag (propagated
+            # from the engine's finish_reason='length'). The length == seq_length
+            # fallback predates the engine's generation-room clamp, which ends capped
+            # turns at seq_length - block_size - 1; it can only fire when inference SL
+            # exceeds training seq_length.
+            truncated_turns = getattr(rollout, 'truncated_turns', None)
+            engine_truncated = bool(
+                truncated_turns is not None
+                and turn_idx < len(truncated_turns)
+                and truncated_turns[turn_idx]
+            )
             if (
                 overlong_filtering
                 and generation_mask is not None
-                and length == seq_length
-                and trajectory[length - 1] != tokenizer.eod
+                and (
+                    engine_truncated
+                    or (length == seq_length and trajectory[length - 1] != tokenizer.eod)
+                )
             ):
                 generation_mask = [False] * len(generation_mask)
                 overlong_filtered += 1
@@ -2657,7 +2867,8 @@ def prepare_trajectories(
         rank_str = str(dist.get_rank()) if torch.distributed.is_initialized() else "0"
         logger.info(
             f"[{rank_str}] overlong filtering: zeroed loss for {overlong_filtered} truncated turn(s) "
-            f"(hit seq_length={seq_length} without EOS) out of {len(trajs)} total turns"
+            f"(engine length-cap flag, or hit seq_length={seq_length} without EOS) "
+            f"out of {len(trajs)} total turns"
         )
 
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')

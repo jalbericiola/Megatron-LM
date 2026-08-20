@@ -467,6 +467,19 @@ def _filter_by_ep_local_rank(
     )
     # EP resharding (sizes differ) — skip filter; keep all source candidates.
     if src_ep_size != len(dst_ep_group):
+        if dst_metadata.is_ep and dst_metadata.global_expert_index is None:
+            # Fused/grouped expert tensors (legacy GroupedMLP weight1/weight2,
+            # SequentialMLP local_experts.N.*) carry no per-expert weightK
+            # naming, so resolved-name matching cannot reassign experts across
+            # a CHANGED EP size — no 'ep' sharding descriptor exists and the
+            # transfer would pair shape-mismatched full tensors. Fail loudly
+            # instead of mis-copying.
+            raise RuntimeError(
+                f"EP-changed refit (src EP {src_ep_size} -> dst EP "
+                f"{len(dst_ep_group)}) is unsupported for fused expert tensor "
+                f"{dst_metadata.resolved_name!r}; only per-expert-named "
+                f"(weightK/biasK) formats can be resharded across EP sizes."
+            )
         return src_meta_list
 
     matching = [
