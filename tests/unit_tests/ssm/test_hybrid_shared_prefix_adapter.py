@@ -18,13 +18,28 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 def _relative_l2(reference, actual):
-    return ((reference.float() - actual.float()).norm() / (reference.float().norm() + 1e-9)).item()
+    reference = reference.double().flatten()
+    actual = actual.double().flatten()
+    denominator = reference.norm().clamp_min(torch.finfo(torch.float64).tiny)
+    return ((reference - actual).norm() / denominator).item()
 
 
 def _cosine(reference, actual):
-    reference = reference.float().flatten()
-    actual = actual.float().flatten()
-    return (torch.dot(reference, actual) / (reference.norm() * actual.norm() + 1e-9)).item()
+    reference = reference.double().flatten()
+    actual = actual.double().flatten()
+    denominator = (reference.norm() * actual.norm()).clamp_min(torch.finfo(torch.float64).tiny)
+    return (torch.dot(reference, actual) / denominator).item()
+
+
+def _gradient_norms(reference, actual):
+    reference = reference.double().flatten()
+    actual = actual.double().flatten()
+    return {
+        "reference": reference.norm().item(),
+        "actual": actual.norm().item(),
+        "difference": (reference - actual).norm().item(),
+        "max_abs_difference": (reference - actual).abs().max().item(),
+    }
 
 
 class _SizeOneGroup:
@@ -187,6 +202,19 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity():
             )
             for length in layout.completion_lens
         ]
+        # A squared-output loss after the stack's final RMSNorm is nearly constant at
+        # initialization. Reuse fixed cotangents so this compares a non-degenerate VJP.
+        probe_generator = torch.Generator(device="cuda").manual_seed(19)
+        gradient_probes = [
+            torch.randn(
+                completion.shape,
+                dtype=torch.float32,
+                device="cuda",
+                generator=probe_generator,
+            )
+            / completion.numel() ** 0.5
+            for completion in completions
+        ]
 
         def causal_mask(length):
             return ~torch.tril(torch.ones(1, 1, length, length, dtype=torch.bool, device="cuda"))
@@ -218,7 +246,7 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity():
             dense = dense_outputs()
             shared = shared_outputs()
         forward_errors = [_relative_l2(d, s) for d, s in zip(dense, shared)]
-        assert max(forward_errors) < 0.05
+        assert max(forward_errors) < 0.02
         for layer in stack.layers:
             if hasattr(layer, "self_attention"):
                 assert not hasattr(layer.self_attention, "_shared_prefix_forest")
@@ -237,8 +265,14 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity():
                 completion.grad = None
             stack.zero_grad(set_to_none=True)
 
+        def probe_loss(outputs):
+            return sum(
+                (output.float() * probe).sum()
+                for output, probe in zip(outputs, gradient_probes, strict=True)
+            )
+
         clear_gradients()
-        sum(output.float().square().mean() for output in dense_outputs()).backward()
+        probe_loss(dense_outputs()).backward()
         dense_prefix_grad = prefix.grad.detach().clone()
         dense_completion_grads = [completion.grad.detach().clone() for completion in completions]
         dense_parameter_grads = {
@@ -246,7 +280,7 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity():
         }
 
         clear_gradients()
-        sum(output.float().square().mean() for output in shared_outputs()).backward()
+        probe_loss(shared_outputs()).backward()
         shared_prefix_grad = prefix.grad.detach().clone()
         shared_completion_grads = [completion.grad.detach().clone() for completion in completions]
         shared_parameter_grads = {
@@ -271,6 +305,17 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity():
             name: _cosine(dense_parameter_grads[name], shared_parameter_grads[name])
             for name in dense_parameter_grads
         }
+        gradient_norms = {
+            "prefix": _gradient_norms(dense_prefix_grad, shared_prefix_grad),
+            "completions": [
+                _gradient_norms(dense_grad, shared_grad)
+                for dense_grad, shared_grad in zip(dense_completion_grads, shared_completion_grads)
+            ],
+            "parameters": {
+                name: _gradient_norms(dense_parameter_grads[name], shared_parameter_grads[name])
+                for name in dense_parameter_grads
+            },
+        }
         print(
             "shared-prefix Hybrid parity: "
             f"forward_relative_l2={forward_errors}, "
@@ -279,19 +324,20 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity():
             f"completion_gradient_relative_l2={completion_gradient_errors}, "
             f"completion_gradient_cosine={completion_gradient_cosines}, "
             f"parameter_gradient_relative_l2={parameter_gradient_errors}, "
-            f"parameter_gradient_cosine={parameter_gradient_cosines}"
+            f"parameter_gradient_cosine={parameter_gradient_cosines}, "
+            f"gradient_norms={gradient_norms}"
         )
 
-        assert prefix_gradient_error < 0.20
-        assert prefix_gradient_cosine > 0.75
+        assert prefix_gradient_error < 0.02
+        assert prefix_gradient_cosine > 0.999
         for gradient_error, gradient_cosine in zip(
             completion_gradient_errors, completion_gradient_cosines
         ):
-            assert gradient_error < 0.20
-            assert gradient_cosine > 0.75
+            assert gradient_error < 0.02
+            assert gradient_cosine > 0.999
         for name in dense_parameter_grads:
-            assert parameter_gradient_errors[name] < 0.20
-            assert parameter_gradient_cosines[name] > 0.75
+            assert parameter_gradient_errors[name] < 0.02
+            assert parameter_gradient_cosines[name] > 0.999
     finally:
         Utils.destroy_model_parallel()
 
