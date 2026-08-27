@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import time
 from collections import deque
 from unittest.mock import MagicMock
 
@@ -16,6 +17,8 @@ from megatron.rl.agent.api import (
     RolloutGenerator,
     RolloutGroup,
     RolloutRequest,
+    _BankRecordItem,
+    _RolloutPipeline,
     _SubmissionGate,
 )
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
@@ -67,8 +70,8 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
     async def get_rollout_response(self, request, inference_request):
         return await request.inference_interface.agenerate(inference_request)
 
-    async def prepare_group_rollout(self, request):
-        idx = self._call_count
+    async def prepare_group_rollout(self, request, *, problem_state=None):
+        idx = problem_state["idx"] if problem_state is not None else self._call_count
         self._call_count += 1
         self.prepare_group_rollout_calls += 1
         inference_request = request.inference_interface.prepare_request(
@@ -86,7 +89,11 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
                 num_evictions=[response.num_evictions],
             )
 
-        return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
+        return GroupRolloutParams(
+            inference_request=inference_request,
+            build_rollout=build_rollout,
+            problem_state={"idx": idx},
+        )
 
 
 def test_grouped_rollout_generator_initializes_rollout_bank():
@@ -97,6 +104,117 @@ def test_grouped_rollout_generator_initializes_rollout_bank():
 
 def test_rollout_group_defines_optional_uid():
     assert RolloutGroup.model_fields["uid"].default is None
+
+
+def _banked_pipeline(bank):
+    request = GroupedRolloutRequest(
+        num_groups=1,
+        rollouts_per_group=1,
+        inference_interface=MockInferenceInterface(),
+        submission_granularity="R",
+        consumption_granularity="G",
+    )
+    return _RolloutPipeline(MockGenerator(), request, 1, bank=bank)
+
+
+def test_bank_writer_progresses_without_pumping_asyncio():
+    """The writer keeps draining while the trainer owns the loop thread."""
+    written = []
+    bank = MagicMock()
+
+    def slow_write(records):
+        time.sleep(0.05)
+        written.extend(records)
+
+    bank.write_records.side_effect = slow_write
+    pipeline = _banked_pipeline(bank)
+    pipeline.bank_queue.put(_BankRecordItem("record"))
+    deadline = time.monotonic() + 2
+    while not written and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert written == ["record"]
+
+
+def test_consumed_markers_follow_queued_records():
+    ops = []
+    bank = MagicMock()
+    bank.write_records.side_effect = lambda records: ops.append(("write", list(records)))
+    bank.mark_consumed_many.side_effect = lambda uids, iteration: ops.append(
+        ("mark", list(uids), iteration)
+    )
+    pipeline = _banked_pipeline(bank)
+    pipeline.bank_queue.put(_BankRecordItem("record"))
+    pipeline.enqueue_consumed_markers(["group-1"], iteration=3)
+    pipeline.drain_bank()
+    assert ops == [("write", ["record"]), ("mark", ["group-1"], 3)]
+
+
+def test_bank_drain_is_a_synchronous_barrier():
+    bank = MagicMock()
+    pipeline = _banked_pipeline(bank)
+    pipeline.bank_queue.put(_BankRecordItem("record"))
+    assert pipeline.drain_bank() is None
+    bank.write_records.assert_called_once_with(["record"])
+
+
+def test_weighted_environment_pipelines_share_one_bank_writer():
+    ops = []
+    bank = MagicMock()
+    bank.write_records.side_effect = lambda records: ops.append(("write", list(records)))
+    bank.mark_consumed_many.side_effect = lambda uids, iteration: ops.append(
+        ("mark", list(uids), iteration)
+    )
+    first = _banked_pipeline(bank)
+    second = _banked_pipeline(bank)
+    assert first.bank_queue is second.bank_queue
+    assert first._bank_writer is second._bank_writer
+    first.bank_queue.put(_BankRecordItem("env-a"))
+    second.bank_queue.put(_BankRecordItem("env-b"))
+    second.enqueue_consumed_markers(["group-a", "group-b"], iteration=4)
+    second.drain_bank()
+    marker_index = next(i for i, op in enumerate(ops) if op[0] == "mark")
+    written_before_marker = [record for op in ops[:marker_index] for record in op[1]]
+    assert written_before_marker == ["env-a", "env-b"]
+
+
+def test_collection_transition_is_ordered_between_record_batches():
+    """Lifecycle items flush earlier records before switching the bank segment."""
+    ops = []
+    bank = MagicMock()
+    bank.write_records.side_effect = lambda records: ops.append(("write", list(records)))
+    bank.set_collection.side_effect = lambda iteration: ops.append(
+        ("set_collection", iteration)
+    )
+    pipeline = _banked_pipeline(bank)
+    pipeline.bank_queue.put(_BankRecordItem("old-record"))
+    pipeline.set_bank_collection(8)
+    pipeline.bank_queue.put(_BankRecordItem("new-record"))
+    pipeline.drain_bank()
+    assert ops == [
+        ("write", ["old-record"]),
+        ("set_collection", 8),
+        ("write", ["new-record"]),
+    ]
+
+
+def test_checkpoint_transition_is_ordered_between_record_batches():
+    """Checkpoint compaction executes in the writer FIFO, not beside it."""
+    ops = []
+    bank = MagicMock()
+    bank.write_records.side_effect = lambda records: ops.append(("write", list(records)))
+    bank.checkpoint_preserving_collection.side_effect = lambda iteration: ops.append(
+        ("checkpoint", iteration)
+    )
+    pipeline = _banked_pipeline(bank)
+    pipeline.bank_queue.put(_BankRecordItem("before-checkpoint"))
+    pipeline.compact_bank_at_checkpoint(7)
+    pipeline.bank_queue.put(_BankRecordItem("after-checkpoint"))
+    pipeline.drain_bank()
+    assert ops == [
+        ("write", ["before-checkpoint"]),
+        ("checkpoint", 7),
+        ("write", ["after-checkpoint"]),
+    ]
 
 
 class CountingRewardAgent(RewardOnlyAgent):

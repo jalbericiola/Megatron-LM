@@ -770,7 +770,12 @@ def maybe_get_rollout_bank(args):
         from megatron.rl.rollout_bank import RolloutBank
 
         bank_dir = args.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
-        _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=args.rl_rollout_bank_max_bytes)
+        _ROLLOUT_BANK = RolloutBank(
+            bank_dir,
+            max_bytes=args.rl_rollout_bank_max_bytes,
+            rollouts_per_group=args.grpo_group_size,
+            drop_zero_variance=args.grpo_filter_groups_with_same_reward,
+        )
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
         log_single_rank(
             logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}"
@@ -784,15 +789,55 @@ def get_rollout_bank():
 
 
 def maybe_compact_rollout_bank(iteration):
-    """Compact the bank at a durable-checkpoint boundary (rank-0 no-op otherwise).
+    """Compact the bank at a durable-checkpoint boundary.
 
-    Called from save_checkpoint so the bank's compacted-through T tracks the model
-    checkpoint: groups consumed at marker <= iteration are reclaimed, survivors
-    carry forward.
+    The compaction is a lifecycle item in the writer FIFO. Records and consumption
+    markers before it become durable first; records after it see the collection
+    reopened by ``checkpoint_preserving_collection``.
     """
     bank = get_rollout_bank()
-    if bank is not None:
-        bank.checkpoint(iteration)
+    if bank is None:
+        return
+    pipelines = _active_rollout_pipelines()
+    if pipelines:
+        # Weighted environments share one FIFO/writer, so one handle is sufficient.
+        pipelines[0].compact_bank_at_checkpoint(iteration)
+    else:
+        bank.checkpoint_preserving_collection(iteration)
+
+
+def _active_rollout_pipelines():
+    """Return active per-environment pipelines in the refactored off-policy agent."""
+    if _ROLLOUT_AGENT is None:
+        return []
+    agents = (
+        _ROLLOUT_AGENT.agents
+        if isinstance(_ROLLOUT_AGENT, WeightedMultiTask)
+        else [_ROLLOUT_AGENT]
+    )
+    return [
+        pipeline
+        for agent in agents
+        if (
+            pipeline := getattr(agent, "_active_pipeline", None)
+            or getattr(agent, "_last_pipeline", None)
+        )
+        is not None
+    ]
+
+
+def _enqueue_rollout_bank_consumed_markers(rollouts, iteration):
+    """Queue markers behind all producers' records without blocking training."""
+    uids = [group.uid for group in rollouts if group and group.uid]
+    if not uids:
+        return
+    pipelines = _active_rollout_pipelines()
+    if pipelines:
+        # The older weighted-agent layout has one pipeline per environment;
+        # their bank queues share one FIFO/writer, so any handle is sufficient.
+        pipelines[0].enqueue_consumed_markers(uids, iteration)
+    else:
+        get_rollout_bank().mark_consumed_many(uids, iteration)
 
 
 def _get_or_create_rollout_agent(args, parallel_generation_tasks):
@@ -946,7 +991,14 @@ def get_environment_rollouts(
                             f"RolloutBank restored {total_restored_groups} completed groups from "
                             f"disk at resume iteration {args.iteration}",
                         )
-                bank.set_collection(args.curr_iteration)
+                # Collection rotation rides the writer FIFO so records before the
+                # boundary land in the old segment and records after it land in the
+                # new one without a queue.join()/new-producer race.
+                pipelines = _active_rollout_pipelines()
+                if pipelines:
+                    pipelines[0].set_bank_collection(args.curr_iteration)
+                else:
+                    bank.set_collection(args.curr_iteration)
 
             with nvtx_range("rl/inference-setup", time=True):
                 rollout_generator = get_rollout_generator(
@@ -986,11 +1038,15 @@ def get_environment_rollouts(
                             except StopAsyncIteration:
                                 break
                     # Record consumption for every group handed to the trainer. On a
-                    # rollback (restart at T < this step) the marker > T rule restores
-                    # these; once the checkpoint advances past this step they are pruned.
+                    # rollback (restart before this update) the marker > T rule restores
+                    # these; once a checkpoint includes the update they are pruned.
+                    # The markers ride the bank's FIFO queue behind the records they
+                    # name, so this returns immediately instead of idling the GPUs
+                    # on a full backlog drain; the writer thread keeps flushing
+                    # while the training step runs.
                     if bank is not None:
-                        bank.mark_consumed_many(
-                            (group.uid for group in rollouts), args.curr_iteration + 1
+                        _enqueue_rollout_bank_consumed_markers(
+                            rollouts, args.curr_iteration + 1
                         )
                 else:
                     # Just set up space to collect the rollouts
@@ -2030,6 +2086,32 @@ def compute_group_stats(
     return stats
 
 
+def _safe_metric_key(label):
+    """Sanitize a free-form label for use inside a wandb metric key."""
+    return ''.join(c if c.isalnum() or c in ('_', '-') else '_' for c in label)
+
+
+def _bounded_artifact_key(key, limit=100):
+    """Bound a metric key so the artifact name wandb derives from it stays within wandb's limit.
+
+    wandb rejects artifact names longer than 128 characters with a ValueError
+    (`NAME_MAXLEN` in wandb/sdk/artifacts/_validators.py)
+
+    A table or plot logged under key K is stored as artifact 'run-{run.id}-{K}'
+    (13 chars of prefix with the default 8-char run id)
+
+    wandb.plot.* charts log their backing table under '{K}_table' (6 more)
+
+    keys containing characters outside [a-zA-Z0-9_.-] (env ids contain ':') are given
+    a 7-char CRC suffix by wandb's sanitizer.
+
+    Worst-case key budget: 128 - 13 - 6 - 7 = 102 ~= 100.
+    """
+    if len(key) <= limit:
+        return key
+    # 9 = 1 ('_' separator) + 8 (hex chars of the md5 digest).
+    digest = hashlib.md5(key.encode()).hexdigest()[:8]
+    return f'{key[: limit - 9]}_{digest}'
 
 def prep_wandb_metrics(
         wandb_writer: wandb_run.Run,
@@ -2291,12 +2373,24 @@ def _collect_rollout_pipeline_metrics() -> dict:
         else [_ROLLOUT_AGENT]
     )
     metrics: dict = {}
+    total_restored = 0
+    total_yielded = 0
     for sub_agent in sub_agents:
         pipeline = getattr(sub_agent, "_active_pipeline", None)
         if pipeline is None:
             continue
         env_id = getattr(sub_agent, "env_id", "") or "rollout"
         gate = pipeline.gate
+        restored_count = pipeline.restored_count
+        yielded_count = pipeline.yielded_count
+        if yielded_count:
+            restored_percentage = 100.0 * restored_count / yielded_count
+            fresh_percentage = 100.0 - restored_percentage
+        else:
+            restored_percentage = 0.0
+            fresh_percentage = 0.0
+        total_restored += restored_count
+        total_yielded += yielded_count
         metrics.update({
             # Queue sizes and gate held are point-in-time reads.
             f"{env_id}_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
@@ -2316,8 +2410,12 @@ def _collect_rollout_pipeline_metrics() -> dict:
             f"{env_id}_pipeline_prepared_count": pipeline.prepared_count,
             f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
             f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
-            f"{env_id}_pipeline_restored_count": pipeline.restored_count,
-            f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
+            f"{env_id}_pipeline_restored_count": restored_count,
+            f"{env_id}_pipeline_yielded_count": yielded_count,
+            f"{env_id}_restored_groups": restored_count,
+            f"{env_id}_restored_groups_percentage": restored_percentage,
+            f"{env_id}_fresh_groups_percentage": fresh_percentage,
+            f"{env_id}_yielded_groups": yielded_count,
         })
         for name, samples in (
             ("infer_queue_dwell", pipeline.infer_queue_dwell),
@@ -2344,6 +2442,10 @@ def _collect_rollout_pipeline_metrics() -> dict:
         gate.prepare_blocked_seconds = 0.0
         gate.acquire_calls = 0
         gate.release_calls = 0
+
+    if metrics:
+        metrics["rollout_pipeline_restored_count"] = total_restored
+        metrics["rollout_pipeline_yielded_count"] = total_yielded
 
     # WeightedMultiTask work distribution (agent_slots / agent_pgts).
     dist = getattr(_ROLLOUT_AGENT, "latest_distribution", None)

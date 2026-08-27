@@ -1387,3 +1387,59 @@ class TestRLUtils:
 
         # Raw RLE expansion yields (epoch, token_count) run lengths.
         assert rl_utils.expand_epoch_segments([[(0, 3), (4, 5)]], [10]) == [(3, 4), (5, 6)]
+
+
+def _ledger_record(epoch, num_evictions=0):
+    return FinishedRequestRecord(
+        policy_epoch=[(0, epoch)], kv_cache_epoch=[(0, epoch)], num_evictions=num_evictions
+    )
+
+
+class TestDurableBankBarriers:
+    """The rollout bank's durability barriers on the production path.
+
+    Nothing else exercises rl_utils with a bank attached, so a rename in the bank
+    or pipeline can silently orphan these call sites. That already happened once:
+    a stale ``bank.flush()`` survived a refactor that deleted the method.
+    """
+
+    def test_consumption_marks_ride_the_bank_queue(self):
+        """Markers queue behind the records they name instead of forcing a drain.
+
+        A blocking drain at the inference-to-training switch idles the GPUs on
+        the whole write backlog; FIFO order through the pipeline's writer thread
+        provides the same records-before-marker guarantee without the wait. A
+        direct ``mark_consumed_many`` call here would silently drop that
+        ordering, so its absence is asserted too.
+        """
+        import inspect
+
+        from megatron.rl import rl_utils
+        from megatron.rl.agent.api import _RolloutPipeline
+        from megatron.rl.rollout_bank import RolloutBank
+
+        source = inspect.getsource(rl_utils.get_environment_rollouts)
+        assert "enqueue_consumed_markers" in source, "consumption markers are not recorded"
+        assert (
+            "mark_consumed_many" not in source
+        ), "a direct marker write bypasses the FIFO records-before-marker ordering"
+        assert "set_bank_collection" in source, (
+            "collection rotation bypasses the FIFO lifecycle boundary"
+        )
+        assert hasattr(_RolloutPipeline, "enqueue_consumed_markers")
+        assert hasattr(_RolloutPipeline, "set_bank_collection")
+        assert hasattr(_RolloutPipeline, "drain_bank")
+        assert not hasattr(
+            RolloutBank, "flush"
+        ), "a stale bank.flush() call site would AttributeError at runtime"
+
+    def test_compaction_uses_the_writer_fifo_before_reclaiming_segments(self):
+        """Compaction is ordered behind queued records and consumption markers."""
+        import inspect
+
+        from megatron.rl import rl_utils
+
+        source = inspect.getsource(rl_utils.maybe_compact_rollout_bank)
+        assert "compact_bank_at_checkpoint" in source, (
+            "compaction bypasses the FIFO lifecycle boundary"
+        )

@@ -166,7 +166,9 @@ class WeightedMultiTask(
 
         return final_counts
 
-    async def prepare_group_rollout(self, request: GroupedRolloutRequest) -> GroupRolloutParams:
+    async def prepare_group_rollout(
+        self, request: GroupedRolloutRequest, *, problem_state: dict | None = None
+    ) -> GroupRolloutParams:
         raise NotImplementedError(
             "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
         )

@@ -277,15 +277,17 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         )
 
     async def prepare_group_rollout(
-        self,
-        request: GroupedRolloutRequest,
+        self, request: GroupedRolloutRequest, *, problem_state: dict | None = None
     ) -> GroupRolloutParams:
+        """Prepare one group, either from a fresh draw or restored problem state."""
         assert self.max_turns == 1, (
             "Multi-turn episodes (max_turns > 1) are not supported by the refactored "
             "grouped rollout pipeline; only the non-grouped rollout path supports them."
         )
-
-        prompt, golden = await self.get_prompt(validation=request.validation)
+        if problem_state is None:
+            prompt, golden = await self.get_prompt(validation=request.validation)
+        else:
+            prompt, golden = problem_state["prompt"], problem_state["golden"]
 
         inference_request = request.inference_interface.prepare_request(
             prompt, request.generation_args
@@ -294,6 +296,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         return GroupRolloutParams(
             inference_request=inference_request,
             build_rollout=functools.partial(self._rollout_from_response, request, golden=golden),
+            problem_state={"prompt": prompt, "golden": golden},
         )
 
     async def _evaluation(

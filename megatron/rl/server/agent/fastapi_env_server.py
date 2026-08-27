@@ -29,6 +29,7 @@ from ...agent.api import (
     RolloutRequest,
     TokenRollout,
 )
+from ...agent.registry import get_agent_class
 from ...server.api import (
     EnvironmentServer,
     InferenceServer,
@@ -118,8 +119,7 @@ class FastAPIEnvServer(EnvironmentServer):
         return rollouts
 
     async def prepare_group_rollout(
-        self,
-        request: GroupedRolloutRequest,
+        self, request: GroupedRolloutRequest, *, problem_state: dict | None = None
     ) -> GroupRolloutParams:
         raise NotImplementedError(
             "FastAPIEnvServer overrides get_grouped_rollouts; prepare_group_rollout is not used."
