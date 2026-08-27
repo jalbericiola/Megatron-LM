@@ -14,6 +14,10 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid.shared_prefix import (
+    SharedPrefixLayout,
+    forward_hybrid_stack_shared_prefix,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -434,12 +438,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
+        shared_prefix_layout: Optional[SharedPrefixLayout] = None,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given or the final hidden units
+
+        ``shared_prefix_layout`` explicitly selects the CP1/TP1 star path. In that path the
+        packed input is ``[prefix, completion_1, ..., completion_G]`` with batch size one; the
+        layout owns the exact tree mask and prefix-continued RoPE positions. The normal decoder
+        path is unchanged when the argument is ``None``.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -453,6 +463,47 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         in_inference_mode = InferenceMode.is_active()
+
+        if shared_prefix_layout is not None:
+            if in_inference_mode or inference_context is not None:
+                raise NotImplementedError("shared-prefix Hybrid forward is training-only")
+            if attention_mask is not None:
+                raise ValueError(
+                    "shared-prefix Hybrid forward owns its tree mask and requires attention_mask=None"
+                )
+            if labels is not None:
+                raise NotImplementedError(
+                    "shared-prefix Hybrid forward requires external next-token loss computation"
+                )
+            if packed_seq_params is not None:
+                raise ValueError(
+                    "shared_prefix_layout and packed_seq_params are mutually exclusive"
+                )
+            if padding_mask is not None:
+                raise ValueError("shared-prefix Hybrid forward does not accept padding_mask")
+            if not self.pre_process or not self.post_process or self.vp_stage is not None:
+                raise NotImplementedError(
+                    "shared-prefix HybridModel forward currently requires a complete PP1 model"
+                )
+            if self.mtp_process:
+                raise NotImplementedError("shared-prefix Hybrid forward does not support MTP")
+            if self.position_embedding_type != 'rope' or self.config.multi_latent_attention:
+                raise NotImplementedError(
+                    "shared-prefix Hybrid forward requires standard RoPE attention"
+                )
+            if self.config.recompute_granularity == 'full':
+                raise NotImplementedError(
+                    "shared-prefix Hybrid forward does not yet support full-layer recomputation"
+                )
+            if decoder_input is None and (
+                input_ids is None
+                or input_ids.ndim != 2
+                or input_ids.shape[0] != 1
+                or input_ids.shape[1] != shared_prefix_layout.total_len
+            ):
+                raise ValueError(
+                    "shared-prefix Hybrid input_ids must have shape [1, layout.total_len]"
+                )
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -485,7 +536,24 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        if shared_prefix_layout is not None:
+            if decoder_input is None:
+                raise RuntimeError("shared-prefix Hybrid embedding did not produce decoder input")
+            if decoder_input.ndim != 3 or decoder_input.shape[:2] != (
+                shared_prefix_layout.total_len,
+                1,
+            ):
+                raise ValueError(
+                    "shared-prefix Hybrid decoder input must have shape "
+                    "[layout.total_len, 1, hidden]"
+                )
+            rotary_table = self.rotary_pos_emb.get_emb(
+                shared_prefix_layout.prefix_len + max(shared_prefix_layout.completion_lens)
+            )
+            rotary_pos_emb = rotary_table.index_select(
+                0, shared_prefix_layout.position_ids(rotary_table.device)
+            )
+        elif self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
@@ -520,14 +588,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
         # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-        )
+        if shared_prefix_layout is not None:
+            hidden_states = forward_hybrid_stack_shared_prefix(
+                self.decoder, decoder_input, shared_prefix_layout, rotary_pos_emb=rotary_pos_emb
+            )
+        else:
+            hidden_states = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+            )
 
         output_weight = None
         if self.share_embeddings_and_output_weights:

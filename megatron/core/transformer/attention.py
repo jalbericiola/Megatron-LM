@@ -1542,7 +1542,34 @@ class Attention(MegatronModule, ABC):
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
-        if self.checkpoint_core_attention and self.training:
+        shared_prefix_forest = getattr(self, "_shared_prefix_forest", None)
+        if shared_prefix_forest is not None:
+            if inference_context is not None or packed_seq_params is not None:
+                raise NotImplementedError(
+                    "shared-prefix fused attention only supports static, unpacked training"
+                )
+            if attention_mask is not None or attention_bias is not None:
+                raise ValueError(
+                    "shared-prefix fused attention owns its tree mask and does not accept a mask/bias"
+                )
+            if query.dtype not in (torch.float16, torch.bfloat16):
+                raise TypeError("shared-prefix fused attention requires fp16 or bf16 Q/K/V")
+
+            from megatron.core.models.hybrid.shared_prefix_fused import (
+                flash_composed_forest_attention,
+            )
+
+            softmax_scale = self.config.softmax_scale or query.shape[-1] ** -0.5
+            if self.config.apply_query_key_layer_scaling:
+                softmax_scale /= max(1, self.layer_number)
+            with core_attn_manager as query:
+                core_attn_out = flash_composed_forest_attention(
+                    query, key, value, shared_prefix_forest, scale=softmax_scale
+                )
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[query, key, value]
+            )
+        elif self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
