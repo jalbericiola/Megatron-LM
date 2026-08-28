@@ -446,10 +446,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         It either returns the Loss values if labels are given or the final hidden units
 
-        ``shared_prefix_layout`` explicitly selects the CP1/TP1 star path. In that path the
-        packed input is ``[prefix, completion_1, ..., completion_G]`` with batch size one; the
+        ``shared_prefix_layout`` explicitly selects the TP1 star path. The global packed input is
+        ``[prefix, completion_1, ..., completion_G, optional_CP_padding]`` with batch size one;
+        CP1 receives it whole, while CP>1 receives standard two-chunk zigzag sequence shards. The
         layout owns the exact tree mask and prefix-continued RoPE positions. The normal decoder
-        path is unchanged when the argument is ``None``.
+        path is unchanged when the argument is ``None``. With ``labels=None``, CP>1 logits remain
+        ``[1, physical_len/CP, vocab]`` in the input shard's zigzag token order; this model does not
+        gather logits across CP.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -495,15 +498,24 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 raise NotImplementedError(
                     "shared-prefix Hybrid forward does not yet support full-layer recomputation"
                 )
-            if decoder_input is None and (
-                input_ids is None
-                or input_ids.ndim != 2
-                or input_ids.shape[0] != 1
-                or input_ids.shape[1] != shared_prefix_layout.total_len
-            ):
-                raise ValueError(
-                    "shared-prefix Hybrid input_ids must have shape [1, layout.total_len]"
-                )
+            if decoder_input is None:
+                cp_size = self.pg_collection.cp.size()
+                if input_ids is None or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+                    raise ValueError(
+                        "shared-prefix Hybrid input_ids must have shape [1, physical_len/CP]"
+                    )
+                physical_len = input_ids.shape[1] * cp_size
+                if cp_size == 1 and physical_len != shared_prefix_layout.total_len:
+                    raise ValueError(
+                        "shared-prefix CP1 input_ids length must equal layout.total_len"
+                    )
+                if cp_size > 1 and (
+                    physical_len % (2 * cp_size)
+                    or not 0 <= physical_len - shared_prefix_layout.total_len < 2 * cp_size
+                ):
+                    raise ValueError(
+                        "shared-prefix CP input_ids must be minimally padded to a 2*CP multiple"
+                    )
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -539,20 +551,26 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if shared_prefix_layout is not None:
             if decoder_input is None:
                 raise RuntimeError("shared-prefix Hybrid embedding did not produce decoder input")
-            if decoder_input.ndim != 3 or decoder_input.shape[:2] != (
-                shared_prefix_layout.total_len,
-                1,
-            ):
+            cp_group = self.pg_collection.cp
+            cp_size = cp_group.size()
+            physical_len = decoder_input.shape[0] * cp_size
+            if decoder_input.ndim != 3 or decoder_input.shape[1] != 1:
                 raise ValueError(
                     "shared-prefix Hybrid decoder input must have shape "
-                    "[layout.total_len, 1, hidden]"
+                    "[physical_len/CP, 1, hidden]"
                 )
             rotary_table = self.rotary_pos_emb.get_emb(
                 shared_prefix_layout.prefix_len + max(shared_prefix_layout.completion_lens)
             )
-            rotary_pos_emb = rotary_table.index_select(
-                0, shared_prefix_layout.position_ids(rotary_table.device)
+            global_position_ids = shared_prefix_layout.padded_position_ids(
+                physical_len, rotary_table.device
             )
+            if cp_size > 1:
+                local_indices = shared_prefix_layout.cp_local_indices(
+                    physical_len, cp_size, cp_group.rank(), rotary_table.device
+                )
+                global_position_ids = global_position_ids.index_select(0, local_indices)
+            rotary_pos_emb = rotary_table.index_select(0, global_position_ids)
         elif self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params

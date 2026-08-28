@@ -1557,15 +1557,24 @@ class Attention(MegatronModule, ABC):
 
             from megatron.core.models.hybrid.shared_prefix_fused import (
                 flash_composed_forest_attention,
+                flash_composed_forest_attention_cp,
             )
 
             softmax_scale = self.config.softmax_scale or query.shape[-1] ** -0.5
-            if self.config.apply_query_key_layer_scaling:
-                softmax_scale /= max(1, self.layer_number)
             with core_attn_manager as query:
-                core_attn_out = flash_composed_forest_attention(
-                    query, key, value, shared_prefix_forest, scale=softmax_scale
-                )
+                if self.pg_collection.cp.size() > 1:
+                    core_attn_out = flash_composed_forest_attention_cp(
+                        query,
+                        key,
+                        value,
+                        shared_prefix_forest,
+                        cp_group=self.pg_collection.cp,
+                        scale=softmax_scale,
+                    )
+                else:
+                    core_attn_out = flash_composed_forest_attention(
+                        query, key, value, shared_prefix_forest, scale=softmax_scale
+                    )
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]
             )
