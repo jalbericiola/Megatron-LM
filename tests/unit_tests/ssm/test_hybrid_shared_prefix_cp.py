@@ -28,10 +28,21 @@ class _FakeGroup:
         return self._rank
 
 
-def _validation_stack(cp_size: int, *, layers=(), query_heads=4, kv_heads=1):
+def _validation_stack(
+    cp_size: int,
+    *,
+    tp_size: int = 1,
+    sequence_parallel: bool | None = None,
+    layers=(),
+    query_heads=4,
+    kv_heads=1,
+):
+    if sequence_parallel is None:
+        sequence_parallel = tp_size > 1
     config = SimpleNamespace(
+        tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
-        sequence_parallel=False,
+        sequence_parallel=sequence_parallel,
         recompute_granularity=None,
         fine_grained_activation_offloading=False,
         cuda_graph_impl="none",
@@ -47,19 +58,23 @@ def _validation_stack(cp_size: int, *, layers=(), query_heads=4, kv_heads=1):
         num_attention_heads=query_heads,
         num_query_groups=kv_heads,
     )
+    tp_group = _FakeGroup(tp_size)
+    cp_group = _FakeGroup(cp_size)
     return SimpleNamespace(
-        tp_group=_FakeGroup(1),
+        tp_group=tp_group,
         pp_group=_FakeGroup(1),
-        pg_collection=SimpleNamespace(cp=_FakeGroup(cp_size)),
+        pg_collection=SimpleNamespace(tp=tp_group, cp=cp_group),
         config=config,
         layers=list(layers),
     )
 
 
-def _stub_attention_layer():
+def _stub_attention_layer(*, tp_size=1, cp_size=1, local_kv_heads=1):
     attention = object.__new__(SelfAttention)
     torch.nn.Module.__init__(attention)
     attention.checkpoint_core_attention = False
+    attention.num_query_groups_per_partition = local_kv_heads
+    attention.pg_collection = SimpleNamespace(tp=_FakeGroup(tp_size), cp=_FakeGroup(cp_size))
     layer = object.__new__(TransformerLayer)
     torch.nn.Module.__init__(layer)
     layer.self_attention = attention
@@ -142,7 +157,10 @@ def test_cp_validation_rejects_unequal_destination_kv_widths_before_forward():
     # but the equal-split all-to-all cannot represent the aggregate layout.
     layout = SharedPrefixLayout(prefix_len=3, completion_lens=[1, 2])
     stack = _validation_stack(
-        cp_size=3, layers=[_stub_attention_layer()], query_heads=12, kv_heads=2
+        cp_size=3,
+        layers=[_stub_attention_layer(cp_size=3, local_kv_heads=2)],
+        query_heads=12,
+        kv_heads=2,
     )
 
     with pytest.raises(NotImplementedError, match="equal KV-head widths"):
@@ -173,19 +191,106 @@ def test_cp_validation_rejects_nonminimal_or_misaligned_physical_length():
         _validate_hybrid_stack(stack, torch.empty(8, 1, 8, dtype=torch.bfloat16), layout)
 
 
-def test_cp_validation_keeps_tp_and_sequence_parallel_fail_closed():
+def test_tp_sp_validation_accepts_canonical_minimal_padding():
     layout = SharedPrefixLayout(prefix_len=3, completion_lens=[2, 4])
-    hidden_states = torch.empty(6, 1, 8, dtype=torch.bfloat16)
+    # TP2/CP1: total=9 -> canonical 2*TP*CP quantum=4 -> physical=12 -> local S=6.
+    _validate_hybrid_stack(
+        _validation_stack(cp_size=1, tp_size=2), torch.empty(6, 1, 8, dtype=torch.bfloat16), layout
+    )
+    # TP2/CP2: total=9 -> canonical quantum=8 -> physical=16 -> local S=4.
+    _validate_hybrid_stack(
+        _validation_stack(cp_size=2, tp_size=2), torch.empty(4, 1, 8, dtype=torch.bfloat16), layout
+    )
 
-    tp_stack = _validation_stack(cp_size=2)
-    tp_stack.tp_group = _FakeGroup(4)
-    with pytest.raises(NotImplementedError, match="TP1 only"):
+
+def test_tp_sp_explicit_padding_multiple_can_exceed_topology_quantum():
+    # Q=2*TP*CP=8, while lowering chose M=16. P2 plus each logical length 1 pads
+    # each dense branch to 16, hence each physical post-prefix span is 14. The star
+    # totals 30 and receives the minimal two-row final pad to global physical 32.
+    layout = SharedPrefixLayout(
+        prefix_len=2, completion_lens=[14, 14], logical_completion_lens=[1, 1], padding_multiple=16
+    )
+    stack = _validation_stack(cp_size=2, tp_size=2)
+    _validate_hybrid_stack(stack, torch.empty(8, 1, 8, dtype=torch.bfloat16), layout)
+
+    with pytest.raises(ValueError, match="provided together"):
+        SharedPrefixLayout(prefix_len=2, completion_lens=[14, 14], logical_completion_lens=[1, 1])
+    with pytest.raises(ValueError, match="divisible by the topology quantum"):
+        _validate_hybrid_stack(
+            stack,
+            torch.empty(8, 1, 8, dtype=torch.bfloat16),
+            SharedPrefixLayout(
+                prefix_len=2,
+                completion_lens=[14, 14],
+                logical_completion_lens=[1, 1],
+                padding_multiple=12,
+            ),
+        )
+    with pytest.raises(ValueError, match="minimal per-branch padding"):
+        _validate_hybrid_stack(
+            stack,
+            torch.empty(8, 1, 8, dtype=torch.bfloat16),
+            SharedPrefixLayout(
+                prefix_len=2,
+                completion_lens=[13, 14],
+                logical_completion_lens=[1, 1],
+                padding_multiple=16,
+            ),
+        )
+
+
+def test_tp1_cp1_explicit_layout_accepts_odd_padding_multiple():
+    # TP1/CP1 has Q=1. P1 + logical lengths 1,2 minimally pad to M3, giving
+    # physical completion spans 2,2 and a star total 5 padded globally to 6.
+    layout = SharedPrefixLayout(
+        prefix_len=1, completion_lens=[2, 2], logical_completion_lens=[1, 2], padding_multiple=3
+    )
+    _validate_hybrid_stack(
+        _validation_stack(cp_size=1), torch.empty(6, 1, 8, dtype=torch.bfloat16), layout
+    )
+
+
+def test_tp_sp_validation_rejects_misaligned_or_nonminimal_padding():
+    layout = SharedPrefixLayout(prefix_len=3, completion_lens=[2, 4])
+    stack = _validation_stack(cp_size=2, tp_size=2)
+
+    # Physical=12 is divisible by TP*CP but not the negotiated 2*TP*CP quantum.
+    with pytest.raises(ValueError, match=r"divisible by 2 \* tensor parallel"):
+        _validate_hybrid_stack(stack, torch.empty(3, 1, 8, dtype=torch.bfloat16), layout)
+
+    # Physical=24 is aligned but skips the minimal physical=16 representation.
+    with pytest.raises(ValueError, match=r"minimal trailing pad to a 2\*TP\*CP"):
+        _validate_hybrid_stack(stack, torch.empty(6, 1, 8, dtype=torch.bfloat16), layout)
+
+
+def test_tp_sp_validation_fails_closed_without_matching_topology():
+    layout = SharedPrefixLayout(prefix_len=3, completion_lens=[2, 4])
+    hidden_states = torch.empty(4, 1, 8, dtype=torch.bfloat16)
+
+    tp_stack = _validation_stack(cp_size=2, tp_size=2, sequence_parallel=False)
+    with pytest.raises(NotImplementedError, match="TP>1 requires sequence parallelism"):
         _validate_hybrid_stack(tp_stack, hidden_states, layout)
 
     sp_stack = _validation_stack(cp_size=2)
     sp_stack.config.sequence_parallel = True
-    with pytest.raises(NotImplementedError, match="does not support sequence parallelism"):
+    with pytest.raises(NotImplementedError, match="sequence parallelism requires TP>1"):
         _validate_hybrid_stack(sp_stack, hidden_states, layout)
+
+    mismatched_config = _validation_stack(cp_size=2, tp_size=2)
+    mismatched_config.config.tensor_model_parallel_size = 4
+    with pytest.raises(RuntimeError, match="config does not match"):
+        _validate_hybrid_stack(mismatched_config, hidden_states, layout)
+
+
+def test_cp_attention_validation_uses_tp_local_q_and_kv_heads():
+    # Global Q12/KV3/TP3/CP2 cuts unequal global KV groups, but the actual tensors on each
+    # TP rank are Q4/KV1 and are a valid CP2 geometry. This catches accidental validation of
+    # the global config values instead of the post-TP Q/K/V widths.
+    layout = SharedPrefixLayout(prefix_len=3, completion_lens=[2, 7])  # total=12
+    attention = _stub_attention_layer(tp_size=3, cp_size=2, local_kv_heads=1)
+    stack = _validation_stack(cp_size=2, tp_size=3, layers=[attention], query_heads=12, kv_heads=3)
+    # Canonical 2*TP*CP quantum=12, two local tokens per TP/CP rank.
+    _validate_hybrid_stack(stack, torch.empty(2, 1, 8, dtype=torch.bfloat16), layout)
 
 
 def test_cp_mamba_default_uses_optimized_state_fork(monkeypatch):

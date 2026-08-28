@@ -31,6 +31,30 @@ from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def _expert_bias_token_counts(
+    routing_map: torch.Tensor,
+    padding_mask: Optional[torch.Tensor] = None,
+    token_multiplicities: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Count routed tokens, optionally reconstructing logical token multiplicity."""
+    if padding_mask is not None:
+        padding_mask = padding_mask.reshape(-1)
+        if padding_mask.shape[0] != routing_map.shape[0]:
+            raise ValueError("MoE padding mask must contain one value per routed token")
+        routing_map = routing_map & (~padding_mask).unsqueeze(-1)
+    if token_multiplicities is None:
+        return routing_map.sum(dim=0)
+
+    token_multiplicities = token_multiplicities.reshape(-1)
+    if token_multiplicities.shape[0] != routing_map.shape[0]:
+        raise ValueError("MoE token multiplicities must contain one value per routed token")
+    if token_multiplicities.device != routing_map.device:
+        raise ValueError("MoE token multiplicities must be on the routing-map device")
+    return (routing_map.to(token_multiplicities.dtype) * token_multiplicities.unsqueeze(-1)).sum(
+        dim=0
+    )
+
+
 class Router(ABC, MegatronModule):
     """Base Router class"""
 
@@ -729,7 +753,10 @@ class TopKRouter(Router):
 
     @jit_fuser
     def _apply_expert_bias(
-        self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+        self,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """
         Update expert bias and tokens_per_expert
@@ -737,11 +764,19 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
-                if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                counts = _expert_bias_token_counts(
+                    routing_map,
+                    padding_mask=padding_mask,
+                    token_multiplicities=token_multiplicities,
+                )
+                self.local_tokens_per_expert += counts.to(self.local_tokens_per_expert.dtype)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
+    ):
         """Top-k routing function
 
         Args:
@@ -830,7 +865,9 @@ class TopKRouter(Router):
             )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        self._apply_expert_bias(
+            routing_map, padding_mask=padding_mask, token_multiplicities=token_multiplicities
+        )
 
         return probs, routing_map
 
@@ -840,7 +877,12 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass of the router.
 
@@ -866,7 +908,9 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(
+            logits, padding_mask=padding_mask, token_multiplicities=token_multiplicities
+        )
 
         return probs, routing_map
 

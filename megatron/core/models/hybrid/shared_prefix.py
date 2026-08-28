@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Explicit TP1 shared-prefix adapter for a HybridStack.
+"""Explicit shared-prefix adapter for a HybridStack.
 
 This module deliberately does not alter :class:`HybridStack`'s normal ``forward`` path. Call
 ``forward_hybrid_stack_shared_prefix`` with one packed star ``[P, C_1, ..., C_G]`` to opt in.
@@ -14,7 +14,9 @@ The implementation is the narrow production slice of the shared-prefix work deve
 Megatron-RL/Megatron-LM commit ``0bf30804f`` plus the fused kernel port ``5b7173f7``. CP1 and CP>1
 are advertised as distinct capabilities so integrations can negotiate against the validated
 topology. CP>1 uses the model's standard zigzag sequence shards and sequence-to-head all-to-alls.
-TP sequence parallelism remains unsupported.
+Validated production capabilities cover TP1 and TP>1 with sequence parallelism, explicit physical
+padding, MoE expert-bias accounting, and full uniform activation recomputation. Topology and feature
+tokens remain distinct so integrations can require the exact supported conjunction.
 """
 
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import (
     MAMBA_HAS_STATE_DTYPE,
@@ -45,6 +48,8 @@ class SharedPrefixLayout:
 
     prefix_len: int
     completion_lens: Sequence[int]
+    logical_completion_lens: Sequence[int] | None = None
+    padding_multiple: int | None = None
 
     def __post_init__(self) -> None:
         prefix_len = int(self.prefix_len)
@@ -52,11 +57,31 @@ class SharedPrefixLayout:
         if prefix_len < 1:
             raise ValueError("shared-prefix layout requires a non-empty prefix")
         if not completion_lens or any(length < 1 for length in completion_lens):
-            raise ValueError(
-                "shared-prefix layout requires one or more non-empty completions"
-            )
+            raise ValueError("shared-prefix layout requires one or more non-empty completions")
         object.__setattr__(self, "prefix_len", prefix_len)
         object.__setattr__(self, "completion_lens", completion_lens)
+        if self.logical_completion_lens is not None:
+            logical_completion_lens = tuple(int(length) for length in self.logical_completion_lens)
+            if len(logical_completion_lens) != len(completion_lens) or any(
+                logical < 1 or logical > physical
+                for logical, physical in zip(logical_completion_lens, completion_lens, strict=True)
+            ):
+                raise ValueError(
+                    "logical completion lengths must be positive, match the physical "
+                    "branch count, and not exceed physical completion lengths"
+                )
+            object.__setattr__(self, "logical_completion_lens", logical_completion_lens)
+        if (self.logical_completion_lens is None) != (self.padding_multiple is None):
+            raise ValueError(
+                "logical completion lengths and padding_multiple must be provided together"
+            )
+        if self.padding_multiple is not None:
+            if isinstance(self.padding_multiple, bool) or not isinstance(
+                self.padding_multiple, int
+            ):
+                raise ValueError("shared-prefix padding_multiple must be an integer")
+            if self.padding_multiple < 1:
+                raise ValueError("shared-prefix padding_multiple must be positive")
 
     @property
     def total_len(self) -> int:
@@ -78,19 +103,12 @@ class SharedPrefixLayout:
         """Prefix-continued RoPE positions for the packed star."""
         pieces = [torch.arange(self.prefix_len, device=device, dtype=torch.long)]
         pieces.extend(
-            torch.arange(
-                self.prefix_len,
-                self.prefix_len + length,
-                device=device,
-                dtype=torch.long,
-            )
+            torch.arange(self.prefix_len, self.prefix_len + length, device=device, dtype=torch.long)
             for length in self.completion_lens
         )
         return torch.cat(pieces)
 
-    def padded_position_ids(
-        self, physical_len: int, device: torch.device | str
-    ) -> Tensor:
+    def padded_position_ids(self, physical_len: int, device: torch.device | str) -> Tensor:
         """Return global star positions plus inert positions for trailing CP padding."""
         physical_len = int(physical_len)
         if physical_len < self.total_len:
@@ -101,11 +119,38 @@ class SharedPrefixLayout:
         if physical_len == self.total_len:
             return positions
         return torch.cat(
+            [positions, torch.zeros(physical_len - self.total_len, device=device, dtype=torch.long)]
+        )
+
+    def padded_token_multiplicities(self, physical_len: int, device: torch.device | str) -> Tensor:
+        """Dense-baseline multiplicity for each physical shared-prefix token.
+
+        Prompt tokens occur once per completion in a conventional rollout batch.
+        Branch tokens, including ordinary per-sequence padding, have unit
+        multiplicity. Trailing topology-only padding is inert.
+        """
+        physical_len = int(physical_len)
+        if physical_len < self.total_len:
+            raise ValueError(
+                f"physical length {physical_len} is shorter than layout {self.total_len}"
+            )
+        multiplicities = torch.cat(
             [
-                positions,
-                torch.zeros(
-                    physical_len - self.total_len, device=device, dtype=torch.long
+                torch.full(
+                    (self.prefix_len,),
+                    len(self.completion_lens),
+                    device=device,
+                    dtype=torch.float32,
                 ),
+                torch.ones(sum(self.completion_lens), device=device, dtype=torch.float32),
+            ]
+        )
+        if physical_len == self.total_len:
+            return multiplicities
+        return torch.cat(
+            [
+                multiplicities,
+                torch.zeros(physical_len - self.total_len, device=device, dtype=torch.float32),
             ]
         )
 
@@ -135,22 +180,15 @@ def _mamba_state_dtype_kwargs(mixer: MambaMixer) -> dict:
 
 
 def _validate_mamba_fork(mixer: MambaMixer) -> None:
-    if mixer.pg_collection.tp.size() != 1:
-        raise NotImplementedError(
-            "shared-prefix Mamba state forking currently supports TP1 only"
-        )
-    if mixer.config.sequence_parallel:
-        raise NotImplementedError(
-            "shared-prefix Mamba state forking does not support sequence parallelism"
-        )
+    tp_size = mixer.pg_collection.tp.size()
+    if tp_size > 1 and not mixer.config.sequence_parallel:
+        raise NotImplementedError("shared-prefix Mamba TP>1 requires sequence parallelism")
+    if tp_size == 1 and mixer.config.sequence_parallel:
+        raise NotImplementedError("shared-prefix Mamba sequence parallelism requires TP>1")
     if not mixer.rmsnorm:
-        raise NotImplementedError(
-            "shared-prefix Mamba state forking requires gated RMSNorm"
-        )
+        raise NotImplementedError("shared-prefix Mamba state forking requires gated RMSNorm")
     if causal_conv1d_fn is None or mamba_chunk_scan_combined is None:
-        raise RuntimeError(
-            "shared-prefix Mamba state forking requires causal-conv1d and mamba-ssm"
-        )
+        raise RuntimeError("shared-prefix Mamba state forking requires causal-conv1d and mamba-ssm")
 
 
 def _prefix_conv_context(xbc: Tensor, width: int) -> Tensor:
@@ -182,16 +220,12 @@ def _scan_mamba_projected_segment(
 
     projected = rearrange(projected, "l b d -> b l d").contiguous()
     z, xbc, dt = torch.split(
-        projected,
-        [d_inner, d_inner + 2 * num_groups * mixer.d_state, num_heads],
-        dim=-1,
+        projected, [d_inner, d_inner + 2 * num_groups * mixer.d_state, num_heads], dim=-1
     )
     A = -torch.exp(cp.get_A_log().float())
 
     xbc = rearrange(xbc, "b l d -> b d l").contiguous()
-    next_conv_context = (
-        _prefix_conv_context(xbc, mixer.d_conv - 1) if capture_state else None
-    )
+    next_conv_context = _prefix_conv_context(xbc, mixer.d_conv - 1) if capture_state else None
     if conv_context is not None:
         if (
             conv_context.ndim != 3
@@ -200,9 +234,7 @@ def _scan_mamba_projected_segment(
         ):
             raise ValueError("prefix convolution state is incompatible with the branch")
         if conv_context.shape[0] not in (1, branch_count):
-            raise ValueError(
-                "prefix convolution state batch is incompatible with the branch"
-            )
+            raise ValueError("prefix convolution state batch is incompatible with the branch")
         repeated_context = conv_context.to(xbc.dtype).expand(branch_count, -1, -1)
         conv_input = torch.cat([repeated_context, xbc], dim=-1)
         conv_output = causal_conv1d_fn(
@@ -232,9 +264,7 @@ def _scan_mamba_projected_segment(
     if initial_states is not None:
         if initial_states.shape[0] not in (1, branch_count):
             raise ValueError("prefix SSM state batch is incompatible with the branch")
-        initial_states = initial_states.expand(
-            branch_count, *initial_states.shape[1:]
-        ).contiguous()
+        initial_states = initial_states.expand(branch_count, *initial_states.shape[1:]).contiguous()
     scan = mamba_chunk_scan_combined(
         x,
         dt.contiguous(),
@@ -273,14 +303,14 @@ def _fork_mamba_segment(
 ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
     """Scan one segment, optionally capturing a differentiable Mamba end state."""
     _validate_mamba_fork(mixer)
-    if mixer.cp.cp_size != 1:
+    if mixer.pg_collection.tp.size() != 1:
         raise RuntimeError(
-            "CP-sharded Mamba segments require the collective CP adapter path"
+            "TP sequence-sharded Mamba segments require the collective parallel adapter path"
         )
+    if mixer.cp.cp_size != 1:
+        raise RuntimeError("CP-sharded Mamba segments require the collective CP adapter path")
     if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
-        raise ValueError(
-            "shared-prefix Mamba segments must have shape [sequence, 1, hidden]"
-        )
+        raise ValueError("shared-prefix Mamba segments must have shape [sequence, 1, hidden]")
 
     cp = mixer.cp
     num_groups = cp.ngroups_local_tpcp
@@ -291,16 +321,12 @@ def _fork_mamba_segment(
     projected = cp.pre_conv_ssm(projected)
     projected = rearrange(projected, "l b d -> b l d").contiguous()
     z, xbc, dt = torch.split(
-        projected,
-        [d_inner, d_inner + 2 * num_groups * mixer.d_state, num_heads],
-        dim=-1,
+        projected, [d_inner, d_inner + 2 * num_groups * mixer.d_state, num_heads], dim=-1
     )
     A = -torch.exp(cp.get_A_log().float())
 
     xbc = rearrange(xbc, "b l d -> b d l").contiguous()
-    next_conv_context = (
-        _prefix_conv_context(xbc, mixer.d_conv - 1) if capture_state else None
-    )
+    next_conv_context = _prefix_conv_context(xbc, mixer.d_conv - 1) if capture_state else None
     if conv_context is not None:
         if conv_context.shape[:2] != xbc.shape[:2]:
             raise ValueError("prefix convolution state is incompatible with the branch")
@@ -362,18 +388,16 @@ def _fork_mamba_segment(
 
 
 def _fork_mamba_branches(
-    mixer: MambaMixer,
-    branches: Tensor,
-    *,
-    conv_context: Tensor,
-    ssm_initial_state: Tensor,
+    mixer: MambaMixer, branches: Tensor, *, conv_context: Tensor, ssm_initial_state: Tensor
 ) -> tuple[Tensor, Tensor | None]:
     """Scan a right-padded batch of completion branches from one prefix state."""
     _validate_mamba_fork(mixer)
-    if mixer.cp.cp_size != 1:
+    if mixer.pg_collection.tp.size() != 1:
         raise RuntimeError(
-            "CP-sharded Mamba branches require the collective CP adapter path"
+            "TP sequence-sharded Mamba branches require the collective parallel adapter path"
         )
+    if mixer.cp.cp_size != 1:
+        raise RuntimeError("CP-sharded Mamba branches require the collective CP adapter path")
     if branches.ndim != 3:
         raise ValueError(
             "shared-prefix Mamba branches must have shape [sequence, branches, hidden]"
@@ -389,9 +413,7 @@ def _fork_mamba_branches(
     projected = cp.pre_conv_ssm(projected)
     projected = rearrange(projected, "l b d -> b l d").contiguous()
     z, xbc, dt = torch.split(
-        projected,
-        [d_inner, d_inner + 2 * num_groups * mixer.d_state, num_heads],
-        dim=-1,
+        projected, [d_inner, d_inner + 2 * num_groups * mixer.d_state, num_heads], dim=-1
     )
     A = -torch.exp(cp.get_A_log().float())
 
@@ -447,25 +469,24 @@ def _fork_mamba_branches(
 def _forward_mamba_layer_shared_prefix(
     layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout
 ) -> Tensor:
-    residual = (
-        hidden_states.float()
-        if layer.config.fp32_residual_connection
-        else hidden_states
-    )
-    normalized = apply_module(layer.norm)(
-        hidden_states.to(dtype=layer.config.params_dtype)
-    )
+    residual = hidden_states.float() if layer.config.fp32_residual_connection else hidden_states
+    normalized = apply_module(layer.norm)(hidden_states.to(dtype=layer.config.params_dtype))
 
     prefix_output, output_bias, conv_context, final_state = _fork_mamba_segment(
         layer.mixer, normalized[: layout.prefix_len], capture_state=True
     )
-    max_completion_len = max(layout.completion_lens)
+    physical_completion_lens = list(layout.completion_lens)
+    physical_completion_lens[-1] += hidden_states.shape[0] - layout.total_len
+    max_completion_len = max(physical_completion_lens)
     branches = normalized.new_zeros(
-        max_completion_len, len(layout.completion_lens), normalized.shape[-1]
+        max_completion_len, len(physical_completion_lens), normalized.shape[-1]
     )
-    for branch_index, completion_slice in enumerate(layout.completion_slices()):
-        branch = normalized[completion_slice, 0]
-        branches[: branch.shape[0], branch_index] = branch
+    start = layout.prefix_len
+    for branch_index, completion_len in enumerate(physical_completion_lens):
+        branches[:completion_len, branch_index] = normalized[start : start + completion_len, 0]
+        start += completion_len
+    if start != hidden_states.shape[0]:
+        raise RuntimeError("shared-prefix branch spans do not cover physical sequence")
     branch_output, _ = _fork_mamba_branches(
         layer.mixer, branches, conv_context=conv_context, ssm_initial_state=final_state
     )
@@ -473,56 +494,47 @@ def _forward_mamba_layer_shared_prefix(
         [prefix_output]
         + [
             branch_output[:length, index : index + 1]
-            for index, length in enumerate(layout.completion_lens)
+            for index, length in enumerate(physical_completion_lens)
         ],
         dim=0,
     )
 
     with layer.bias_dropout_add_exec_handler():
-        return layer.mamba_bda(
-            training=layer.training, fused=layer.config.bias_dropout_fusion
-        )((packed_output, output_bias), residual, layer.hidden_dropout)
+        return layer.mamba_bda(training=layer.training, fused=layer.config.bias_dropout_fusion)(
+            (packed_output, output_bias), residual, layer.hidden_dropout
+        )
 
 
 def _forward_mamba_layer_shared_prefix_cp_impl(
-    layer: MambaLayer,
-    hidden_states: Tensor,
-    layout: SharedPrefixLayout,
-    *,
-    replay_prefix: bool,
+    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout, *, replay_prefix: bool
 ) -> Tensor:
-    """Run a CP Mamba star with either state-fork or uninterrupted-replay prefix handling.
+    """Run a TP/SP/CP Mamba star with state-fork or uninterrupted-replay prefix handling.
 
-    The projection first converts local zigzag sequence shards into one canonical global sequence
-    with CP-local channels. State-fork scans the prefix once and expands its differentiable state;
-    replay is retained as a parity baseline and repeats the projected prefix per branch. The packed
-    result returns to local zigzag sequence shards before the shared norm/output path.
+    The input projection first gathers sequence-parallel TP shards, then the CP adapter converts
+    local zigzag sequence shards into one canonical global sequence with TP/CP-local channels.
+    State-fork scans the prefix once and expands its differentiable state; replay is retained as a
+    parity baseline and repeats the projected prefix per branch. The packed result returns through
+    the inverse CP transform and TP output-projection reduce-scatter.
     """
     mixer = layer.mixer
     _validate_mamba_fork(mixer)
     cp = mixer.cp
-    if cp.cp_size <= 1:
-        return _forward_mamba_layer_shared_prefix(layer, hidden_states, layout)
 
-    residual = (
-        hidden_states.float()
-        if layer.config.fp32_residual_connection
-        else hidden_states
-    )
-    normalized = apply_module(layer.norm)(
-        hidden_states.to(dtype=layer.config.params_dtype)
-    )
+    residual = hidden_states.float() if layer.config.fp32_residual_connection else hidden_states
+    normalized = apply_module(layer.norm)(hidden_states.to(dtype=layer.config.params_dtype))
     projected, _ = mixer.in_proj(normalized)
-    # [physical/C, 1, projection] zigzag -> [physical, 1, projection/C] canonical.
+    # Input SP gather: [physical/(TP*C), 1, hidden] -> [physical/C, 1, projection/TP].
+    # CP A2A: [physical/C, 1, projection/TP] -> [physical, 1, projection/(TP*C)].
     projected = cp.pre_conv_ssm(projected)
     physical_len = projected.shape[0]
     if physical_len < layout.total_len:
         raise ValueError(
-            f"CP physical length {physical_len} is shorter than shared layout {layout.total_len}"
+            f"parallel physical length {physical_len} is shorter than shared layout "
+            f"{layout.total_len}"
         )
 
     physical_completion_lens = list(layout.completion_lens)
-    # CP requires a multiple of 2*C. Padding is placed after the final completion;
+    # The topology validator owns physical alignment. Padding is placed after the final completion;
     # scanning it as that branch's causal tail cannot affect any real-token output.
     physical_completion_lens[-1] += physical_len - layout.total_len
     branch_prefix_len = layout.prefix_len if replay_prefix else 0
@@ -533,17 +545,13 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
     start = layout.prefix_len
     for branch_index, completion_len in enumerate(physical_completion_lens):
         if replay_prefix:
-            branches[: layout.prefix_len, branch_index] = projected[
-                : layout.prefix_len, 0
-            ]
-        branches[
-            branch_prefix_len : branch_prefix_len + completion_len, branch_index
-        ] = projected[start : start + completion_len, 0]
+            branches[: layout.prefix_len, branch_index] = projected[: layout.prefix_len, 0]
+        branches[branch_prefix_len : branch_prefix_len + completion_len, branch_index] = projected[
+            start : start + completion_len, 0
+        ]
         start += completion_len
     if start != physical_len:
-        raise RuntimeError(
-            "shared-prefix CP branch spans do not cover physical sequence"
-        )
+        raise RuntimeError("shared-prefix CP branch spans do not cover physical sequence")
 
     if replay_prefix:
         branch_y, branch_z, _, _ = _scan_mamba_projected_segment(mixer, branches)
@@ -554,9 +562,7 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
             mixer, projected[: layout.prefix_len], capture_state=True
         )
         if conv_context is None or final_state is None:
-            raise RuntimeError(
-                "shared-prefix CP Mamba scan did not return a differentiable state"
-            )
+            raise RuntimeError("shared-prefix CP Mamba scan did not return a differentiable state")
         branch_y, branch_z, _, _ = _scan_mamba_projected_segment(
             mixer, branches, conv_context=conv_context, ssm_initial_state=final_state
         )
@@ -583,9 +589,9 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
     packed_output, output_bias = mixer.out_proj(packed_y)
 
     with layer.bias_dropout_add_exec_handler():
-        return layer.mamba_bda(
-            training=layer.training, fused=layer.config.bias_dropout_fusion
-        )((packed_output, output_bias), residual, layer.hidden_dropout)
+        return layer.mamba_bda(training=layer.training, fused=layer.config.bias_dropout_fusion)(
+            (packed_output, output_bias), residual, layer.hidden_dropout
+        )
 
 
 def _forward_mamba_layer_shared_prefix_cp_state_fork(
@@ -610,9 +616,7 @@ def _forward_mamba_layer_shared_prefix_cp(
     layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout
 ) -> Tensor:
     """Production CP Mamba path using the optimized differentiable state fork."""
-    return _forward_mamba_layer_shared_prefix_cp_state_fork(
-        layer, hidden_states, layout
-    )
+    return _forward_mamba_layer_shared_prefix_cp_state_fork(layer, hidden_states, layout)
 
 
 def _has_nonzero_config_value(value) -> bool:
@@ -624,80 +628,145 @@ def _has_nonzero_config_value(value) -> bool:
     return float(value) != 0.0
 
 
-def _validate_hybrid_stack(
-    stack, hidden_states: Tensor, layout: SharedPrefixLayout
+def _validate_shared_prefix_physical_length(
+    layout: SharedPrefixLayout,
+    physical_len: int,
+    *,
+    tp_size: int,
+    cp_size: int,
+    sequence_parallel: bool,
 ) -> None:
-    if stack.tp_group.size() != 1:
-        raise NotImplementedError(
-            "shared-prefix Hybrid adapter currently supports TP1 only"
+    """Validate the global star length against its negotiated topology/padding contract."""
+    physical_len = int(physical_len)
+    if tp_size > 1:
+        topology_multiple = 2 * tp_size * cp_size
+    elif cp_size > 1:
+        topology_multiple = 2 * cp_size
+    else:
+        topology_multiple = 1
+    padding = physical_len - layout.total_len
+
+    if layout.padding_multiple is not None:
+        padding_multiple = layout.padding_multiple
+        if padding_multiple % topology_multiple:
+            raise ValueError(
+                "shared-prefix padding_multiple must be divisible by the topology quantum: "
+                f"M={padding_multiple}, Q={topology_multiple}, TP={tp_size}, CP={cp_size}"
+            )
+        for branch, (physical_completion, logical_completion) in enumerate(
+            zip(layout.completion_lens, layout.logical_completion_lens, strict=True)
+        ):
+            if (layout.prefix_len + physical_completion) % padding_multiple or not (
+                0 <= physical_completion - logical_completion < padding_multiple
+            ):
+                raise ValueError(
+                    "shared-prefix physical completion span must use the minimal per-branch "
+                    "padding to padding_multiple: "
+                    f"branch={branch}, prefix={layout.prefix_len}, "
+                    f"logical={logical_completion}, physical={physical_completion}, "
+                    f"M={padding_multiple}"
+                )
+        if physical_len % padding_multiple:
+            raise ValueError(
+                "shared-prefix physical length must be divisible by padding_multiple: "
+                f"physical={physical_len}, M={padding_multiple}"
+            )
+        if not 0 <= padding < padding_multiple:
+            raise ValueError(
+                "shared-prefix input must use the minimal trailing pad to padding_multiple: "
+                f"physical={physical_len}, layout={layout.total_len}, M={padding_multiple}"
+            )
+        return
+
+    if tp_size > 1:
+        if physical_len % topology_multiple:
+            raise ValueError(
+                "shared-prefix TP/SP physical length must be divisible by 2 * tensor parallel "
+                "size * context parallel size"
+            )
+        if not 0 <= padding < topology_multiple:
+            raise ValueError(
+                "shared-prefix TP/SP input must use the minimal trailing pad to a 2*TP*CP "
+                f"multiple: physical={physical_len}, layout={layout.total_len}, "
+                f"TP={tp_size}, CP={cp_size}"
+            )
+    elif cp_size == 1:
+        if physical_len != layout.total_len:
+            raise ValueError(
+                f"packed sequence length {physical_len} does not match layout {layout.total_len}"
+            )
+    else:
+        if physical_len % topology_multiple:
+            raise ValueError(
+                "shared-prefix CP physical length must be divisible by 2 * context parallel size"
+            )
+        if not 0 <= padding < topology_multiple:
+            raise ValueError(
+                "shared-prefix CP input must use the minimal trailing pad to a 2*CP multiple: "
+                f"physical={physical_len}, layout={layout.total_len}, CP={cp_size}"
+            )
+
+
+def _validate_hybrid_stack(stack, hidden_states: Tensor, layout: SharedPrefixLayout) -> None:
+    tp_size = stack.tp_group.size()
+    sequence_parallel = bool(stack.config.sequence_parallel)
+    if tp_size > 1 and not sequence_parallel:
+        raise NotImplementedError("shared-prefix Hybrid TP>1 requires sequence parallelism")
+    if tp_size == 1 and sequence_parallel:
+        raise NotImplementedError("shared-prefix Hybrid sequence parallelism requires TP>1")
+    if stack.config.tensor_model_parallel_size != tp_size:
+        raise RuntimeError(
+            "shared-prefix Hybrid tensor-parallel config does not match its process group"
         )
+    if stack.pg_collection.tp.size() != tp_size:
+        raise RuntimeError("shared-prefix Hybrid tensor-parallel groups disagree on their size")
     if stack.pp_group.size() != 1:
-        raise NotImplementedError(
-            "shared-prefix Hybrid adapter currently supports PP1 only"
-        )
+        raise NotImplementedError("shared-prefix Hybrid adapter currently supports PP1 only")
     cp_group = stack.pg_collection.cp
     cp_size = cp_group.size()
     if stack.config.context_parallel_size != cp_size:
         raise RuntimeError(
             "shared-prefix Hybrid context-parallel config does not match its process group"
         )
-    if stack.config.sequence_parallel:
-        raise NotImplementedError(
-            "shared-prefix Hybrid adapter does not support sequence parallelism"
-        )
     if stack.config.recompute_granularity == "full":
-        raise NotImplementedError(
-            "shared-prefix Hybrid adapter does not yet preserve full-layer recomputation"
-        )
+        if stack.config.recompute_method != "uniform":
+            raise NotImplementedError(
+                "shared-prefix Hybrid full recomputation currently supports only the uniform method"
+            )
+        if not isinstance(stack.config.recompute_num_layers, int) or (
+            stack.config.recompute_num_layers < 1
+        ):
+            raise ValueError(
+                "shared-prefix Hybrid uniform recomputation requires recompute_num_layers >= 1"
+            )
     if stack.config.fine_grained_activation_offloading:
         raise NotImplementedError(
             "shared-prefix Hybrid adapter does not support fine-grained activation offloading"
         )
     if stack.config.cuda_graph_impl != "none":
-        raise NotImplementedError(
-            "shared-prefix Hybrid adapter does not support CUDA graphs"
-        )
+        raise NotImplementedError("shared-prefix Hybrid adapter does not support CUDA graphs")
     if stack.config.fp8 or stack.config.fp4:
-        raise NotImplementedError(
-            "shared-prefix Hybrid adapter currently supports fp16/bf16 only"
-        )
+        raise NotImplementedError("shared-prefix Hybrid adapter currently supports fp16/bf16 only")
     if hidden_states.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError(
-            "fused shared-prefix attention requires fp16 or bf16 hidden states"
-        )
+        raise TypeError("fused shared-prefix attention requires fp16 or bf16 hidden states")
     if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
         raise ValueError(
-            "shared-prefix Hybrid input must have shape [sequence/CP, 1, hidden]"
+            "shared-prefix Hybrid input must have shape [sequence/(TP*CP), 1, hidden] "
+            "when sequence parallelism is enabled"
         )
-    physical_len = hidden_states.shape[0] * cp_size
-    if cp_size == 1:
-        if physical_len != layout.total_len:
-            raise ValueError(
-                f"packed sequence length {physical_len} does not match layout {layout.total_len}"
-            )
-    else:
-        if physical_len % (2 * cp_size):
-            raise ValueError(
-                "shared-prefix CP physical length must be divisible by 2 * context parallel size"
-            )
-        padding = physical_len - layout.total_len
-        if not 0 <= padding < 2 * cp_size:
-            raise ValueError(
-                "shared-prefix CP input must use the minimal trailing pad to a 2*CP multiple: "
-                f"physical={physical_len}, layout={layout.total_len}, CP={cp_size}"
-            )
+    sequence_shards = tp_size if sequence_parallel else 1
+    physical_len = hidden_states.shape[0] * cp_size * sequence_shards
+    _validate_shared_prefix_physical_length(
+        layout, physical_len, tp_size=tp_size, cp_size=cp_size, sequence_parallel=sequence_parallel
+    )
     if stack.config.attention_dropout != 0.0 or stack.config.hidden_dropout != 0.0:
-        raise NotImplementedError(
-            "shared-prefix Hybrid adapter currently requires zero dropout"
-        )
+        raise NotImplementedError("shared-prefix Hybrid adapter currently requires zero dropout")
     if stack.config.window_size not in (None, (-1, -1)):
         raise NotImplementedError(
             "shared-prefix Hybrid adapter does not support sliding-window attention"
         )
     if stack.config.softmax_type != "vanilla":
-        raise NotImplementedError(
-            "shared-prefix fused attention supports only vanilla softmax"
-        )
+        raise NotImplementedError("shared-prefix fused attention supports only vanilla softmax")
 
     num_moe_experts = stack.config.num_moe_experts
     if num_moe_experts is not None and num_moe_experts > 0:
@@ -729,13 +798,18 @@ def _validate_hybrid_stack(
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE input jitter"
             )
-        if stack.config.moe_router_enable_expert_bias:
+        if stack.config.moe_router_enable_expert_bias and layout.logical_completion_lens is None:
             raise NotImplementedError(
-                "shared-prefix Hybrid adapter does not yet correct MoE expert-bias token counts"
+                "shared-prefix MoE expert-bias accounting requires explicit physical "
+                "branch padding and logical completion lengths"
             )
         if stack.config.moe_expert_capacity_factor is not None:
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE expert capacity or token dropping"
+            )
+        if getattr(stack.config, "mlp_chunks_for_training", 1) != 1:
+            raise NotImplementedError(
+                "shared-prefix Hybrid MoE adapter does not support training MLP chunking"
             )
 
     for layer in stack.layers:
@@ -745,6 +819,10 @@ def _validate_hybrid_stack(
                     "shared-prefix state forking only supports MambaMixer-backed Mamba layers"
                 )
             _validate_mamba_fork(layer.mixer)
+            if layer.mixer.pg_collection.tp.size() != tp_size:
+                raise RuntimeError(
+                    "shared-prefix Mamba TP helper does not match the Hybrid stack TP group"
+                )
             if layer.mixer.cp.cp_size != cp_size:
                 raise RuntimeError(
                     "shared-prefix Mamba CP helper does not match the Hybrid stack CP group"
@@ -767,14 +845,40 @@ def _validate_hybrid_stack(
                 raise NotImplementedError(
                     "shared-prefix fused attention does not yet produce QK-clipping/max-logit statistics"
                 )
+            if isinstance(layer.self_attention, SelfAttention):
+                if layer.self_attention.pg_collection.tp.size() != tp_size:
+                    raise RuntimeError(
+                        "shared-prefix attention TP helper does not match the Hybrid stack TP group"
+                    )
+                if layer.self_attention.pg_collection.cp.size() != cp_size:
+                    raise RuntimeError(
+                        "shared-prefix attention CP helper does not match the Hybrid stack CP group"
+                    )
             if cp_size > 1 and isinstance(layer.self_attention, SelfAttention):
                 from megatron.core.models.hybrid.shared_prefix_fused import (
                     _cp_kv_head_slices_for_destinations,
                 )
 
-                query_heads = stack.config.num_attention_heads
-                kv_heads = stack.config.num_query_groups or query_heads
+                if stack.config.num_attention_heads % tp_size:
+                    raise NotImplementedError(
+                        "shared-prefix attention requires query heads divisible by TP size"
+                    )
+                query_heads = stack.config.num_attention_heads // tp_size
+                # This is the actual local K/V tensor width. When global KV heads are fewer than
+                # TP ranks, SelfAttention replicates one KV head across the relevant TP ranks.
+                kv_heads = layer.self_attention.num_query_groups_per_partition
                 _cp_kv_head_slices_for_destinations(query_heads, kv_heads, cp_size)
+            if stack.config.moe_router_enable_expert_bias and getattr(layer, "is_moe_layer", False):
+                from megatron.core.transformer.moe.moe_layer import MoELayer
+                from megatron.core.transformer.moe.router import TopKRouter
+
+                if not isinstance(layer.mlp, MoELayer) or not isinstance(
+                    layer.mlp.router, TopKRouter
+                ):
+                    raise NotImplementedError(
+                        "shared-prefix expert-bias accounting requires an MCore "
+                        "MoELayer with TopKRouter"
+                    )
         else:
             raise NotImplementedError(
                 f"shared-prefix state forking is not implemented for {type(layer).__name__}"
@@ -788,7 +892,7 @@ def forward_hybrid_stack_shared_prefix(
     *,
     rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
 ) -> Tensor:
-    """Explicit exact-prompt star forward for a supported TP1 ``HybridStack``.
+    """Explicit exact-prompt star forward for a supported ``HybridStack`` topology.
 
     Normal ``HybridStack.forward`` and ``Attention.forward`` behavior is unchanged unless this
     function installs its scoped private forest descriptor. The descriptor is always removed in a
@@ -796,45 +900,103 @@ def forward_hybrid_stack_shared_prefix(
     """
     _validate_hybrid_stack(stack, hidden_states, layout)
     has_attention = any(
-        isinstance(layer, TransformerLayer)
-        and isinstance(layer.self_attention, SelfAttention)
+        isinstance(layer, TransformerLayer) and isinstance(layer.self_attention, SelfAttention)
         for layer in stack.layers
     )
     if has_attention and rotary_pos_emb is None:
-        raise ValueError(
-            "position-aware rotary_pos_emb is required for shared-prefix attention"
+        raise ValueError("position-aware rotary_pos_emb is required for shared-prefix attention")
+
+    cp_group = stack.pg_collection.cp
+    tp_group = stack.pg_collection.tp
+    tp_size = tp_group.size()
+    sequence_shards = tp_size if stack.config.sequence_parallel else 1
+    physical_len = hidden_states.shape[0] * cp_group.size() * sequence_shards
+    token_multiplicities = None
+    if stack.config.moe_router_enable_expert_bias:
+        token_multiplicities = layout.padded_token_multiplicities(
+            physical_len, hidden_states.device
         )
-
-    for layer in stack.layers:
-        if isinstance(layer, MambaLayer):
-            if stack.pg_collection.cp.size() > 1:
-                hidden_states = _forward_mamba_layer_shared_prefix_cp(
-                    layer, hidden_states, layout
-                )
-            else:
-                hidden_states = _forward_mamba_layer_shared_prefix(
-                    layer, hidden_states, layout
-                )
-        elif isinstance(layer.self_attention, IdentityOp):
-            hidden_states = layer(hidden_states=hidden_states, attention_mask=None)
-        else:
-            attention = layer.self_attention
-            if getattr(attention, "_shared_prefix_forest", None) is not None:
+        if cp_group.size() > 1:
+            token_multiplicities = token_multiplicities.index_select(
+                0,
+                layout.cp_local_indices(
+                    physical_len, cp_group.size(), cp_group.rank(), hidden_states.device
+                ),
+            )
+        if tp_size > 1:
+            if token_multiplicities.numel() % tp_size:
                 raise RuntimeError(
-                    "nested shared-prefix attention dispatch is not supported"
+                    "shared-prefix CP-local token multiplicities must divide evenly over TP"
                 )
-            attention._shared_prefix_forest = layout.forest
-            try:
-                hidden_states = layer(
-                    hidden_states=hidden_states,
-                    attention_mask=None,
-                    rotary_pos_emb=rotary_pos_emb,
-                )
-            finally:
-                del attention._shared_prefix_forest
+            token_multiplicities = torch.chunk(token_multiplicities, tp_size, dim=0)[
+                tp_group.rank()
+            ].contiguous()
+        if token_multiplicities.numel() != hidden_states.shape[0]:
+            raise RuntimeError(
+                "shared-prefix token multiplicity ownership does not match the local hidden rows"
+            )
 
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
+    def forward_layer_range(hidden_states: Tensor, start: int, end: int) -> Tensor:
+        for layer in stack.layers[start:end]:
+            moe_layer = (
+                layer.mlp
+                if stack.config.moe_router_enable_expert_bias
+                and getattr(layer, "is_moe_layer", False)
+                else None
+            )
+            if moe_layer is not None:
+                if getattr(moe_layer, "_shared_prefix_token_multiplicities", None) is not None:
+                    raise RuntimeError("nested shared-prefix MoE dispatch is not supported")
+                moe_layer._shared_prefix_token_multiplicities = token_multiplicities
+            try:
+                if isinstance(layer, MambaLayer):
+                    if cp_group.size() > 1 or tp_size > 1:
+                        hidden_states = _forward_mamba_layer_shared_prefix_cp(
+                            layer, hidden_states, layout
+                        )
+                    else:
+                        hidden_states = _forward_mamba_layer_shared_prefix(
+                            layer, hidden_states, layout
+                        )
+                elif isinstance(layer.self_attention, IdentityOp):
+                    hidden_states = layer(hidden_states=hidden_states, attention_mask=None)
+                else:
+                    attention = layer.self_attention
+                    if getattr(attention, "_shared_prefix_forest", None) is not None:
+                        raise RuntimeError(
+                            "nested shared-prefix attention dispatch is not supported"
+                        )
+                    attention._shared_prefix_forest = layout.forest
+                    try:
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=None,
+                            rotary_pos_emb=rotary_pos_emb,
+                        )
+                    finally:
+                        del attention._shared_prefix_forest
+            finally:
+                if moe_layer is not None:
+                    del moe_layer._shared_prefix_token_multiplicities
+
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+        return hidden_states
+
+    if stack.config.recompute_granularity == "full" and stack.training:
+        chunk_size = stack.config.recompute_num_layers
+        for start in range(0, len(stack.layers), chunk_size):
+            end = min(start + chunk_size, len(stack.layers))
+
+            def custom_forward(hidden_states: Tensor, start=start, end=end) -> Tensor:
+                # Scopes live inside the callable so backward replay reconstructs them.
+                return forward_layer_range(hidden_states, start, end)
+
+            hidden_states = tensor_parallel.checkpoint(
+                custom_forward, stack.config.distribute_saved_activations, hidden_states
+            )
+    else:
+        hidden_states = forward_layer_range(hidden_states, 0, len(stack.layers))
 
     if stack.post_process and stack.post_layer_norm:
         hidden_states = stack.final_norm(hidden_states)
@@ -849,9 +1011,21 @@ def forward_hybrid_stack_shared_prefix(
 # the CP1 fast path while requiring the validated CP>1 Hybrid forward/backward contract.
 SHARED_PREFIX_TRAINING_CAPABILITY = "hybrid_star_cp1_tp1_v1"
 SHARED_PREFIX_CP_TRAINING_CAPABILITY = "hybrid_star_cp_v1"
+SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY = "hybrid_star_explicit_physical_padding_v1"
+SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY = "hybrid_star_moe_expert_bias_v1"
+SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY = "hybrid_star_full_uniform_recompute_v1"
+SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp1_tp_sp_v1"
+SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp_tp_sp_v1"
+# Topology and feature capabilities are independent so integrations can negotiate their exact
+# validated conjunction without inferring support from a broader aggregate token.
 SHARED_PREFIX_TRAINING_CAPABILITIES = frozenset(
     {
         SHARED_PREFIX_TRAINING_CAPABILITY,
         SHARED_PREFIX_CP_TRAINING_CAPABILITY,
+        SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+        SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY,
+        SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
+        SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY,
+        SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY,
     }
 )

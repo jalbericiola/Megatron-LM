@@ -8,7 +8,12 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shared_prefix import (
+    SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY,
     SHARED_PREFIX_CP_TRAINING_CAPABILITY,
+    SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+    SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
+    SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY,
+    SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY,
     SHARED_PREFIX_TRAINING_CAPABILITIES,
     SHARED_PREFIX_TRAINING_CAPABILITY,
     SharedPrefixLayout,
@@ -29,9 +34,7 @@ def _relative_l2(reference, actual):
 def _cosine(reference, actual):
     reference = reference.double().flatten()
     actual = actual.double().flatten()
-    denominator = (reference.norm() * actual.norm()).clamp_min(
-        torch.finfo(torch.float64).tiny
-    )
+    denominator = (reference.norm() * actual.norm()).clamp_min(torch.finfo(torch.float64).tiny)
     return (torch.dot(reference, actual) / denominator).item()
 
 
@@ -53,9 +56,13 @@ class _SizeOneGroup:
 
 def _validation_stack(*, layers=(), **config_overrides):
     config = SimpleNamespace(
+        tensor_model_parallel_size=1,
         context_parallel_size=1,
         sequence_parallel=False,
         recompute_granularity=None,
+        recompute_method=None,
+        recompute_num_layers=None,
+        distribute_saved_activations=False,
         fine_grained_activation_offloading=False,
         cuda_graph_impl="none",
         fp8=None,
@@ -81,7 +88,7 @@ def _validation_stack(*, layers=(), **config_overrides):
     return SimpleNamespace(
         tp_group=_SizeOneGroup(),
         pp_group=_SizeOneGroup(),
-        pg_collection=SimpleNamespace(cp=_SizeOneGroup()),
+        pg_collection=SimpleNamespace(tp=_SizeOneGroup(), cp=_SizeOneGroup()),
         config=config,
         layers=list(layers),
     )
@@ -91,6 +98,7 @@ def _stub_attention_layer():
     attention = object.__new__(SelfAttention)
     torch.nn.Module.__init__(attention)
     attention.checkpoint_core_attention = False
+    attention.pg_collection = SimpleNamespace(tp=_SizeOneGroup(), cp=_SizeOneGroup())
     layer = object.__new__(TransformerLayer)
     torch.nn.Module.__init__(layer)
     layer.self_attention = attention
@@ -102,16 +110,30 @@ def test_shared_prefix_layout_and_capability_are_explicit():
 
     assert SHARED_PREFIX_TRAINING_CAPABILITY == "hybrid_star_cp1_tp1_v1"
     assert SHARED_PREFIX_CP_TRAINING_CAPABILITY == "hybrid_star_cp_v1"
+    assert (
+        SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY
+        == "hybrid_star_explicit_physical_padding_v1"
+    )
+    assert SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY == "hybrid_star_moe_expert_bias_v1"
+    assert SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY == "hybrid_star_full_uniform_recompute_v1"
+    assert SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY == "hybrid_star_cp1_tp_sp_v1"
+    assert SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY == "hybrid_star_cp_tp_sp_v1"
     assert SHARED_PREFIX_TRAINING_CAPABILITIES == frozenset(
-        {"hybrid_star_cp1_tp1_v1", "hybrid_star_cp_v1"}
+        {
+            "hybrid_star_cp1_tp1_v1",
+            "hybrid_star_cp_v1",
+            "hybrid_star_explicit_physical_padding_v1",
+            "hybrid_star_moe_expert_bias_v1",
+            "hybrid_star_full_uniform_recompute_v1",
+            "hybrid_star_cp1_tp_sp_v1",
+            "hybrid_star_cp_tp_sp_v1",
+        }
     )
     assert layout.total_len == 9
     assert layout.forest == [(0, 3, [2, 4])]
     assert layout.completion_slices() == (slice(3, 5), slice(5, 9))
     assert layout.position_ids("cpu").tolist() == [0, 1, 2, 3, 4, 3, 4, 5, 6]
-    model_parameter = inspect.signature(HybridModel.forward).parameters[
-        "shared_prefix_layout"
-    ]
+    model_parameter = inspect.signature(HybridModel.forward).parameters["shared_prefix_layout"]
     assert model_parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert model_parameter.default is None
 
@@ -134,6 +156,44 @@ def test_shared_prefix_validation_rejects_randomized_moe_routing(
         _validate_hybrid_stack(stack, hidden_states, layout)
 
 
+def test_shared_prefix_validation_requires_explicit_physical_moe_layout():
+    physical_layout = SharedPrefixLayout(
+        prefix_len=2, completion_lens=[6, 6], logical_completion_lens=[2, 2], padding_multiple=8
+    )
+    implicit_layout = SharedPrefixLayout(prefix_len=2, completion_lens=[6, 6])
+    stack = _validation_stack(num_moe_experts=2, moe_router_enable_expert_bias=True)
+    hidden_states = torch.empty(16, 1, 8, dtype=torch.bfloat16)
+
+    with pytest.raises(NotImplementedError, match="explicit physical branch padding"):
+        _validate_hybrid_stack(
+            stack,
+            torch.empty(implicit_layout.total_len, 1, 8, dtype=torch.bfloat16),
+            implicit_layout,
+        )
+    _validate_hybrid_stack(stack, hidden_states, physical_layout)
+
+
+def test_shared_prefix_validation_accepts_only_uniform_full_recompute():
+    layout = SharedPrefixLayout(prefix_len=2, completion_lens=[2])
+    hidden_states = torch.empty(layout.total_len, 1, 8, dtype=torch.bfloat16)
+
+    _validate_hybrid_stack(
+        _validation_stack(
+            recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1
+        ),
+        hidden_states,
+        layout,
+    )
+    with pytest.raises(NotImplementedError, match="only the uniform method"):
+        _validate_hybrid_stack(
+            _validation_stack(
+                recompute_granularity="full", recompute_method="block", recompute_num_layers=1
+            ),
+            hidden_states,
+            layout,
+        )
+
+
 @pytest.mark.parametrize("config_name", ["qk_clip", "log_max_attention_logit"])
 def test_shared_prefix_validation_rejects_unavailable_attention_statistics(config_name):
     layout = SharedPrefixLayout(prefix_len=2, completion_lens=[2])
@@ -146,9 +206,7 @@ def test_shared_prefix_validation_rejects_unavailable_attention_statistics(confi
 
 @pytest.mark.internal
 @pytest.mark.timeout(180)
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="shared-prefix parity requires CUDA"
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="shared-prefix parity requires CUDA")
 def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
     pytest.importorskip("causal_conv1d")
     pytest.importorskip("flash_attn")
@@ -156,13 +214,9 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
     if not torch.cuda.is_bf16_supported():
         pytest.skip("shared-prefix parity requires CUDA bf16 support")
 
-    from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-        RotaryEmbedding,
-    )
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
     from megatron.core.models.hybrid.hybrid_block import HybridStack
-    from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        validate_segment_layers,
-    )
+    from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
     from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -177,9 +231,7 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
     monkeypatch.setenv("NVTE_APPLY_QK_LAYER_SCALING", "1")
 
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        context_parallel_size=1,
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
     )
     try:
         model_parallel_cuda_manual_seed(123)
@@ -230,12 +282,7 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
         )
         completions = [
             torch.randn(
-                length,
-                1,
-                hidden_size,
-                dtype=torch.bfloat16,
-                device="cuda",
-                requires_grad=True,
+                length, 1, hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
             )
             for length in layout.completion_lens
         ]
@@ -244,19 +291,14 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
         probe_generator = torch.Generator(device="cuda").manual_seed(19)
         gradient_probes = [
             torch.randn(
-                completion.shape,
-                dtype=torch.float32,
-                device="cuda",
-                generator=probe_generator,
+                completion.shape, dtype=torch.float32, device="cuda", generator=probe_generator
             )
             / completion.numel() ** 0.5
             for completion in completions
         ]
 
         def causal_mask(length):
-            return ~torch.tril(
-                torch.ones(1, 1, length, length, dtype=torch.bool, device="cuda")
-            )
+            return ~torch.tril(torch.ones(1, 1, length, length, dtype=torch.bool, device="cuda"))
 
         def dense_outputs():
             outputs = []
@@ -273,16 +315,13 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
         def shared_outputs():
             packed = torch.cat([prefix, *completions], dim=0)
             position_ids = layout.position_ids(packed.device)
-            rotary_pos_emb = rotary.get_emb(
-                int(position_ids.max().item()) + 1
-            ).index_select(0, position_ids)
+            rotary_pos_emb = rotary.get_emb(int(position_ids.max().item()) + 1).index_select(
+                0, position_ids
+            )
             output = forward_hybrid_stack_shared_prefix(
                 stack, packed, layout, rotary_pos_emb=rotary_pos_emb
             )
-            return [
-                output[completion_slice]
-                for completion_slice in layout.completion_slices()
-            ]
+            return [output[completion_slice] for completion_slice in layout.completion_slices()]
 
         with torch.no_grad():
             dense = dense_outputs()
@@ -296,13 +335,10 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
         watched_parameters = {
             name: parameter
             for name, parameter in stack.named_parameters()
-            if "mixer.in_proj.weight" in name
-            or "self_attention.linear_qkv.weight" in name
+            if "mixer.in_proj.weight" in name or "self_attention.linear_qkv.weight" in name
         }
         assert any("mixer.in_proj.weight" in name for name in watched_parameters)
-        assert any(
-            "self_attention.linear_qkv.weight" in name for name in watched_parameters
-        )
+        assert any("self_attention.linear_qkv.weight" in name for name in watched_parameters)
 
         def clear_gradients():
             prefix.grad = None
@@ -319,43 +355,31 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
         clear_gradients()
         probe_loss(dense_outputs()).backward()
         dense_prefix_grad = prefix.grad.detach().clone()
-        dense_completion_grads = [
-            completion.grad.detach().clone() for completion in completions
-        ]
+        dense_completion_grads = [completion.grad.detach().clone() for completion in completions]
         dense_parameter_grads = {
-            name: parameter.grad.detach().clone()
-            for name, parameter in watched_parameters.items()
+            name: parameter.grad.detach().clone() for name, parameter in watched_parameters.items()
         }
 
         clear_gradients()
         probe_loss(shared_outputs()).backward()
         shared_prefix_grad = prefix.grad.detach().clone()
-        shared_completion_grads = [
-            completion.grad.detach().clone() for completion in completions
-        ]
+        shared_completion_grads = [completion.grad.detach().clone() for completion in completions]
         shared_parameter_grads = {
-            name: parameter.grad.detach().clone()
-            for name, parameter in watched_parameters.items()
+            name: parameter.grad.detach().clone() for name, parameter in watched_parameters.items()
         }
 
         prefix_gradient_error = _relative_l2(dense_prefix_grad, shared_prefix_grad)
         prefix_gradient_cosine = _cosine(dense_prefix_grad, shared_prefix_grad)
         completion_gradient_errors = [
             _relative_l2(dense_grad, shared_grad)
-            for dense_grad, shared_grad in zip(
-                dense_completion_grads, shared_completion_grads
-            )
+            for dense_grad, shared_grad in zip(dense_completion_grads, shared_completion_grads)
         ]
         completion_gradient_cosines = [
             _cosine(dense_grad, shared_grad)
-            for dense_grad, shared_grad in zip(
-                dense_completion_grads, shared_completion_grads
-            )
+            for dense_grad, shared_grad in zip(dense_completion_grads, shared_completion_grads)
         ]
         parameter_gradient_errors = {
-            name: _relative_l2(
-                dense_parameter_grads[name], shared_parameter_grads[name]
-            )
+            name: _relative_l2(dense_parameter_grads[name], shared_parameter_grads[name])
             for name in dense_parameter_grads
         }
         parameter_gradient_cosines = {
@@ -366,14 +390,10 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
             "prefix": _gradient_norms(dense_prefix_grad, shared_prefix_grad),
             "completions": [
                 _gradient_norms(dense_grad, shared_grad)
-                for dense_grad, shared_grad in zip(
-                    dense_completion_grads, shared_completion_grads
-                )
+                for dense_grad, shared_grad in zip(dense_completion_grads, shared_completion_grads)
             ],
             "parameters": {
-                name: _gradient_norms(
-                    dense_parameter_grads[name], shared_parameter_grads[name]
-                )
+                name: _gradient_norms(dense_parameter_grads[name], shared_parameter_grads[name])
                 for name in dense_parameter_grads
             },
         }
@@ -405,9 +425,7 @@ def test_hybrid_shared_prefix_forward_and_gradient_parity(monkeypatch):
 
 @pytest.mark.internal
 @pytest.mark.timeout(180)
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="shared-prefix parity requires CUDA"
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="shared-prefix parity requires CUDA")
 def test_hybrid_model_explicit_shared_prefix_forward_matches_dense():
     pytest.importorskip("causal_conv1d")
     pytest.importorskip("flash_attn")
@@ -415,9 +433,7 @@ def test_hybrid_model_explicit_shared_prefix_forward_matches_dense():
     if not torch.cuda.is_bf16_supported():
         pytest.skip("shared-prefix parity requires CUDA bf16 support")
 
-    from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        validate_segment_layers,
-    )
+    from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
     from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -432,9 +448,7 @@ def test_hybrid_model_explicit_shared_prefix_forward_matches_dense():
     layout = SharedPrefixLayout(prefix_len=24, completion_lens=[20, 28])
 
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        context_parallel_size=1,
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
     )
     try:
         model_parallel_cuda_manual_seed(123)
@@ -475,9 +489,7 @@ def test_hybrid_model_explicit_shared_prefix_forward_matches_dense():
         ]
 
         def causal_mask(length):
-            return ~torch.tril(
-                torch.ones(1, 1, length, length, dtype=torch.bool, device="cuda")
-            )
+            return ~torch.tril(torch.ones(1, 1, length, length, dtype=torch.bool, device="cuda"))
 
         with torch.no_grad():
             dense_completion_logits = []
@@ -485,9 +497,7 @@ def test_hybrid_model_explicit_shared_prefix_forward_matches_dense():
                 tokens = torch.cat([prefix, completion]).unsqueeze(0)
                 length = tokens.shape[1]
                 logits = model(
-                    tokens,
-                    torch.arange(length, device="cuda").unsqueeze(0),
-                    causal_mask(length),
+                    tokens, torch.arange(length, device="cuda").unsqueeze(0), causal_mask(length)
                 )
                 dense_completion_logits.append(logits[0, layout.prefix_len :])
 
@@ -499,9 +509,7 @@ def test_hybrid_model_explicit_shared_prefix_forward_matches_dense():
                 shared_prefix_layout=layout,
             )[0]
 
-        for dense, completion_slice in zip(
-            dense_completion_logits, layout.completion_slices()
-        ):
+        for dense, completion_slice in zip(dense_completion_logits, layout.completion_slices()):
             shared = shared_logits[completion_slice]
             assert _relative_l2(dense, shared) < 0.05
             assert _cosine(dense, shared) > 0.99

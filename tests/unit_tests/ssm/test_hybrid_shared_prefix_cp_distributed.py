@@ -43,14 +43,20 @@ def _requires_world_size(size):
     )
 
 
-def _gather_canonical_with_grad(local_tensor, cp_group):
+def _gather_canonical_with_grad(local_tensor, cp_group, tp_group=None):
+    if tp_group is not None and tp_group.size() > 1:
+        local_tensor = torch.cat(all_gather(local_tensor, group=tp_group), dim=0)
     if cp_group.size() == 1:
         return local_tensor
     rank_major = torch.cat(all_gather(local_tensor, group=cp_group), dim=0)
     return _undo_cp_zigzag(rank_major, cp_group.size())
 
 
-def _gather_canonical(local_tensor, cp_group):
+def _gather_canonical(local_tensor, cp_group, tp_group=None):
+    if tp_group is not None and tp_group.size() > 1:
+        gathered = [torch.empty_like(local_tensor) for _ in range(tp_group.size())]
+        torch.distributed.all_gather(gathered, local_tensor, group=tp_group)
+        local_tensor = torch.cat(gathered, dim=0)
     if cp_group.size() == 1:
         return local_tensor
     gathered = [torch.empty_like(local_tensor) for _ in range(cp_group.size())]
@@ -167,6 +173,8 @@ def _run_hybrid_shared_prefix_parity(
     data_seed=7,
     dense_oracle="separate",
     run_state_fork_candidate=True,
+    tp_size=1,
+    sequence_parallel=False,
 ):
     pytest.importorskip("causal_conv1d")
     pytest.importorskip("mamba_ssm")
@@ -194,11 +202,17 @@ def _run_hybrid_shared_prefix_parity(
     from megatron.core.typed_torch import apply_module
 
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp_size
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=cp_size,
     )
     try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_rank = tp_group.rank()
         cp_group = parallel_state.get_context_parallel_group()
         cp_rank = cp_group.rank()
+        if (tp_size > 1) != sequence_parallel:
+            raise ValueError("TP/SP parity requires TP1/SP=false or TP>1/SP=true")
         # The default total of 31 requires exactly one trailing physical token for
         # both CP2 and CP4. Diagnostics may also pass a no-pad layout explicitly.
         if layout is None:
@@ -222,6 +236,8 @@ def _run_hybrid_shared_prefix_parity(
             use_mamba_mem_eff_path=False,
             hidden_dropout=0.0,
             attention_dropout=0.0,
+            tensor_model_parallel_size=tp_size,
+            sequence_parallel=sequence_parallel,
             context_parallel_size=cp_size,
             apply_query_key_layer_scaling=True,
         )
@@ -279,17 +295,26 @@ def _run_hybrid_shared_prefix_parity(
         ]
 
         def localize(global_tensor):
-            if cp_size == 1:
-                return global_tensor.detach().clone().requires_grad_(True)
-            indices = layout.cp_local_indices(
-                global_tensor.shape[0], cp_group.size(), cp_rank, global_tensor.device
-            )
-            return global_tensor.index_select(0, indices).detach().clone().requires_grad_(True)
+            if cp_size > 1:
+                indices = layout.cp_local_indices(
+                    global_tensor.shape[0], cp_group.size(), cp_rank, global_tensor.device
+                )
+                local_tensor = global_tensor.index_select(0, indices)
+            else:
+                local_tensor = global_tensor
+            if tp_size > 1:
+                if local_tensor.shape[0] % tp_size:
+                    raise ValueError("CP-local sequence must be divisible by TP size")
+                local_tensor = torch.chunk(local_tensor, tp_size, dim=0)[tp_rank]
+            return local_tensor.detach().clone().requires_grad_(True)
 
         def pad_for_cp(global_tensor):
-            if cp_size == 1:
+            if tp_size > 1:
+                multiple = 2 * tp_size * cp_size
+            elif cp_size > 1:
+                multiple = 2 * cp_size
+            else:
                 return global_tensor
-            multiple = 2 * cp_size
             padding = (-global_tensor.shape[0]) % multiple
             if not padding:
                 return global_tensor
@@ -304,7 +329,7 @@ def _run_hybrid_shared_prefix_parity(
             )
             # One global objective drives the collective autograd graph. Every rank
             # still participates in backward, but only rank zero seeds the VJP.
-            return loss * (1.0 if cp_rank == 0 else 0.0)
+            return loss * (1.0 if cp_rank == 0 and tp_rank == 0 else 0.0)
 
         scan_impl = mamba_mixer_module.mamba_chunk_scan_combined
         assert shared_prefix_module.mamba_chunk_scan_combined is scan_impl
@@ -354,11 +379,14 @@ def _run_hybrid_shared_prefix_parity(
 
         def gather_layer_records(records):
             outputs = [
-                [_gather_canonical(value.detach(), cp_group) for value in layer_records]
+                [_gather_canonical(value.detach(), cp_group, tp_group) for value in layer_records]
                 for layer_records in records
             ]
             gradients = [
-                [_gather_canonical(value.grad.detach(), cp_group) for value in layer_records]
+                [
+                    _gather_canonical(value.grad.detach(), cp_group, tp_group)
+                    for value in layer_records
+                ]
                 for layer_records in records
             ]
             return outputs, gradients
@@ -380,30 +408,51 @@ def _run_hybrid_shared_prefix_parity(
                 torch.distributed.all_gather(dy_by_rank, local_dy, group=cp_group)
                 assembled.append((torch.cat(x_by_rank, dim=2), torch.cat(dy_by_rank, dim=2)))
 
+            branch_count = len(layout.completion_lens)
+            max_logical_length = layout.prefix_len + max(layout.completion_lens)
+
+            def logical_branch(value, branch_index):
+                logical_length = layout.prefix_len + layout.completion_lens[branch_index]
+                if value.shape[0] != 1 or value.shape[1] < logical_length:
+                    raise RuntimeError(
+                        "captured Mamba branch scan does not cover its logical branch span"
+                    )
+                value = value[:, :logical_length]
+                if logical_length == max_logical_length:
+                    return value
+                return torch.cat(
+                    [
+                        value,
+                        value.new_zeros(1, max_logical_length - logical_length, *value.shape[2:]),
+                    ],
+                    dim=1,
+                )
+
             if len(assembled) == 1:
                 x, dy = assembled[0]
-                return {"x": x, "dy": dy, "calls": assembled, "call_shapes": call_shapes}
-            if len(assembled) == len(layout.completion_lens) and all(
-                x.shape[0] == 1 for x, _ in assembled
-            ):
-                max_length = max(x.shape[1] for x, _ in assembled)
-
-                def right_pad(value):
-                    if value.shape[1] == max_length:
-                        return value
-                    return torch.cat(
+                if x.shape[0] == branch_count:
+                    x = torch.cat(
                         [
-                            value,
-                            value.new_zeros(
-                                value.shape[0], max_length - value.shape[1], *value.shape[2:]
-                            ),
-                        ],
-                        dim=1,
+                            logical_branch(x[index : index + 1], index)
+                            for index in range(branch_count)
+                        ]
                     )
-
+                    dy = torch.cat(
+                        [
+                            logical_branch(dy[index : index + 1], index)
+                            for index in range(branch_count)
+                        ]
+                    )
+                return {"x": x, "dy": dy, "calls": assembled, "call_shapes": call_shapes}
+            if len(assembled) == branch_count and all(x.shape[0] == 1 for x, _ in assembled):
                 return {
-                    "x": torch.cat([right_pad(x) for x, _ in assembled], dim=0),
-                    "dy": torch.cat([right_pad(dy) for _, dy in assembled], dim=0),
+                    "x": torch.cat(
+                        [logical_branch(x, index) for index, (x, _) in enumerate(assembled)], dim=0
+                    ),
+                    "dy": torch.cat(
+                        [logical_branch(dy, index) for index, (_, dy) in enumerate(assembled)],
+                        dim=0,
+                    ),
                     "calls": assembled,
                     "call_shapes": call_shapes,
                 }
@@ -456,8 +505,8 @@ def _run_hybrid_shared_prefix_parity(
         ]
         if dense_oracle == "matched-batch":
             dense_physical_len = max(branch.shape[0] for branch in global_dense_branches)
-            if cp_size > 1:
-                multiple = 2 * cp_size
+            if cp_size > 1 or tp_size > 1:
+                multiple = 2 * cp_size * tp_size
                 dense_physical_len = ((dense_physical_len + multiple - 1) // multiple) * multiple
             global_dense_batch = torch.cat(
                 [
@@ -491,7 +540,7 @@ def _run_hybrid_shared_prefix_parity(
             0, shared_positions.index_select(0, shared_local_indices)
         )
 
-        if pattern == "M" and dense_oracle == "separate":
+        if pattern == "M" and dense_oracle == "separate" and tp_size == 1:
             # Diagnose every collective/state boundary before comparing the full layer. This
             # characterizes the pinned dependency's explicit prompt-state handoff and independently
             # verifies the uninterrupted replay baseline.
@@ -602,7 +651,7 @@ def _run_hybrid_shared_prefix_parity(
                             "output_projection": output_error,
                         }
                     )
-                if cp_rank == 0:
+                if cp_rank == 0 and tp_rank == 0:
                     print(f"CP{cp_size} Mamba stage dtypes: {stage_dtypes}")
                     print(f"CP{cp_size} Mamba stage parity: {stage_errors}")
                 for errors in stage_errors:
@@ -619,11 +668,13 @@ def _run_hybrid_shared_prefix_parity(
             with capture_mamba_scans(dense_scan_records):
                 if dense_oracle == "matched-batch":
                     local_input = dense_inputs[0]
-                    dense_rotary = rotary(local_input.shape[0] * cp_size, cp_group=cp_group)
+                    dense_rotary = rotary(
+                        local_input.shape[0] * cp_size * tp_size, cp_group=cp_group
+                    )
                     local_output = stack(
                         hidden_states=local_input, attention_mask=None, rotary_pos_emb=dense_rotary
                     )
-                    global_output = _gather_canonical_with_grad(local_output, cp_group)
+                    global_output = _gather_canonical_with_grad(local_output, cp_group, tp_group)
                     dense_outputs.extend(
                         global_output[
                             layout.prefix_len : layout.prefix_len + completion_len,
@@ -635,13 +686,17 @@ def _run_hybrid_shared_prefix_parity(
                     for local_input, completion_len in zip(
                         dense_inputs, layout.completion_lens, strict=True
                     ):
-                        dense_rotary = rotary(local_input.shape[0] * cp_size, cp_group=cp_group)
+                        dense_rotary = rotary(
+                            local_input.shape[0] * cp_size * tp_size, cp_group=cp_group
+                        )
                         local_output = stack(
                             hidden_states=local_input,
                             attention_mask=None,
                             rotary_pos_emb=dense_rotary,
                         )
-                        global_output = _gather_canonical_with_grad(local_output, cp_group)
+                        global_output = _gather_canonical_with_grad(
+                            local_output, cp_group, tp_group
+                        )
                         dense_outputs.append(
                             global_output[layout.prefix_len : layout.prefix_len + completion_len]
                         )
@@ -687,14 +742,15 @@ def _run_hybrid_shared_prefix_parity(
             dense_local_d_absolute_sum,
         ) = reconstruct_d_gradient(dense_scan_records)
         if dense_oracle == "matched-batch":
-            global_dense_input_grad = _gather_canonical(dense_inputs[0].grad, cp_group)
+            global_dense_input_grad = _gather_canonical(dense_inputs[0].grad, cp_group, tp_group)
             dense_input_grads = [
                 global_dense_input_grad[:, branch_index : branch_index + 1]
                 for branch_index in range(len(probes))
             ]
         else:
             dense_input_grads = [
-                _gather_canonical(local_input.grad, cp_group) for local_input in dense_inputs
+                _gather_canonical(local_input.grad, cp_group, tp_group)
+                for local_input in dense_inputs
             ]
         dense_parameter_grads = {}
         dense_local_parameter_grads = {}
@@ -704,6 +760,10 @@ def _run_hybrid_shared_prefix_parity(
             local_gradient = parameter.grad.detach().clone()
             dense_local_parameter_grads[name] = local_gradient
             gradient = local_gradient.clone()
+            if tp_size > 1 and getattr(parameter, "sequence_parallel", False):
+                # Match finalize_model_grads: replicated parameters see only their
+                # local SP token slice during backward and require a TP SUM.
+                torch.distributed.all_reduce(gradient, group=tp_group)
             torch.distributed.all_reduce(gradient, group=cp_group)
             dense_parameter_grads[name] = gradient
 
@@ -715,7 +775,7 @@ def _run_hybrid_shared_prefix_parity(
             layer_records, attention_records, handles = install_layer_captures()
             mamba_attribute = (
                 "_forward_mamba_layer_shared_prefix"
-                if cp_size == 1
+                if cp_size == 1 and tp_size == 1
                 else "_forward_mamba_layer_shared_prefix_cp"
             )
             mamba_implementation = mamba_impl or getattr(shared_prefix_module, mamba_attribute)
@@ -737,7 +797,7 @@ def _run_hybrid_shared_prefix_parity(
                     )
             finally:
                 remove_handles(handles)
-            global_output = _gather_canonical_with_grad(local_output, cp_group)
+            global_output = _gather_canonical_with_grad(local_output, cp_group, tp_group)
             outputs = [
                 global_output[completion_slice] for completion_slice in layout.completion_slices()
             ]
@@ -748,7 +808,7 @@ def _run_hybrid_shared_prefix_parity(
             d_formula, d_absolute_sum, local_d_formula, local_d_absolute_sum = (
                 reconstruct_d_gradient(scan_records)
             )
-            input_grad = _gather_canonical(local_input.grad, cp_group)
+            input_grad = _gather_canonical(local_input.grad, cp_group, tp_group)
             parameter_grads = {}
             local_parameter_grads = {}
             for name, parameter in stack.named_parameters():
@@ -757,6 +817,8 @@ def _run_hybrid_shared_prefix_parity(
                 local_gradient = parameter.grad.detach().clone()
                 local_parameter_grads[name] = local_gradient
                 gradient = local_gradient.clone()
+                if tp_size > 1 and getattr(parameter, "sequence_parallel", False):
+                    torch.distributed.all_reduce(gradient, group=tp_group)
                 torch.distributed.all_reduce(gradient, group=cp_group)
                 parameter_grads[name] = gradient
             return (
@@ -1259,20 +1321,21 @@ def _run_hybrid_shared_prefix_parity(
                 .flatten()[worst_index]
                 .item(),
             }
-            if cp_rank == 0:
-                print(f"CP{cp_size} {pattern} {label} parity: {summary}")
-                print(f"CP{cp_size} {pattern} {label} parameter outliers: {outliers}")
+            if cp_rank == 0 and tp_rank == 0:
+                topology = f"TP{tp_size}/CP{cp_size}/SP{int(sequence_parallel)}"
+                print(f"{topology} {pattern} {label} parity: {summary}")
+                print(f"{topology} {pattern} {label} parameter outliers: {outliers}")
                 print(
-                    f"CP{cp_size} {pattern} {label} layer-boundary diagnostics: "
+                    f"{topology} {pattern} {label} layer-boundary diagnostics: "
                     f"{boundary_diagnostics}"
                 )
                 print(
-                    f"CP{cp_size} {pattern} {label} attention diagnostics: "
+                    f"{topology} {pattern} {label} attention diagnostics: "
                     f"{attention_diagnostics}"
                 )
-                print(f"CP{cp_size} {pattern} {label} scan diagnostics: {scan_diagnostics}")
+                print(f"{topology} {pattern} {label} scan diagnostics: {scan_diagnostics}")
                 print(
-                    f"CP{cp_size} {pattern} {label} D-formula diagnostics: "
+                    f"{topology} {pattern} {label} D-formula diagnostics: "
                     f"{d_formula_diagnostics}"
                 )
 
@@ -1334,7 +1397,8 @@ def _run_hybrid_shared_prefix_parity(
 
         fork_metrics = None
         fork_parameter_grads = None
-        if cp_size > 1 and run_state_fork_candidate:
+        uses_parallel_mamba_adapter = cp_size > 1 or tp_size > 1
+        if uses_parallel_mamba_adapter and run_state_fork_candidate:
             (
                 fork_outputs,
                 fork_input_grad,
@@ -1386,7 +1450,7 @@ def _run_hybrid_shared_prefix_parity(
             production_local_d_formula,
             production_local_d_absolute_sum,
         ) = run_shared(production_input)
-        production_label = "cp1" if cp_size == 1 else "state-fork-default"
+        production_label = "tp1-cp1" if not uses_parallel_mamba_adapter else "state-fork-default"
         if dense_oracle != "separate" or not run_state_fork_candidate:
             production_label = (
                 f"{production_label}-vs-{dense_oracle}-seed{data_seed}"
@@ -1411,7 +1475,7 @@ def _run_hybrid_shared_prefix_parity(
 
         fallback_metrics = None
         fallback_parameter_grads = None
-        if cp_size > 1 and run_state_fork_candidate:
+        if uses_parallel_mamba_adapter and run_state_fork_candidate:
             fallback_input = localize(global_packed)
             (
                 fallback_outputs,
@@ -1461,9 +1525,9 @@ def _run_hybrid_shared_prefix_parity(
                 )
                 for name in sorted(outlier_names)
             }
-            if cp_rank == 0:
+            if cp_rank == 0 and tp_rank == 0:
                 print(
-                    f"CP{cp_size} {pattern} state-fork default vs replay fallback "
+                    f"TP{tp_size}/CP{cp_size} {pattern} state-fork default vs replay fallback "
                     f"parameter outliers: {default_fallback_parameter_stats}"
                 )
 
@@ -1492,11 +1556,181 @@ def test_cp1_mixed_hybrid_shared_prefix_all_parameter_baseline():
     _run_hybrid_shared_prefix_parity("M*", cp_size=1, hidden_size=256, query_heads=4, kv_heads=1)
 
 
+@pytest.mark.timeout(600)
+@_requires_world_size(2)
+def test_tp2_cp1_sp_mixed_shared_prefix_matches_dense_forward_and_backward():
+    _run_hybrid_shared_prefix_parity(
+        "M*",
+        tp_size=2,
+        sequence_parallel=True,
+        cp_size=1,
+        hidden_size=256,
+        query_heads=32,
+        kv_heads=2,
+        kv_channels=128,
+        mamba_heads=64,
+        mamba_groups=8,
+        layout=SharedPrefixLayout(prefix_len=4, completion_lens=[3, 4]),
+        dense_oracle="matched-batch",
+    )
+
+
+@pytest.mark.parametrize("cp_size", [pytest.param(1, id="cp1"), pytest.param(2, id="cp2")])
+@pytest.mark.timeout(900)
+def test_tp2_sp_hybrid_model_returns_full_cp_local_tp_vocab_shard(cp_size):
+    pytest.importorskip("causal_conv1d")
+    pytest.importorskip("flash_attn")
+    pytest.importorskip("mamba_ssm")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("TP/SP parity requires CUDA bf16 support")
+
+    from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer import TransformerConfig
+
+    tp_size = 2
+    required_world_size = tp_size * cp_size
+    if int(os.environ.get("WORLD_SIZE", "1")) != required_world_size:
+        pytest.skip(f"TP2/CP{cp_size} requires torchrun --nproc_per_node={required_world_size}")
+    hidden_size = 256
+    vocab_size = 512
+    pattern = "M*"
+    layout = SharedPrefixLayout(prefix_len=4, completion_lens=[3, 4])
+    physical_multiple = 2 * tp_size * cp_size
+    physical_len = (
+        (layout.total_len + physical_multiple - 1) // physical_multiple
+    ) * physical_multiple
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=cp_size,
+    )
+    try:
+        previous_qk_layer_scaling = os.environ.get("NVTE_APPLY_QK_LAYER_SCALING")
+        os.environ["NVTE_APPLY_QK_LAYER_SCALING"] = "1"
+        torch.manual_seed(20260827)
+        model_parallel_cuda_manual_seed(20260827)
+        config = TransformerConfig(
+            hidden_size=hidden_size,
+            num_layers=len(validate_segment_layers(pattern)),
+            num_attention_heads=4,
+            num_query_groups=1,
+            tensor_model_parallel_size=tp_size,
+            context_parallel_size=cp_size,
+            sequence_parallel=True,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_mamba_mem_eff_path=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            apply_query_key_layer_scaling=True,
+        )
+        process_groups = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "pp", "cp", "embd", "dp_cp"]
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=vocab_size,
+            max_sequence_length=physical_len,
+            hybrid_layer_pattern=pattern,
+            position_embedding_type="rope",
+            pre_process=True,
+            post_process=True,
+            parallel_output=True,
+            pg_collection=process_groups,
+        ).cuda()
+        cp_group = process_groups.cp
+        cp_rank = cp_group.rank()
+
+        def cp_localize(global_tensor):
+            if cp_size == 1:
+                return global_tensor
+            indices = layout.cp_local_indices(
+                global_tensor.shape[0], cp_size, cp_rank, global_tensor.device
+            )
+            return global_tensor.index_select(0, indices)
+
+        global_tokens = torch.arange(physical_len, device="cuda") % vocab_size
+        tokens = cp_localize(global_tokens).unsqueeze(0)
+        position_ids = cp_localize(layout.padded_position_ids(physical_len, "cuda")).unsqueeze(0)
+        dense_completion_logits = []
+        with torch.no_grad():
+            for completion_slice in layout.completion_slices():
+                completion_len = completion_slice.stop - completion_slice.start
+                branch_tokens = torch.cat(
+                    [global_tokens[: layout.prefix_len], global_tokens[completion_slice]], dim=0
+                )
+                dense_len = 8
+                branch_tokens = torch.cat(
+                    [branch_tokens, branch_tokens.new_zeros(dense_len - branch_tokens.shape[0])]
+                ).unsqueeze(0)
+                dense_position_ids = torch.arange(dense_len, device="cuda")
+                branch_tokens = cp_localize(branch_tokens[0]).unsqueeze(0)
+                dense_position_ids = cp_localize(dense_position_ids).unsqueeze(0)
+                dense_logits = model(branch_tokens, dense_position_ids, None)
+                dense_logits = _gather_canonical(dense_logits.transpose(0, 1), cp_group).transpose(
+                    0, 1
+                )
+                dense_completion_logits.append(
+                    dense_logits[0, layout.prefix_len : layout.prefix_len + completion_len]
+                )
+
+        logits = model(tokens, position_ids, None, shared_prefix_layout=layout)
+
+        assert logits.shape == (1, physical_len // cp_size, vocab_size // tp_size)
+        assert logits.shape[-1] == model.output_layer.output_size_per_partition
+        assert torch.isfinite(logits).all()
+        global_shared_logits = _gather_canonical(
+            logits.detach().transpose(0, 1), cp_group
+        ).transpose(0, 1)
+        for dense_logits, completion_slice in zip(
+            dense_completion_logits, layout.completion_slices(), strict=True
+        ):
+            shared_logits = global_shared_logits[0, completion_slice]
+            assert _relative_l2(dense_logits, shared_logits) < 0.05
+            assert _cosine(dense_logits, shared_logits) > 0.99
+
+        logits.float().square().mean().backward()
+        assert model.output_layer.weight.grad is not None
+        assert model.decoder.layers[0].mixer.in_proj.weight.grad is not None
+    finally:
+        Utils.destroy_model_parallel()
+        if previous_qk_layer_scaling is None:
+            os.environ.pop("NVTE_APPLY_QK_LAYER_SCALING", None)
+        else:
+            os.environ["NVTE_APPLY_QK_LAYER_SCALING"] = previous_qk_layer_scaling
+
+
 @pytest.mark.parametrize("pattern", [pytest.param("M", id="mamba"), pytest.param("M*", id="mixed")])
 @pytest.mark.timeout(300)
 @_requires_world_size(2)
 def test_cp2_hybrid_shared_prefix_matches_dense_branches_forward_and_backward(pattern):
     _run_hybrid_shared_prefix_parity(pattern, cp_size=2, hidden_size=256, query_heads=4, kv_heads=1)
+
+
+@pytest.mark.timeout(900)
+@_requires_world_size(4)
+def test_tp2_cp2_sp_mixed_shared_prefix_matches_dense_forward_and_backward():
+    _run_hybrid_shared_prefix_parity(
+        "M*",
+        tp_size=2,
+        sequence_parallel=True,
+        cp_size=2,
+        hidden_size=256,
+        query_heads=32,
+        kv_heads=2,
+        kv_channels=128,
+        mamba_heads=64,
+        mamba_groups=8,
+        layout=SharedPrefixLayout(prefix_len=4, completion_lens=[3, 4]),
+        dense_oracle="matched-batch",
+    )
 
 
 @pytest.mark.parametrize(

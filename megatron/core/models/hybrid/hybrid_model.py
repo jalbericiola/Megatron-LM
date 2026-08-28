@@ -16,6 +16,7 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import Yar
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid.shared_prefix import (
     SharedPrefixLayout,
+    _validate_shared_prefix_physical_length,
     forward_hybrid_stack_shared_prefix,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -446,13 +447,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         It either returns the Loss values if labels are given or the final hidden units
 
-        ``shared_prefix_layout`` explicitly selects the TP1 star path. The global packed input is
-        ``[prefix, completion_1, ..., completion_G, optional_CP_padding]`` with batch size one;
-        CP1 receives it whole, while CP>1 receives standard two-chunk zigzag sequence shards. The
-        layout owns the exact tree mask and prefix-continued RoPE positions. The normal decoder
-        path is unchanged when the argument is ``None``. With ``labels=None``, CP>1 logits remain
-        ``[1, physical_len/CP, vocab]`` in the input shard's zigzag token order; this model does not
-        gather logits across CP.
+        ``shared_prefix_layout`` explicitly selects the star path. The global packed input is
+        ``[prefix, completion_1, ..., completion_G, optional_topology_padding]`` with batch size
+        one; CP1 receives it whole, while CP>1 receives standard two-chunk zigzag sequence shards.
+        With TP>1, input IDs remain CP-local and replicated over TP; sequence parallelism starts at
+        the embedding output. The layout owns the exact tree mask and prefix-continued RoPE
+        positions. The normal decoder path is unchanged when the argument is ``None``. With
+        ``labels=None`` and parallel output, logits remain
+        ``[1, physical_len/CP, padded_vocab/TP]`` in the input shard's zigzag token order; this
+        model gathers neither sequence across CP nor vocabulary across TP.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -494,28 +497,38 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 raise NotImplementedError(
                     "shared-prefix Hybrid forward requires standard RoPE attention"
                 )
-            if self.config.recompute_granularity == 'full':
+            tp_size = self.pg_collection.tp.size()
+            cp_size = self.pg_collection.cp.size()
+            if tp_size > 1 and not self.config.sequence_parallel:
                 raise NotImplementedError(
-                    "shared-prefix Hybrid forward does not yet support full-layer recomputation"
+                    "shared-prefix HybridModel TP>1 requires sequence parallelism"
+                )
+            if tp_size == 1 and self.config.sequence_parallel:
+                raise NotImplementedError(
+                    "shared-prefix HybridModel sequence parallelism requires TP>1"
+                )
+            if self.config.tensor_model_parallel_size != tp_size:
+                raise RuntimeError(
+                    "shared-prefix HybridModel tensor-parallel config does not match its "
+                    "process group"
+                )
+            if tp_size > 1 and (not self.parallel_output or runtime_gather_output):
+                raise NotImplementedError(
+                    "shared-prefix HybridModel TP/SP requires TP-sharded parallel output logits"
                 )
             if decoder_input is None:
-                cp_size = self.pg_collection.cp.size()
                 if input_ids is None or input_ids.ndim != 2 or input_ids.shape[0] != 1:
                     raise ValueError(
                         "shared-prefix Hybrid input_ids must have shape [1, physical_len/CP]"
                     )
                 physical_len = input_ids.shape[1] * cp_size
-                if cp_size == 1 and physical_len != shared_prefix_layout.total_len:
-                    raise ValueError(
-                        "shared-prefix CP1 input_ids length must equal layout.total_len"
-                    )
-                if cp_size > 1 and (
-                    physical_len % (2 * cp_size)
-                    or not 0 <= physical_len - shared_prefix_layout.total_len < 2 * cp_size
-                ):
-                    raise ValueError(
-                        "shared-prefix CP input_ids must be minimally padded to a 2*CP multiple"
-                    )
+                _validate_shared_prefix_physical_length(
+                    shared_prefix_layout,
+                    physical_len,
+                    tp_size=tp_size,
+                    cp_size=cp_size,
+                    sequence_parallel=self.config.sequence_parallel,
+                )
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -553,11 +566,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 raise RuntimeError("shared-prefix Hybrid embedding did not produce decoder input")
             cp_group = self.pg_collection.cp
             cp_size = cp_group.size()
-            physical_len = decoder_input.shape[0] * cp_size
+            tp_size = self.pg_collection.tp.size()
+            sequence_shards = tp_size if self.config.sequence_parallel else 1
+            physical_len = decoder_input.shape[0] * cp_size * sequence_shards
             if decoder_input.ndim != 3 or decoder_input.shape[1] != 1:
                 raise ValueError(
                     "shared-prefix Hybrid decoder input must have shape "
-                    "[physical_len/CP, 1, hidden]"
+                    "[physical_len/(TP*CP), 1, hidden] when sequence parallelism is enabled"
                 )
             rotary_table = self.rotary_pos_emb.get_emb(
                 shared_prefix_layout.prefix_len + max(shared_prefix_layout.completion_lens)

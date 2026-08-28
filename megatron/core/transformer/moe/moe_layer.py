@@ -442,13 +442,23 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        token_multiplicities: Optional[torch.Tensor] = None,
+    ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        if token_multiplicities is None:
+            probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        else:
+            probs, routing_map = apply_module(self.router)(
+                hidden_states, padding_mask, token_multiplicities
+            )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -654,12 +664,19 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
+        # Capture before checkpointing constructs its closure. The shared-prefix
+        # caller removes the scoped attribute after forward, while selective MoE
+        # recomputation happens later in backward.
+        token_multiplicities = getattr(self, "_shared_prefix_token_multiplicities", None)
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    probs, routing_map = self.route(
+                        hidden_states, padding_mask, token_multiplicities
+                    )
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
