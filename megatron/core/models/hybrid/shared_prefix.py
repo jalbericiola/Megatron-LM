@@ -19,6 +19,7 @@ padding, MoE expert-bias accounting, and full uniform activation recomputation. 
 tokens remain distinct so integrations can require the exact supported conjunction.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -28,6 +29,7 @@ from einops import rearrange
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import (
     MAMBA_HAS_STATE_DTYPE,
@@ -98,6 +100,26 @@ class SharedPrefixLayout:
             slices.append(slice(start, start + length))
             start += length
         return tuple(slices)
+
+    def dense_branch_indices(self, device: torch.device | str) -> tuple[Tensor, ...]:
+        """Return global-star indices for conventional prompt-completion sequences.
+
+        MTP's token shifts are defined on an ordinary causal sequence and must
+        never cross between sibling completion branches.  These indices provide
+        the exact inverse of prompt deduplication: the prompt is repeated once
+        for each physical completion, including that completion's ordinary
+        per-sequence padding.
+        """
+        prompt = torch.arange(self.prefix_len, device=device, dtype=torch.long)
+        return tuple(
+            torch.cat(
+                (
+                    prompt,
+                    torch.arange(branch.start, branch.stop, device=device, dtype=torch.long),
+                )
+            )
+            for branch in self.completion_slices()
+        )
 
     def position_ids(self, device: torch.device | str) -> Tensor:
         """Prefix-continued RoPE positions for the packed star."""
@@ -197,6 +219,26 @@ def _prefix_conv_context(xbc: Tensor, width: int) -> Tensor:
         return xbc[:, :, :0]
     padded = F.pad(xbc, (max(0, width - xbc.shape[-1]), 0))
     return padded[:, :, -width:].clone()
+
+
+def _mamba_prefix_fork_boundary(mixer: MambaMixer, prefix_len: int) -> int:
+    """Return the last scan-chunk boundary at or before ``prefix_len``.
+
+    Restarting ``mamba_chunk_scan_combined`` at an arbitrary token changes its
+    internal chunk partition.  With BF16 training state, that extra state
+    boundary is numerically visible after many Hybrid layers.  Fork only at an
+    ordinary Mamba chunk boundary and replay the (short) prompt tail inside
+    each completion branch so the state-fork and uninterrupted scans use the
+    same chunk partition.
+    """
+    prefix_len = int(prefix_len)
+    chunk_size = getattr(mixer, "chunk_size", None)
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        message = "shared-prefix Mamba requires a positive integer chunk_size"
+        raise ValueError(f"{message}, got {chunk_size!r}")
+    if prefix_len < 1:
+        raise ValueError("shared-prefix Mamba requires a non-empty prefix")
+    return prefix_len - prefix_len % chunk_size
 
 
 def _scan_mamba_projected_segment(
@@ -388,9 +430,13 @@ def _fork_mamba_segment(
 
 
 def _fork_mamba_branches(
-    mixer: MambaMixer, branches: Tensor, *, conv_context: Tensor, ssm_initial_state: Tensor
+    mixer: MambaMixer,
+    branches: Tensor,
+    *,
+    conv_context: Tensor | None,
+    ssm_initial_state: Tensor | None,
 ) -> tuple[Tensor, Tensor | None]:
-    """Scan a right-padded batch of completion branches from one prefix state."""
+    """Scan right-padded prompt-tail/completion branches from an aligned state."""
     _validate_mamba_fork(mixer)
     if mixer.pg_collection.tp.size() != 1:
         raise RuntimeError(
@@ -418,14 +464,22 @@ def _fork_mamba_branches(
     A = -torch.exp(cp.get_A_log().float())
 
     xbc = rearrange(xbc, "b l d -> b d l").contiguous()
-    repeated_context = conv_context.to(xbc.dtype).expand(branch_count, -1, -1)
-    conv_input = torch.cat([repeated_context, xbc], dim=-1)
-    conv_output = causal_conv1d_fn(
-        conv_input,
-        rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
-        cp.get_conv1d_bias(),
-        activation=mixer.activation,
-    )[:, :, repeated_context.shape[-1] :]
+    if conv_context is None:
+        conv_output = causal_conv1d_fn(
+            xbc,
+            rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
+            cp.get_conv1d_bias(),
+            activation=mixer.activation,
+        )
+    else:
+        repeated_context = conv_context.to(xbc.dtype).expand(branch_count, -1, -1)
+        conv_input = torch.cat([repeated_context, xbc], dim=-1)
+        conv_output = causal_conv1d_fn(
+            conv_input,
+            rearrange(cp.get_conv1d_weight(), "d 1 w -> d w"),
+            cp.get_conv1d_bias(),
+            activation=mixer.activation,
+        )[:, :, repeated_context.shape[-1] :]
     xbc = rearrange(conv_output, "b d l -> b l d").contiguous()
 
     x, B, C = torch.split(
@@ -435,9 +489,11 @@ def _fork_mamba_branches(
     B = rearrange(B, "b l (g n) -> b l g n", n=mixer.d_state).contiguous()
     C = rearrange(C, "b l (g n) -> b l g n", n=mixer.d_state).contiguous()
     z = rearrange(z, "b l (h p) -> b l h p", p=mixer.headdim).contiguous()
-    initial_states = ssm_initial_state.expand(
-        branch_count, *ssm_initial_state.shape[1:]
-    ).contiguous()
+    initial_states = (
+        None
+        if ssm_initial_state is None
+        else ssm_initial_state.expand(branch_count, *ssm_initial_state.shape[1:]).contiguous()
+    )
 
     y = mamba_chunk_scan_combined(
         x,
@@ -472,28 +528,44 @@ def _forward_mamba_layer_shared_prefix(
     residual = hidden_states.float() if layer.config.fp32_residual_connection else hidden_states
     normalized = apply_module(layer.norm)(hidden_states.to(dtype=layer.config.params_dtype))
 
-    prefix_output, output_bias, conv_context, final_state = _fork_mamba_segment(
-        layer.mixer, normalized[: layout.prefix_len], capture_state=True
-    )
+    fork_boundary = _mamba_prefix_fork_boundary(layer.mixer, layout.prefix_len)
+    replayed_prefix_len = layout.prefix_len - fork_boundary
+    prefix_output = normalized.new_empty((0, 1, normalized.shape[-1]))
+    output_bias = None
+    conv_context = None
+    final_state = None
+    if fork_boundary:
+        prefix_output, output_bias, conv_context, final_state = _fork_mamba_segment(
+            layer.mixer, normalized[:fork_boundary], capture_state=True
+        )
     physical_completion_lens = list(layout.completion_lens)
     physical_completion_lens[-1] += hidden_states.shape[0] - layout.total_len
-    max_completion_len = max(physical_completion_lens)
+    max_completion_len = replayed_prefix_len + max(physical_completion_lens)
     branches = normalized.new_zeros(
         max_completion_len, len(physical_completion_lens), normalized.shape[-1]
     )
     start = layout.prefix_len
     for branch_index, completion_len in enumerate(physical_completion_lens):
-        branches[:completion_len, branch_index] = normalized[start : start + completion_len, 0]
+        if replayed_prefix_len:
+            branches[:replayed_prefix_len, branch_index] = normalized[
+                fork_boundary : layout.prefix_len, 0
+            ]
+        branches[replayed_prefix_len : replayed_prefix_len + completion_len, branch_index] = (
+            normalized[start : start + completion_len, 0]
+        )
         start += completion_len
     if start != hidden_states.shape[0]:
         raise RuntimeError("shared-prefix branch spans do not cover physical sequence")
-    branch_output, _ = _fork_mamba_branches(
+    branch_output, branch_bias = _fork_mamba_branches(
         layer.mixer, branches, conv_context=conv_context, ssm_initial_state=final_state
     )
+    if output_bias is None:
+        output_bias = branch_bias
+    prefix_output = torch.cat([prefix_output, branch_output[:replayed_prefix_len, :1]], dim=0)
     packed_output = torch.cat(
         [prefix_output]
         + [
-            branch_output[:length, index : index + 1]
+            branch_output[replayed_prefix_len : replayed_prefix_len + length, index : index + 1]
             for index, length in enumerate(physical_completion_lens)
         ],
         dim=0,
@@ -512,9 +584,10 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
 
     The input projection first gathers sequence-parallel TP shards, then the CP adapter converts
     local zigzag sequence shards into one canonical global sequence with TP/CP-local channels.
-    State-fork scans the prefix once and expands its differentiable state; replay is retained as a
-    parity baseline and repeats the projected prefix per branch. The packed result returns through
-    the inverse CP transform and TP output-projection reduce-scatter.
+    State-fork scans the chunk-aligned prefix head once, expands its differentiable state, and
+    replays only the unaligned prompt tail per branch. Replay is retained as a parity baseline and
+    repeats the full projected prefix per branch. The packed result returns through the inverse CP
+    transform and TP output-projection reduce-scatter.
     """
     mixer = layer.mixer
     _validate_mamba_fork(mixer)
@@ -537,15 +610,18 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
     # The topology validator owns physical alignment. Padding is placed after the final completion;
     # scanning it as that branch's causal tail cannot affect any real-token output.
     physical_completion_lens[-1] += physical_len - layout.total_len
-    branch_prefix_len = layout.prefix_len if replay_prefix else 0
+    fork_boundary = 0 if replay_prefix else _mamba_prefix_fork_boundary(mixer, layout.prefix_len)
+    branch_prefix_len = layout.prefix_len if replay_prefix else layout.prefix_len - fork_boundary
     max_branch_len = branch_prefix_len + max(physical_completion_lens)
     branches = projected.new_zeros(
         max_branch_len, len(physical_completion_lens), projected.shape[-1]
     )
     start = layout.prefix_len
     for branch_index, completion_len in enumerate(physical_completion_lens):
-        if replay_prefix:
-            branches[: layout.prefix_len, branch_index] = projected[: layout.prefix_len, 0]
+        if branch_prefix_len:
+            branches[:branch_prefix_len, branch_index] = projected[
+                layout.prefix_len - branch_prefix_len : layout.prefix_len, 0
+            ]
         branches[branch_prefix_len : branch_prefix_len + completion_len, branch_index] = projected[
             start : start + completion_len, 0
         ]
@@ -558,14 +634,23 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
         prefix_y = branch_y[: layout.prefix_len, :1]
         prefix_z = branch_z[: layout.prefix_len, :1]
     else:
-        prefix_y, prefix_z, conv_context, final_state = _scan_mamba_projected_segment(
-            mixer, projected[: layout.prefix_len], capture_state=True
-        )
-        if conv_context is None or final_state is None:
-            raise RuntimeError("shared-prefix CP Mamba scan did not return a differentiable state")
+        prefix_y = projected.new_empty((0, 1, mixer.cp.d_inner_local_tpcp))
+        prefix_z = projected.new_empty((0, 1, mixer.cp.d_inner_local_tpcp))
+        conv_context = None
+        final_state = None
+        if fork_boundary:
+            prefix_y, prefix_z, conv_context, final_state = _scan_mamba_projected_segment(
+                mixer, projected[:fork_boundary], capture_state=True
+            )
+            if conv_context is None or final_state is None:
+                raise RuntimeError(
+                    "shared-prefix CP Mamba scan did not return a differentiable state"
+                )
         branch_y, branch_z, _, _ = _scan_mamba_projected_segment(
             mixer, branches, conv_context=conv_context, ssm_initial_state=final_state
         )
+        prefix_y = torch.cat([prefix_y, branch_y[:branch_prefix_len, :1]], dim=0)
+        prefix_z = torch.cat([prefix_z, branch_z[:branch_prefix_len, :1]], dim=0)
     packed_y = torch.cat(
         [prefix_y]
         + [
@@ -597,7 +682,7 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
 def _forward_mamba_layer_shared_prefix_cp_state_fork(
     layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout
 ) -> Tensor:
-    """Optimized CP Mamba candidate: scan the prefix once and fork differentiable state."""
+    """Optimized CP Mamba: fork at a scan-chunk boundary and replay the prompt tail."""
     return _forward_mamba_layer_shared_prefix_cp_impl(
         layer, hidden_states, layout, replay_prefix=False
     )
@@ -612,11 +697,219 @@ def _forward_mamba_layer_shared_prefix_cp_replay(
     )
 
 
+def _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
+    layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout
+) -> Tensor:
+    """Diagnostic dense replay through Mamba's unchanged packed fused path.
+
+    This deliberately gives up Mamba prefix sharing.  It reconstructs the ordinary
+    branch-major packed batch from the canonical star, invokes ``MambaLayer.forward``
+    with the same ``PackedSeqParams`` contract as dense NeMo-RL sequence packing, and
+    then folds the result back to one shared-prefix star.  Consequently the oracle
+    exercises ``mamba_split_conv1d_scan_combined(seq_idx=...)`` rather than the
+    decomposed causal-convolution/chunk-scan implementation used by the optimized
+    state-fork path.
+
+    The helper is a correctness fallback and an isolation oracle.  It is selected
+    explicitly with ``NRL_SP_MAMBA_IMPL=packed_fused``; the optimized state-fork
+    implementation remains the default until end-to-end GPU parity validates a
+    safer default.
+    """
+    mixer = layer.mixer
+    if not isinstance(mixer, MambaMixer):
+        raise TypeError("shared-prefix packed-fused Mamba oracle requires MambaMixer")
+    tp_group = mixer.pg_collection.tp
+    cp_group = mixer.pg_collection.cp
+    tp_size = tp_group.size()
+    cp_size = cp_group.size()
+    physical_len = hidden_states.shape[0] * tp_size * cp_size
+    _validate_shared_prefix_physical_length(
+        layout,
+        physical_len,
+        tp_size=tp_size,
+        cp_size=cp_size,
+        sequence_parallel=bool(mixer.config.sequence_parallel),
+    )
+
+    # [star/(TP*CP),1,H] -> one canonical global star.  The oracle runs under
+    # no_grad, but use the same collectives/order as the differentiable MTP
+    # reconstruction so the forward topology is representative.
+    cp_local_star = hidden_states
+    if tp_size > 1:
+        cp_local_star = tensor_parallel.gather_from_sequence_parallel_region(
+            cp_local_star, tensor_parallel_output_grad=False, group=tp_group
+        )
+    if cp_size > 1:
+        rank_order_star = tensor_parallel.gather_from_sequence_parallel_region(
+            cp_local_star, tensor_parallel_output_grad=True, group=cp_group
+        )
+        rank_order_indices = torch.cat(
+            [
+                layout.cp_local_indices(physical_len, cp_size, rank, hidden_states.device)
+                for rank in range(cp_size)
+            ]
+        )
+        inverse_order = torch.empty_like(rank_order_indices)
+        inverse_order[rank_order_indices] = torch.arange(
+            physical_len, device=hidden_states.device, dtype=torch.long
+        )
+        global_star = rank_order_star.index_select(0, inverse_order)
+    else:
+        global_star = cp_local_star
+    if global_star.shape != (physical_len, 1, hidden_states.shape[-1]):
+        raise RuntimeError(
+            "shared-prefix packed-fused Mamba oracle reconstructed an invalid star shape"
+        )
+
+    # Drop topology-only padding after the final completion.  Dense NeMo-RL
+    # padding is per branch, and those physical branch tails are already part of
+    # layout.completion_lens.
+    branch_indices = layout.dense_branch_indices(hidden_states.device)
+    branch_lengths = [int(indices.numel()) for indices in branch_indices]
+    dense_global = torch.cat(
+        [global_star.index_select(0, indices) for indices in branch_indices], dim=0
+    )
+    dense_total = sum(branch_lengths)
+    if dense_global.shape[0] != dense_total:
+        raise RuntimeError("shared-prefix packed-fused Mamba oracle built an invalid dense batch")
+    if cp_size > 1 and any(length % (2 * cp_size) for length in branch_lengths):
+        raise ValueError(
+            "shared-prefix packed-fused Mamba oracle requires each dense branch "
+            "to divide the CP zigzag quantum"
+        )
+
+    # Match NeMo-RL's per-sequence CP zigzag packing, then its TP sequence
+    # parallel shard.  This ordering is distinct from the whole-star CP layout.
+    if cp_size > 1:
+        dense_cp_indices = []
+        branch_offset = 0
+        for branch_length in branch_lengths:
+            dense_cp_indices.append(
+                branch_offset
+                + layout.cp_local_indices(
+                    branch_length, cp_size, cp_group.rank(), hidden_states.device
+                )
+            )
+            branch_offset += branch_length
+        dense_cp_indices = torch.cat(dense_cp_indices)
+        dense_cp_local = dense_global.index_select(0, dense_cp_indices)
+    else:
+        dense_cp_local = dense_global
+    dense_local = dense_cp_local
+    if tp_size > 1:
+        dense_local = tensor_parallel.scatter_to_sequence_parallel_region(
+            dense_local, group=tp_group
+        )
+
+    cumulative_lengths = [0]
+    for branch_length in branch_lengths:
+        cumulative_lengths.append(cumulative_lengths[-1] + branch_length)
+    cu_seqlens = torch.tensor(cumulative_lengths, device=hidden_states.device, dtype=torch.int32)
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
+        max_seqlen_q=max(branch_lengths),
+        max_seqlen_kv=max(branch_lengths),
+        total_tokens=dense_total,
+    )
+    dense_output_local = layer(
+        hidden_states=dense_local, attention_mask=None, packed_seq_params=packed_seq_params
+    )
+    if isinstance(dense_output_local, tuple):
+        dense_output_local = dense_output_local[0]
+
+    dense_output_cp_local = dense_output_local
+    if tp_size > 1:
+        dense_output_cp_local = tensor_parallel.gather_from_sequence_parallel_region(
+            dense_output_cp_local, tensor_parallel_output_grad=False, group=tp_group
+        )
+    if cp_size > 1:
+        dense_rank_order = tensor_parallel.gather_from_sequence_parallel_region(
+            dense_output_cp_local, tensor_parallel_output_grad=True, group=cp_group
+        )
+        rank_order_dense_indices = []
+        for rank in range(cp_size):
+            branch_offset = 0
+            for branch_length in branch_lengths:
+                rank_order_dense_indices.append(
+                    branch_offset
+                    + layout.cp_local_indices(branch_length, cp_size, rank, hidden_states.device)
+                )
+                branch_offset += branch_length
+        rank_order_dense_indices = torch.cat(rank_order_dense_indices)
+        inverse_dense_order = torch.empty_like(rank_order_dense_indices)
+        inverse_dense_order[rank_order_dense_indices] = torch.arange(
+            dense_total, device=hidden_states.device, dtype=torch.long
+        )
+        dense_output_global = dense_rank_order.index_select(0, inverse_dense_order)
+    else:
+        dense_output_global = dense_output_cp_local
+
+    # One prompt output is sufficient: every dense branch has the same causal
+    # prompt and the oracle is forward-only.  Completion outputs remain tied to
+    # their corresponding branch.
+    prefix_output = dense_output_global[: layout.prefix_len]
+    completion_outputs = []
+    branch_offset = 0
+    for completion_length, branch_length in zip(
+        layout.completion_lens, branch_lengths, strict=True
+    ):
+        completion_outputs.append(
+            dense_output_global[
+                branch_offset
+                + layout.prefix_len : branch_offset
+                + layout.prefix_len
+                + completion_length
+            ]
+        )
+        branch_offset += branch_length
+    star_output_global = torch.cat([prefix_output, *completion_outputs], dim=0)
+    trailing_padding = physical_len - layout.total_len
+    if trailing_padding:
+        star_output_global = torch.cat(
+            [
+                star_output_global,
+                torch.zeros(
+                    trailing_padding,
+                    1,
+                    star_output_global.shape[-1],
+                    dtype=star_output_global.dtype,
+                    device=star_output_global.device,
+                ),
+            ],
+            dim=0,
+        )
+    if cp_size > 1:
+        star_output_cp_local = star_output_global.index_select(
+            0, layout.cp_local_indices(physical_len, cp_size, cp_group.rank(), hidden_states.device)
+        )
+    else:
+        star_output_cp_local = star_output_global
+    if tp_size > 1:
+        return tensor_parallel.scatter_to_sequence_parallel_region(
+            star_output_cp_local, group=tp_group
+        )
+    return star_output_cp_local
+
+
 def _forward_mamba_layer_shared_prefix_cp(
     layer: MambaLayer, hidden_states: Tensor, layout: SharedPrefixLayout
 ) -> Tensor:
-    """Production CP Mamba path using the optimized differentiable state fork."""
-    return _forward_mamba_layer_shared_prefix_cp_state_fork(layer, hidden_states, layout)
+    """Select the optimized Mamba path or correctness-first packed fallback."""
+    implementation = os.environ.get("NRL_SP_MAMBA_IMPL", "state_fork")
+    if implementation == "state_fork":
+        return _forward_mamba_layer_shared_prefix_cp_state_fork(layer, hidden_states, layout)
+    if implementation == "packed_fused":
+        return _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
+            layer, hidden_states, layout
+        )
+    raise ValueError(
+        "NRL_SP_MAMBA_IMPL must be 'state_fork' or 'packed_fused', "
+        f"got {implementation!r}"
+    )
 
 
 def _has_nonzero_config_value(value) -> bool:
@@ -769,6 +1062,7 @@ def _validate_hybrid_stack(stack, hidden_states: Tensor, layout: SharedPrefixLay
         raise NotImplementedError("shared-prefix fused attention supports only vanilla softmax")
 
     num_moe_experts = stack.config.num_moe_experts
+    expert_bias_enabled = bool(getattr(stack.config, "moe_router_enable_expert_bias", False))
     if num_moe_experts is not None and num_moe_experts > 0:
         if stack.config.moe_router_force_load_balancing:
             raise NotImplementedError(
@@ -798,7 +1092,7 @@ def _validate_hybrid_stack(stack, hidden_states: Tensor, layout: SharedPrefixLay
             raise NotImplementedError(
                 "shared-prefix Hybrid adapter does not support MoE input jitter"
             )
-        if stack.config.moe_router_enable_expert_bias and layout.logical_completion_lens is None:
+        if expert_bias_enabled and layout.logical_completion_lens is None:
             raise NotImplementedError(
                 "shared-prefix MoE expert-bias accounting requires explicit physical "
                 "branch padding and logical completion lengths"
@@ -868,7 +1162,7 @@ def _validate_hybrid_stack(stack, hidden_states: Tensor, layout: SharedPrefixLay
                 # TP ranks, SelfAttention replicates one KV head across the relevant TP ranks.
                 kv_heads = layer.self_attention.num_query_groups_per_partition
                 _cp_kv_head_slices_for_destinations(query_heads, kv_heads, cp_size)
-            if stack.config.moe_router_enable_expert_bias and getattr(layer, "is_moe_layer", False):
+            if expert_bias_enabled and getattr(layer, "is_moe_layer", False):
                 from megatron.core.transformer.moe.moe_layer import MoELayer
                 from megatron.core.transformer.moe.router import TopKRouter
 
@@ -891,6 +1185,7 @@ def forward_hybrid_stack_shared_prefix(
     layout: SharedPrefixLayout,
     *,
     rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
+    position_embedding_type: str = "rope",
 ) -> Tensor:
     """Explicit exact-prompt star forward for a supported ``HybridStack`` topology.
 
@@ -903,8 +1198,14 @@ def forward_hybrid_stack_shared_prefix(
         isinstance(layer, TransformerLayer) and isinstance(layer.self_attention, SelfAttention)
         for layer in stack.layers
     )
-    if has_attention and rotary_pos_emb is None:
+    if position_embedding_type not in ("rope", "none"):
+        raise NotImplementedError(
+            "shared-prefix attention supports only RoPE or positionless Hybrid models"
+        )
+    if has_attention and position_embedding_type == "rope" and rotary_pos_emb is None:
         raise ValueError("position-aware rotary_pos_emb is required for shared-prefix attention")
+    if position_embedding_type == "none" and rotary_pos_emb is not None:
+        raise ValueError("positionless shared-prefix attention must not receive rotary_pos_emb")
 
     cp_group = stack.pg_collection.cp
     tp_group = stack.pg_collection.tp
@@ -912,7 +1213,8 @@ def forward_hybrid_stack_shared_prefix(
     sequence_shards = tp_size if stack.config.sequence_parallel else 1
     physical_len = hidden_states.shape[0] * cp_group.size() * sequence_shards
     token_multiplicities = None
-    if stack.config.moe_router_enable_expert_bias:
+    expert_bias_enabled = bool(getattr(stack.config, "moe_router_enable_expert_bias", False))
+    if expert_bias_enabled:
         token_multiplicities = layout.padded_token_multiplicities(
             physical_len, hidden_states.device
         )
@@ -940,8 +1242,7 @@ def forward_hybrid_stack_shared_prefix(
         for layer in stack.layers[start:end]:
             moe_layer = (
                 layer.mlp
-                if stack.config.moe_router_enable_expert_bias
-                and getattr(layer, "is_moe_layer", False)
+                if expert_bias_enabled and getattr(layer, "is_moe_layer", False)
                 else None
             )
             if moe_layer is not None:
@@ -1016,6 +1317,15 @@ SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY = "hybrid_star_moe_expert_bias_v1"
 SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY = "hybrid_star_full_uniform_recompute_v1"
 SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp1_tp_sp_v1"
 SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp_tp_sp_v1"
+# Validated target-model feature: Nemotron-H attention is positionless while
+# Mamba remains state-positioned by sequence order.
+SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY = (
+    "hybrid_star_positionless_attention_v1"
+)
+# Validated MTP predictor feature: reconstruct dense attention/MLP or attention/MoE
+# heads from the shared-prefix physical layout on the supported distributed TP/CP
+# topologies.
+SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY = "hybrid_star_mtp_dense_heads_v1"
 # Topology and feature capabilities are independent so integrations can negotiate their exact
 # validated conjunction without inferring support from a broader aggregate token.
 SHARED_PREFIX_TRAINING_CAPABILITIES = frozenset(
@@ -1027,5 +1337,7 @@ SHARED_PREFIX_TRAINING_CAPABILITIES = frozenset(
         SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
         SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY,
         SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY,
+        SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+        SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
     }
 )

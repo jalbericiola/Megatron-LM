@@ -13,6 +13,10 @@
 #include <pybind11/numpy.h>
 #include <random>
 
+#ifndef MEGATRON_DATASET_HELPERS_SOURCE_SHA256
+#define MEGATRON_DATASET_HELPERS_SOURCE_SHA256 ""
+#endif
+
 namespace py = pybind11;
 using namespace std;
 
@@ -840,6 +844,7 @@ py::array build_blocks_mapping(const py::array_t<int64_t> &docs_,
 
 PYBIND11_MODULE(helpers_cpp, m)
 {
+  m.attr("__megatron_helpers_source_sha256__") = MEGATRON_DATASET_HELPERS_SOURCE_SHA256;
   m.def("build_mapping", &build_mapping);
   m.def("build_blocks_mapping", &build_blocks_mapping);
   m.def("build_sample_idx_int32", &build_sample_idx<int32_t>);

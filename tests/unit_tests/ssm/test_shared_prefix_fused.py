@@ -1,7 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import ast
 import importlib
 import inspect
+import textwrap
 
 import pytest
 import torch
@@ -23,6 +25,198 @@ def test_fused_merge_old_opt_in_fails_closed(monkeypatch):
 
     with pytest.raises(RuntimeError, match="known nondeterministic"):
         shared_prefix_fused._resolve_fused_merge_setting()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(None, False, id="unset"),
+        pytest.param("0", False, id="zero"),
+        pytest.param("false", False, id="false"),
+        pytest.param("1", True, id="one"),
+        pytest.param("TRUE", True, id="true"),
+    ],
+)
+def test_deterministic_backward_gate_is_explicit_and_default_off(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("NRL_SP_DETERMINISTIC_BACKWARD", raising=False)
+    else:
+        monkeypatch.setenv("NRL_SP_DETERMINISTIC_BACKWARD", value)
+
+    assert shared_prefix_fused._resolve_deterministic_backward_setting() is expected
+
+
+@pytest.mark.parametrize("value", ["", "yes", "2", " true "])
+def test_deterministic_backward_gate_rejects_ambiguous_values(monkeypatch, value):
+    monkeypatch.setenv("NRL_SP_DETERMINISTIC_BACKWARD", value)
+
+    with pytest.raises(RuntimeError, match="must be one of"):
+        shared_prefix_fused._resolve_deterministic_backward_setting()
+
+
+def test_both_flash_backward_paths_use_deterministic_gate():
+    source = textwrap.dedent(inspect.getsource(shared_prefix_fused._ComposedForestAttn.backward))
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_flash_attn_varlen_backward"
+    ]
+
+    assert len(calls) == 2
+    for call in calls:
+        deterministic = call.args[20]
+        assert isinstance(deterministic, ast.Name)
+        assert deterministic.id == "_SP_DETERMINISTIC_BACKWARD"
+
+
+_SAFE_TRITON_GATES = (
+    "NRL_SP_FUSED_KV_GATHER",
+    "NRL_SP_FUSED_BACKWARD_GLUE",
+    "NRL_SP_FUSED_DQ_ASSEMBLY",
+)
+
+
+def test_safe_triton_gates_are_independently_default_off(monkeypatch):
+    for env_name in _SAFE_TRITON_GATES:
+        monkeypatch.delenv(env_name, raising=False)
+
+    assert [
+        shared_prefix_fused._resolve_experimental_triton_setting(env_name)
+        for env_name in _SAFE_TRITON_GATES
+    ] == [False, False, False]
+
+
+@pytest.mark.parametrize("enabled_env", _SAFE_TRITON_GATES)
+def test_safe_triton_gates_can_be_opted_in_independently(monkeypatch, enabled_env):
+    monkeypatch.setenv("NRL_SP_FUSED_MERGE", "0")
+    for env_name in _SAFE_TRITON_GATES:
+        monkeypatch.setenv(env_name, "1" if env_name == enabled_env else "0")
+
+    assert shared_prefix_fused._resolve_fused_merge_setting() is False
+    assert [
+        shared_prefix_fused._resolve_experimental_triton_setting(env_name)
+        for env_name in _SAFE_TRITON_GATES
+    ] == [env_name == enabled_env for env_name in _SAFE_TRITON_GATES]
+
+
+@pytest.mark.parametrize("value", ["yes", "2", " false ", "enabled"])
+def test_safe_triton_gates_reject_ambiguous_values(monkeypatch, value):
+    monkeypatch.setenv("NRL_SP_FUSED_KV_GATHER", value)
+
+    with pytest.raises(RuntimeError, match="NRL_SP_FUSED_KV_GATHER must be one of"):
+        shared_prefix_fused._resolve_experimental_triton_setting("NRL_SP_FUSED_KV_GATHER")
+
+
+def test_safe_triton_gates_fall_back_when_triton_is_unavailable(monkeypatch):
+    monkeypatch.setattr(shared_prefix_fused, "HAVE_TRITON", False)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_KV_GATHER", True)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_BACKWARD_GLUE", True)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_DQ_ASSEMBLY", True)
+
+    assert shared_prefix_fused._sp_fused_kv_gather_effective() is False
+    assert shared_prefix_fused._sp_fused_backward_glue_effective() is False
+    assert shared_prefix_fused._sp_fused_dq_assembly_effective([0, 1]) is False
+
+
+def test_fused_dq_assembly_fails_closed_for_deep_plans(monkeypatch):
+    monkeypatch.setattr(shared_prefix_fused, "HAVE_TRITON", True)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_DQ_ASSEMBLY", True)
+
+    assert shared_prefix_fused._sp_fused_dq_assembly_effective(list(range(7))) is True
+    assert shared_prefix_fused._sp_fused_dq_assembly_effective(list(range(8))) is False
+
+
+def test_safe_triton_gates_do_not_unlock_unsafe_combined_merge(monkeypatch):
+    monkeypatch.setattr(shared_prefix_fused, "HAVE_TRITON", True)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_COMBINE_CROSS", True)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_MERGE", False)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_KV_GATHER", True)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_BACKWARD_GLUE", True)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_DQ_ASSEMBLY", True)
+
+    assert shared_prefix_fused._sp_combine_effective() is False
+
+
+def test_safe_triton_paths_are_not_coupled_to_fused_lse_merge():
+    gather_source = inspect.getsource(shared_prefix_fused._gather_kv)
+    backward_source = inspect.getsource(shared_prefix_fused._ComposedForestAttn.backward)
+
+    assert "_sp_fused_kv_gather_effective()" in gather_source
+    assert "_sp_fused_backward_glue_effective()" in backward_source
+    assert "_sp_fused_dq_assembly_effective(ctx.slot_pass)" in backward_source
+    assert "_SP_FUSED_MERGE" not in gather_source
+    assert "_SP_FUSED_MERGE" not in backward_source
+
+
+def test_fused_kv_gather_passes_interleaved_qkv_view_strides(monkeypatch):
+    """Hybrid attention splits K/V out of an interleaved QKV projection without copying them."""
+
+    total, num_groups, query_heads_per_group, head_dim = 5, 2, 3, 4
+    group_width = (query_heads_per_group + 2) * head_dim
+    mixed_qkv = torch.arange(total * num_groups * group_width, dtype=torch.float32).reshape(
+        total, num_groups, group_width
+    )
+    _, key, value = torch.split(
+        mixed_qkv, [query_heads_per_group * head_dim, head_dim, head_dim], dim=-1
+    )
+    indices = torch.tensor([4, 1, 3], dtype=torch.long)
+
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+
+    captured = {}
+
+    class FakeGatherKernel:
+        def __getitem__(self, grid):
+            captured["grid"] = grid
+
+            def launch(k, v, k_idx, kx, vx, *strides, **meta):
+                captured["strides"] = strides
+                captured["meta"] = meta
+                kx.copy_(k.index_select(0, k_idx))
+                vx.copy_(v.index_select(0, k_idx))
+
+            return launch
+
+    monkeypatch.setattr(shared_prefix_fused, "HAVE_TRITON", True)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_KV_GATHER", True)
+    monkeypatch.setattr(
+        shared_prefix_fused, "_sp_gather_kv_kernel", FakeGatherKernel(), raising=False
+    )
+
+    gathered_key, gathered_value = shared_prefix_fused._gather_kv(key, value, indices)
+
+    torch.testing.assert_close(gathered_key, key.index_select(0, indices))
+    torch.testing.assert_close(gathered_value, value.index_select(0, indices))
+    assert captured["grid"] == (indices.numel(), num_groups)
+    assert captured["strides"] == (*key.stride(), *value.stride())
+    assert captured["meta"] == {"ng": num_groups, "HN": head_dim}
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not shared_prefix_fused.HAVE_TRITON,
+    reason="requires CUDA and Triton",
+)
+def test_fused_kv_gather_matches_index_select_for_interleaved_qkv_cuda(monkeypatch):
+    total, num_groups, query_heads_per_group, head_dim = 17, 2, 3, 8
+    group_width = (query_heads_per_group + 2) * head_dim
+    mixed_qkv = torch.randn(total, num_groups, group_width, device="cuda", dtype=torch.bfloat16)
+    _, key, value = torch.split(
+        mixed_qkv, [query_heads_per_group * head_dim, head_dim, head_dim], dim=-1
+    )
+    indices = torch.tensor([16, 2, 11, 0, 7], device="cuda", dtype=torch.long)
+
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_KV_GATHER", True)
+
+    gathered_key, gathered_value = shared_prefix_fused._gather_kv(key, value, indices)
+
+    torch.testing.assert_close(gathered_key, key.index_select(0, indices), rtol=0, atol=0)
+    torch.testing.assert_close(gathered_value, value.index_select(0, indices), rtol=0, atol=0)
 
 
 def test_star_forest_builds_exact_cpu_attention_plan():
@@ -81,6 +275,37 @@ def test_cached_chainfirst_plan_rejects_non_dfs_layout():
         )
 
 
+def test_validate_forest_accepts_contiguous_arbitrary_depth_forest():
+    shared_prefix_fused._validate_forest_dfs_preorder(
+        node_start=[0, 2, 5, 6, 10, 11],
+        node_len=[2, 3, 1, 4, 1, 2],
+        node_parent=[-1, 0, 1, 0, -1, 4],
+    )
+
+
+@pytest.mark.parametrize(
+    ("node_start", "node_len"),
+    [
+        pytest.param([0, 2], [1, 1], id="gapped"),
+        pytest.param([0, 1], [2, 1], id="overlapping"),
+        pytest.param([0, 2, 1], [1, 1, 1], id="permuted"),
+    ],
+)
+def test_validate_forest_rejects_noncontiguous_node_spans(node_start, node_len):
+    with pytest.raises(ValueError, match="spans must be contiguous in array order"):
+        shared_prefix_fused._validate_forest_dfs_preorder(
+            node_start=node_start, node_len=node_len, node_parent=[-1] * len(node_start)
+        )
+
+
+@pytest.mark.parametrize("node_len", [0, -1])
+def test_validate_forest_rejects_nonpositive_node_lengths(node_len):
+    with pytest.raises(ValueError, match="non-positive length"):
+        shared_prefix_fused._validate_forest_dfs_preorder(
+            node_start=[0], node_len=[node_len], node_parent=[-1]
+        )
+
+
 def test_plan_cache_reuses_cpu_plan():
     shared_prefix_fused._PLAN_CACHE.clear()
     args = ([0, 2, 5], [2, 3, 1], [-1, 0, 0], torch.device("cpu"))
@@ -95,11 +320,34 @@ def test_plan_cache_reuses_cpu_plan():
 @pytest.mark.internal
 @pytest.mark.timeout(180)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="shared-prefix parity requires CUDA")
-def test_fused_star_matches_dense_forward_and_exact_backward():
-    """Compare the composed FlashAttention star with an explicit dense oracle."""
+@pytest.mark.parametrize(
+    ("fused_kv_gather", "fused_backward_glue", "fused_dq_assembly"),
+    [
+        pytest.param(False, False, False, id="eager"),
+        pytest.param(True, False, False, id="kv-only"),
+        pytest.param(False, True, False, id="backward-glue-only"),
+        pytest.param(False, False, True, id="dq-only"),
+        pytest.param(True, True, False, id="kv-plus-backward-glue"),
+        pytest.param(True, False, True, id="kv-plus-dq"),
+        pytest.param(False, True, True, id="backward-glue-plus-dq"),
+        pytest.param(True, True, True, id="all-safe-triton-paths"),
+    ],
+)
+def test_fused_star_matches_dense_forward_and_exact_backward(
+    monkeypatch, fused_kv_gather, fused_backward_glue, fused_dq_assembly
+):
+    """Compare every safe-kernel gate combination with an explicit dense oracle."""
     pytest.importorskip("flash_attn")
     if not torch.cuda.is_bf16_supported():
         pytest.skip("shared-prefix parity requires CUDA bf16 support")
+    if any((fused_kv_gather, fused_backward_glue, fused_dq_assembly)):
+        if not shared_prefix_fused.HAVE_TRITON:
+            pytest.skip("safe fused shared-prefix gates require Triton")
+
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_MERGE", False)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_KV_GATHER", fused_kv_gather)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_BACKWARD_GLUE", fused_backward_glue)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_DQ_ASSEMBLY", fused_dq_assembly)
 
     prefix_len = 7
     completion_lens = [5, 3]
@@ -151,6 +399,72 @@ def test_fused_star_matches_dense_forward_and_exact_backward():
     ):
         assert fused_gradient is not None
         assert reference_gradient is not None
+        torch.testing.assert_close(
+            fused_gradient.float(), reference_gradient.float(), rtol=3e-2, atol=3e-2
+        )
+
+
+@pytest.mark.internal
+@pytest.mark.timeout(180)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="shared-prefix parity requires CUDA")
+@pytest.mark.parametrize("fused_backward_glue", [False, True], ids=["eager-glue", "fused-glue"])
+def test_fused_dq_opt_in_deep_tree_falls_back_with_exact_backward(monkeypatch, fused_backward_glue):
+    """An eight-slot plan must use exact eager dQ assembly instead of the seven-slot kernel."""
+    pytest.importorskip("flash_attn")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("shared-prefix parity requires CUDA bf16 support")
+    if not shared_prefix_fused.HAVE_TRITON:
+        pytest.skip("deep-slot dQ fallback parity requires Triton")
+
+    monkeypatch.setattr(shared_prefix_fused, "_SP_CHAINFIRST", False)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_MERGE", False)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_BACKWARD_GLUE", fused_backward_glue)
+    monkeypatch.setattr(shared_prefix_fused, "_SP_FUSED_DQ_ASSEMBLY", True)
+    shared_prefix_fused._PLAN_CACHE.clear()
+
+    total_len, num_heads, head_dim = 8, 2, 16
+    scale = head_dim**-0.5
+    node_start = list(range(total_len))
+    node_len = [1] * total_len
+    node_parent = [-1] + list(range(total_len - 1))
+    plan = shared_prefix_fused._forest_attention_plan_cached(
+        node_start, node_len, node_parent, torch.device("cuda")
+    )
+    assert len(plan[4]) == 8
+    assert shared_prefix_fused._sp_fused_dq_assembly_effective(plan[4]) is False
+
+    torch.manual_seed(2027)
+    base_tensors = [
+        torch.randn(total_len, 1, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        for _ in range(3)
+    ]
+    reference_q, reference_k, reference_v = [
+        tensor.detach().clone().requires_grad_(True) for tensor in base_tensors
+    ]
+    fused_q, fused_k, fused_v = [
+        tensor.detach().clone().requires_grad_(True) for tensor in base_tensors
+    ]
+
+    scores = (
+        torch.einsum("thd,shd->hts", reference_q[:, 0].float(), reference_k[:, 0].float()) * scale
+    )
+    allow = torch.tril(torch.ones(total_len, total_len, dtype=torch.bool, device="cuda"))
+    probabilities = torch.softmax(scores.masked_fill(~allow.unsqueeze(0), float("-inf")), dim=-1)
+    reference_output = torch.einsum(
+        "hts,shd->thd", probabilities, reference_v[:, 0].float()
+    ).reshape(total_len, 1, num_heads * head_dim)
+    fused_output = shared_prefix_fused.flash_composed_forest_attention_fused(
+        fused_q, fused_k, fused_v, node_start, node_len, node_parent, scale=scale
+    )
+    torch.testing.assert_close(fused_output.float(), reference_output, rtol=2e-2, atol=2e-2)
+
+    upstream = torch.randn_like(fused_output)
+    reference_output.backward(upstream.float())
+    fused_output.backward(upstream)
+    for fused_gradient, reference_gradient in zip(
+        (fused_q.grad, fused_k.grad, fused_v.grad),
+        (reference_q.grad, reference_k.grad, reference_v.grad),
+    ):
         torch.testing.assert_close(
             fused_gradient.float(), reference_gradient.float(), rtol=3e-2, atol=3e-2
         )

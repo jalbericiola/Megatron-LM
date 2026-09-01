@@ -1080,12 +1080,12 @@ def _run_hybrid_shared_prefix_parity(
                 )
 
             def logical_scan_segments(snapshot):
-                """Return prefix and logical completion scan tensors in branch order."""
+                """Return positioned prefix spans and logical completions in branch order."""
                 if snapshot["x"] is not None:
                     scan_x = snapshot["x"]
                     scan_dy = snapshot["dy"]
                     return (
-                        (scan_x[:, : layout.prefix_len], scan_dy[:, : layout.prefix_len]),
+                        [(0, scan_x[:, : layout.prefix_len], scan_dy[:, : layout.prefix_len])],
                         [
                             (
                                 scan_x[
@@ -1102,31 +1102,53 @@ def _run_hybrid_shared_prefix_parity(
                     )
 
                 calls = snapshot["calls"]
+                fork_boundary = shared_prefix_module._mamba_prefix_fork_boundary(
+                    stack.layers[0].mixer, layout.prefix_len
+                )
+                branch_prefix_len = layout.prefix_len - fork_boundary
                 if (
                     len(calls) != 2
                     or calls[0][0].shape[0] != 1
-                    or calls[0][0].shape[1] != layout.prefix_len
+                    or calls[0][0].shape[1] != fork_boundary
                     or calls[1][0].shape[0] != len(layout.completion_lens)
                 ):
                     raise RuntimeError(
-                        "state-fork scan diagnostics require one prefix and one branch call"
+                        "state-fork scan diagnostics require one aligned-prefix and one "
+                        "prompt-tail/branch call"
                     )
-                prefix = calls[0]
+                prefix_x, prefix_dy = calls[0]
                 branch_x, branch_dy = calls[1]
+                prefix_segments = [(0, prefix_x, prefix_dy)]
+                if branch_prefix_len:
+                    prefix_segments.append(
+                        (
+                            fork_boundary,
+                            branch_x[:, :branch_prefix_len],
+                            branch_dy[:, :branch_prefix_len],
+                        )
+                    )
                 completions = [
                     (
-                        branch_x[branch_index : branch_index + 1, :completion_len],
-                        branch_dy[branch_index : branch_index + 1, :completion_len],
+                        branch_x[
+                            branch_index : branch_index + 1,
+                            branch_prefix_len : branch_prefix_len + completion_len,
+                        ],
+                        branch_dy[
+                            branch_index : branch_index + 1,
+                            branch_prefix_len : branch_prefix_len + completion_len,
+                        ],
                     )
                     for branch_index, completion_len in enumerate(layout.completion_lens)
                 ]
-                return prefix, completions
+                return prefix_segments, completions
 
             def d_path_error_diagnostics(reference_snapshot, actual_snapshot, denominator):
                 """Attribute each D-formula delta to the captured scan ``dy*x`` path."""
                 mixer = stack.layers[0].mixer
-                reference_prefix, reference_completions = logical_scan_segments(reference_snapshot)
-                actual_prefix, actual_completions = logical_scan_segments(actual_snapshot)
+                reference_prefixes, reference_completions = logical_scan_segments(
+                    reference_snapshot
+                )
+                actual_prefixes, actual_completions = logical_scan_segments(actual_snapshot)
                 path_absolute = torch.zeros_like(denominator, dtype=torch.float64)
                 dy_absolute = torch.zeros_like(denominator, dtype=torch.float64)
                 x_absolute = torch.zeros_like(denominator, dtype=torch.float64)
@@ -1162,7 +1184,31 @@ def _run_hybrid_shared_prefix_parity(
                         (actual_dy.double() * (reference_x.double() - actual_x.double())).abs()
                     )
 
-                accumulate(*reference_prefix, *actual_prefix)
+                def prefix_slice(segments, start, stop):
+                    for segment_start, segment_x, segment_dy in segments:
+                        segment_stop = segment_start + segment_x.shape[1]
+                        if segment_start <= start and stop <= segment_stop:
+                            local_start = start - segment_start
+                            local_stop = stop - segment_start
+                            return (
+                                segment_x[:, local_start:local_stop],
+                                segment_dy[:, local_start:local_stop],
+                            )
+                    raise RuntimeError(
+                        f"captured Mamba prefix scans do not cover logical span [{start}:{stop}]"
+                    )
+
+                prefix_boundaries = {0, layout.prefix_len}
+                for segments in (reference_prefixes, actual_prefixes):
+                    for segment_start, segment_x, _ in segments:
+                        prefix_boundaries.add(segment_start)
+                        prefix_boundaries.add(segment_start + segment_x.shape[1])
+                prefix_boundaries = sorted(prefix_boundaries)
+                for start, stop in zip(prefix_boundaries[:-1], prefix_boundaries[1:], strict=True):
+                    accumulate(
+                        *prefix_slice(reference_prefixes, start, stop),
+                        *prefix_slice(actual_prefixes, start, stop),
+                    )
                 for reference_completion, actual_completion in zip(
                     reference_completions, actual_completions, strict=True
                 ):
@@ -1557,6 +1603,21 @@ def test_cp1_mixed_hybrid_shared_prefix_all_parameter_baseline():
 
 
 @pytest.mark.timeout(600)
+@_requires_world_size(1)
+def test_cp1_mamba_unaligned_prompt_tail_matches_dense_forward_and_backward():
+    # Default chunk_size=128. Fork at 128 and replay prompt tokens [128:133]
+    # inside each branch so the scan partition matches ordinary dense Mamba.
+    _run_hybrid_shared_prefix_parity(
+        "M",
+        cp_size=1,
+        hidden_size=256,
+        query_heads=4,
+        kv_heads=1,
+        layout=SharedPrefixLayout(prefix_len=133, completion_lens=[5, 6]),
+    )
+
+
+@pytest.mark.timeout(600)
 @_requires_world_size(2)
 def test_tp2_cp1_sp_mixed_shared_prefix_matches_dense_forward_and_backward():
     _run_hybrid_shared_prefix_parity(
@@ -1712,6 +1773,19 @@ def test_tp2_sp_hybrid_model_returns_full_cp_local_tp_vocab_shard(cp_size):
 @_requires_world_size(2)
 def test_cp2_hybrid_shared_prefix_matches_dense_branches_forward_and_backward(pattern):
     _run_hybrid_shared_prefix_parity(pattern, cp_size=2, hidden_size=256, query_heads=4, kv_heads=1)
+
+
+@pytest.mark.timeout(600)
+@_requires_world_size(2)
+def test_cp2_mamba_unaligned_prompt_tail_matches_dense_forward_and_backward():
+    _run_hybrid_shared_prefix_parity(
+        "M",
+        cp_size=2,
+        hidden_size=256,
+        query_heads=4,
+        kv_heads=1,
+        layout=SharedPrefixLayout(prefix_len=133, completion_lens=[5, 6]),
+    )
 
 
 @pytest.mark.timeout(900)

@@ -1,12 +1,19 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from megatron.core.models.hybrid import shared_prefix as shared_prefix_module
-from megatron.core.models.hybrid.shared_prefix import SharedPrefixLayout, _validate_hybrid_stack
+from megatron.core.models.hybrid.shared_prefix import (
+    SharedPrefixLayout,
+    _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle,
+    _forward_mamba_layer_shared_prefix_cp_state_fork,
+    _mamba_prefix_fork_boundary,
+    _validate_hybrid_stack,
+)
 from megatron.core.models.hybrid.shared_prefix_fused import (
     _cp_local_kv_head_slice,
     _redo_cp_zigzag,
@@ -293,6 +300,15 @@ def test_cp_attention_validation_uses_tp_local_q_and_kv_heads():
     _validate_hybrid_stack(stack, torch.empty(2, 1, 8, dtype=torch.bfloat16), layout)
 
 
+def test_cp_attention_validation_treats_absent_optional_expert_bias_as_disabled():
+    layout = SharedPrefixLayout(prefix_len=3, completion_lens=[4, 5])
+    attention = _stub_attention_layer(cp_size=2, local_kv_heads=1)
+    stack = _validation_stack(cp_size=2, layers=[attention], query_heads=4, kv_heads=1)
+
+    assert not hasattr(stack.config, "moe_router_enable_expert_bias")
+    _validate_hybrid_stack(stack, torch.empty(6, 1, 8, dtype=torch.bfloat16), layout)
+
+
 def test_cp_mamba_default_uses_optimized_state_fork(monkeypatch):
     sentinel = object()
     monkeypatch.setattr(
@@ -302,3 +318,159 @@ def test_cp_mamba_default_uses_optimized_state_fork(monkeypatch):
     )
 
     assert shared_prefix_module._forward_mamba_layer_shared_prefix_cp(None, None, None) is sentinel
+
+
+def test_cp_mamba_packed_fused_fallback_is_explicit(monkeypatch):
+    sentinel = object()
+    monkeypatch.setenv("NRL_SP_MAMBA_IMPL", "packed_fused")
+    monkeypatch.setattr(
+        shared_prefix_module,
+        "_forward_mamba_layer_shared_prefix_cp_packed_fused_oracle",
+        lambda *_args: sentinel,
+    )
+
+    assert shared_prefix_module._forward_mamba_layer_shared_prefix_cp(None, None, None) is sentinel
+
+
+def test_cp_mamba_rejects_unknown_implementation(monkeypatch):
+    monkeypatch.setenv("NRL_SP_MAMBA_IMPL", "approximate")
+
+    with pytest.raises(ValueError, match="NRL_SP_MAMBA_IMPL"):
+        shared_prefix_module._forward_mamba_layer_shared_prefix_cp(None, None, None)
+
+
+def test_packed_fused_mamba_oracle_reconstructs_dense_branches(monkeypatch):
+    class FakeMambaMixer:
+        def __init__(self):
+            tp_group = _FakeGroup(1)
+            cp_group = _FakeGroup(1)
+            self.pg_collection = SimpleNamespace(tp=tp_group, cp=cp_group)
+            self.config = SimpleNamespace(sequence_parallel=False)
+
+    class FakeMambaLayer:
+        def __init__(self):
+            self.mixer = FakeMambaMixer()
+            self.calls = []
+
+        def __call__(self, *, hidden_states, attention_mask, packed_seq_params):
+            self.calls.append(
+                {
+                    "hidden_states": hidden_states.clone(),
+                    "attention_mask": attention_mask,
+                    "packed_seq_params": packed_seq_params,
+                }
+            )
+            return hidden_states * 2
+
+    monkeypatch.setattr(shared_prefix_module, "MambaMixer", FakeMambaMixer)
+    layer = FakeMambaLayer()
+    layout = SharedPrefixLayout(prefix_len=2, completion_lens=[2, 1])
+    hidden_states = torch.arange(20, dtype=torch.float32).reshape(5, 1, 4)
+
+    output = _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
+        layer, hidden_states, layout
+    )
+
+    assert len(layer.calls) == 1
+    call = layer.calls[0]
+    expected_dense = torch.cat([hidden_states[[0, 1, 2, 3]], hidden_states[[0, 1, 4]]], dim=0)
+    torch.testing.assert_close(call["hidden_states"], expected_dense)
+    assert call["attention_mask"] is None
+    packed = call["packed_seq_params"]
+    assert packed.qkv_format == "thd"
+    assert packed.cu_seqlens_q.tolist() == [0, 4, 7]
+    assert packed.cu_seqlens_q_padded.tolist() == [0, 4, 7]
+    assert packed.max_seqlen_q == 4
+    assert packed.total_tokens == 7
+    assert packed.seq_idx.tolist() == [[0, 0, 0, 0, 1, 1, 1]]
+    torch.testing.assert_close(output, hidden_states * 2)
+
+
+@pytest.mark.parametrize(
+    ("prefix_len", "expected"), [(128, 128), (133, 128), (1853, 1792), (63, 0)]
+)
+def test_mamba_prefix_fork_boundary_preserves_scan_chunk_partition(prefix_len, expected):
+    mixer = SimpleNamespace(chunk_size=128)
+
+    assert _mamba_prefix_fork_boundary(mixer, prefix_len) == expected
+
+
+@pytest.mark.parametrize("chunk_size", [None, 0, -1, True, 1.5])
+def test_mamba_prefix_fork_boundary_rejects_invalid_chunk_size(chunk_size):
+    with pytest.raises(ValueError, match="positive integer chunk_size"):
+        _mamba_prefix_fork_boundary(SimpleNamespace(chunk_size=chunk_size), 5)
+
+
+def test_cp_mamba_state_fork_replays_only_unaligned_prompt_tail(monkeypatch):
+    layout = SharedPrefixLayout(prefix_len=5, completion_lens=[1, 2])
+    hidden_states = torch.arange(32, dtype=torch.float32).reshape(8, 1, 4)
+    hidden_states.requires_grad_(True)
+    scans = []
+
+    def scan(_mixer, projected, *, conv_context=None, ssm_initial_state=None, capture_state=False):
+        scans.append(
+            {
+                "projected": projected.detach().clone(),
+                "capture_state": capture_state,
+                "has_conv_context": conv_context is not None,
+                "has_ssm_initial_state": ssm_initial_state is not None,
+            }
+        )
+        output = projected * 2
+        if conv_context is not None:
+            output = output + conv_context.reshape(1, 1, 1)
+        if ssm_initial_state is not None:
+            output = output + ssm_initial_state.reshape(1, 1, 1)
+        state = projected[-1:].mean(dim=-1, keepdim=True) if capture_state else None
+        return output, torch.zeros_like(output), state, state
+
+    monkeypatch.setattr(shared_prefix_module, "_validate_mamba_fork", lambda _mixer: None)
+    monkeypatch.setattr(shared_prefix_module, "_scan_mamba_projected_segment", scan)
+    cp = SimpleNamespace(
+        cp_size=2,
+        d_inner_local_tpcp=4,
+        pre_conv_ssm=lambda value: value,
+        post_conv_ssm=lambda value: value,
+    )
+    mixer = SimpleNamespace(
+        chunk_size=4,
+        cp=cp,
+        in_proj=lambda value: (value, None),
+        norm=lambda y, _z: y,
+        out_proj=lambda value: (value, None),
+    )
+    layer = SimpleNamespace(
+        config=SimpleNamespace(
+            fp32_residual_connection=False, params_dtype=torch.float32, bias_dropout_fusion=False
+        ),
+        norm=torch.nn.Identity(),
+        mixer=mixer,
+        bias_dropout_add_exec_handler=nullcontext,
+        mamba_bda=lambda **_kwargs: (
+            lambda output_with_bias, residual, _dropout: output_with_bias[0] + residual
+        ),
+        training=True,
+        hidden_dropout=0.0,
+    )
+
+    output = _forward_mamba_layer_shared_prefix_cp_state_fork(layer, hidden_states, layout)
+
+    assert output.shape == hidden_states.shape
+    assert len(scans) == 2
+    assert scans[0]["projected"].shape == (4, 1, 4)
+    assert scans[0]["capture_state"]
+    assert not scans[0]["has_conv_context"]
+    assert not scans[0]["has_ssm_initial_state"]
+    expected_branches = torch.stack(
+        (
+            torch.stack((hidden_states[4, 0], hidden_states[5, 0], torch.zeros(4))),
+            torch.stack((hidden_states[4, 0], hidden_states[6, 0], hidden_states[7, 0])),
+        ),
+        dim=1,
+    )
+    torch.testing.assert_close(scans[1]["projected"], expected_branches)
+    assert not scans[1]["capture_state"]
+    assert scans[1]["has_conv_context"]
+    assert scans[1]["has_ssm_initial_state"]
+    output.sum().backward()
+    assert torch.count_nonzero(hidden_states.grad) == hidden_states.numel()

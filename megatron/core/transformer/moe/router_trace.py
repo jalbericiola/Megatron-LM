@@ -27,6 +27,7 @@ import atexit
 import json
 import os
 import re
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
@@ -187,6 +188,11 @@ class RouterTracer:
         self.dump_router_weights = dump_router_weights
         self._router_state: dict = {}
         self._hook_handles: List[torch.utils.hooks.RemovableHook] = []
+        # Optional diagnostic labels for aligning tokens whose physical layout
+        # differs between two executions (for example dense OFF versus
+        # shared-prefix ON).  The tracer never invents this mapping: callers
+        # opt in with semantic_token_scope()/set_semantic_token_ids().
+        self._semantic_token_ids: dict[tuple[str, Optional[int]], tuple[str | int | None, ...]] = {}
 
         os.makedirs(output_dir, exist_ok=True)
         self.output_path = os.path.join(output_dir, f"router_trace_rank{rank}.jsonl")
@@ -226,6 +232,73 @@ class RouterTracer:
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
+
+    @staticmethod
+    def _normalize_semantic_token_ids(semantic_token_ids) -> tuple[str | int | None, ...]:
+        """Validate JSON-stable semantic token labels.
+
+        ``None`` deliberately means "do not compare this physical token" and
+        is useful for topology-only or rectangular-batch padding.  Strings and
+        integers make traces portable without relying on Python tuple/list
+        round-tripping rules.
+        """
+        normalized = []
+        for token_id in semantic_token_ids:
+            if token_id is not None and (
+                isinstance(token_id, bool) or not isinstance(token_id, (str, int))
+            ):
+                raise TypeError(
+                    "semantic token ids must be strings, integers, or None; "
+                    f"got {type(token_id).__name__}"
+                )
+            normalized.append(token_id)
+        return tuple(normalized)
+
+    def set_semantic_token_ids(
+        self, semantic_token_ids, *, block: str = "decoder", mtp_idx: Optional[int] = None
+    ) -> None:
+        """Set opt-in physical-row-to-semantic-token labels for router records.
+
+        All router calls in ``(block, mtp_idx)`` must receive the same number
+        of physical tokens while the mapping is installed.  A mismatch raises
+        instead of emitting a misleading parity trace.
+        """
+        self._semantic_token_ids[(block, mtp_idx)] = self._normalize_semantic_token_ids(
+            semantic_token_ids
+        )
+
+    def clear_semantic_token_ids(
+        self, *, block: str = "decoder", mtp_idx: Optional[int] = None
+    ) -> None:
+        """Remove a mapping installed by set_semantic_token_ids()."""
+        self._semantic_token_ids.pop((block, mtp_idx), None)
+
+    @contextmanager
+    def semantic_token_scope(
+        self, semantic_token_ids, *, block: str = "decoder", mtp_idx: Optional[int] = None
+    ):
+        """Temporarily label physical router rows with stable semantic ids."""
+        key = (block, mtp_idx)
+        previous = self._semantic_token_ids.get(key)
+        self.set_semantic_token_ids(semantic_token_ids, block=block, mtp_idx=mtp_idx)
+        try:
+            yield
+        finally:
+            if previous is None:
+                self._semantic_token_ids.pop(key, None)
+            else:
+                self._semantic_token_ids[key] = previous
+
+    def _semantic_ids_for_record(
+        self, block: str, mtp_idx: Optional[int], num_tokens: int
+    ) -> Optional[tuple[str | int | None, ...]]:
+        semantic_ids = self._semantic_token_ids.get((block, mtp_idx))
+        if semantic_ids is not None and len(semantic_ids) != num_tokens:
+            raise RuntimeError(
+                "MoE router semantic-token mapping length does not match the routed token count: "
+                f"{(block, mtp_idx)=}, mapping={len(semantic_ids)}, routed={num_tokens}"
+            )
+        return semantic_ids
 
     def advance_step(self, step_id: Optional[int] = None) -> None:
         """Advance to the next step (training mode).
@@ -288,7 +361,9 @@ class RouterTracer:
             return None
         return hs
 
-    def _make_index_record(self, top_indices_cpu, step, block, mtp_idx, layer) -> dict:
+    def _make_index_record(
+        self, top_indices_cpu, step, block, mtp_idx, layer, semantic_token_ids=None
+    ) -> dict:
         """Assemble a JSONL record dict for one layer's top-K indices."""
         record: dict = {
             "step": int(step),
@@ -302,6 +377,14 @@ class RouterTracer:
         }
         if mtp_idx is not None:
             record["mtp_idx"] = int(mtp_idx)
+        if semantic_token_ids is not None:
+            if len(semantic_token_ids) != record["num_tokens"]:
+                raise RuntimeError(
+                    "MoE router semantic-token mapping length does not match the routed "
+                    f"token count: mapping={len(semantic_token_ids)}, "
+                    f"routed={record['num_tokens']}"
+                )
+            record["semantic_token_ids"] = list(semantic_token_ids)
         return record
 
     def _record(self, module, inputs, outputs, identity=None) -> None:
@@ -365,7 +448,15 @@ class RouterTracer:
         top_indices_cpu = top_indices.detach().to("cpu", torch.int32, non_blocking=True)
         num_tokens = int(top_indices_cpu.shape[0])
 
-        record = self._make_index_record(top_indices_cpu, self.step_id, block, mtp_idx, layer)
+        semantic_token_ids = self._semantic_ids_for_record(block, mtp_idx, num_tokens)
+        record = self._make_index_record(
+            top_indices_cpu,
+            self.step_id,
+            block,
+            mtp_idx,
+            layer,
+            semantic_token_ids=semantic_token_ids,
+        )
 
         if self.capture_hidden_states:
             hs = self._extract_hidden_state(inputs, num_tokens)
@@ -411,6 +502,7 @@ class RouterTracer:
         layer_ids: Optional[List[int]] = None,
         block: str = "decoder",
         mtp_idx: Optional[int] = None,
+        semantic_token_ids=None,
     ) -> None:
         """Serialize already-captured top-K routing indices through the JSONL sink.
 
@@ -432,6 +524,10 @@ class RouterTracer:
                 range(num_layers).
             block: Block tag for the records ("decoder" or "mtp").
             mtp_idx: MTP head index.
+            semantic_token_ids: Optional stable string/integer label per physical
+                token. ``None`` entries mark padding rows that the semantic
+                comparator should ignore. When omitted, a mapping previously
+                installed for ``(block, mtp_idx)`` is used if available.
         """
         if self._stopped:
             return
@@ -458,8 +554,22 @@ class RouterTracer:
         for i, layer_indices in enumerate(per_layer):
             layer = i if layer_ids is None else layer_ids[i]
             top_indices_cpu = layer_indices.detach().to("cpu", torch.int32, non_blocking=True)
+            record_semantic_ids = semantic_token_ids
+            if record_semantic_ids is None:
+                record_semantic_ids = self._semantic_ids_for_record(
+                    block, mtp_idx, int(top_indices_cpu.shape[0])
+                )
+            else:
+                record_semantic_ids = self._normalize_semantic_token_ids(record_semantic_ids)
             self.records.append(
-                self._make_index_record(top_indices_cpu, step, block, mtp_idx, layer)
+                self._make_index_record(
+                    top_indices_cpu,
+                    step,
+                    block,
+                    mtp_idx,
+                    layer,
+                    semantic_token_ids=record_semantic_ids,
+                )
             )
 
     def _flush_records_to_disk(self) -> None:

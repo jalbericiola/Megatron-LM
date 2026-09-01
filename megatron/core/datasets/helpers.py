@@ -5,8 +5,17 @@
 # Explicit imports for readability
 import numpy
 
-from megatron.core.datasets.helpers_cpp import *
-from megatron.core.datasets.helpers_cpp import build_sample_idx_int32, build_sample_idx_int64
+from megatron.core.datasets.utils import compile_helpers as _compile_helpers
+
+# Resolve a packaged extension first, then fall back to the writable runtime cache. Calling this in
+# every importing process also covers node-local caches and callers that only initialized rank zero.
+_helpers_cpp = _compile_helpers()
+build_mapping = _helpers_cpp.build_mapping
+build_blocks_mapping = _helpers_cpp.build_blocks_mapping
+build_sample_idx_int32 = _helpers_cpp.build_sample_idx_int32
+build_sample_idx_int64 = _helpers_cpp.build_sample_idx_int64
+build_blending_indices = _helpers_cpp.build_blending_indices
+build_exhaustive_blending_indices = _helpers_cpp.build_exhaustive_blending_indices
 
 
 def build_sample_idx(

@@ -29,6 +29,18 @@ class _SizeOneGroup:
         return 0
 
 
+class _RankedGroup:
+    def __init__(self, size, rank):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
 def test_layout_multiplicities_cover_physical_branch_tails_and_not_topology_pad():
     layout = SharedPrefixLayout(prefix_len=3, completion_lens=[5, 5])
 
@@ -45,16 +57,19 @@ def test_cp1_mamba_forward_preserves_explicit_topology_tail_and_backward(monkeyp
     layout = SharedPrefixLayout(
         prefix_len=3, completion_lens=[5, 5], logical_completion_lens=[2, 4], padding_multiple=8
     )
-    observed_branch_shape = None
+    observed_prefix_length = None
+    observed_branches = None
 
     def fork_prefix(_mixer, prefix, *, capture_state):
+        nonlocal observed_prefix_length
         assert capture_state
+        observed_prefix_length = prefix.shape[0]
         return prefix * 2, None, prefix.new_zeros(1), prefix.new_zeros(1)
 
     def fork_branches(_mixer, branches, *, conv_context, ssm_initial_state):
-        nonlocal observed_branch_shape
+        nonlocal observed_branches
         assert conv_context is not None and ssm_initial_state is not None
-        observed_branch_shape = branches.shape
+        observed_branches = branches.detach().clone()
         return branches * 3, None
 
     monkeypatch.setattr(shared_prefix_module, "_fork_mamba_segment", fork_prefix)
@@ -64,7 +79,7 @@ def test_cp1_mamba_forward_preserves_explicit_topology_tail_and_backward(monkeyp
             fp32_residual_connection=False, params_dtype=torch.float32, bias_dropout_fusion=False
         ),
         norm=torch.nn.Identity(),
-        mixer=object(),
+        mixer=SimpleNamespace(chunk_size=2),
         bias_dropout_add_exec_handler=nullcontext,
         mamba_bda=lambda **_kwargs: (
             lambda output_with_bias, residual, _dropout: output_with_bias[0] + residual
@@ -77,7 +92,10 @@ def test_cp1_mamba_forward_preserves_explicit_topology_tail_and_backward(monkeyp
     output = _forward_mamba_layer_shared_prefix(layer, hidden_states, layout)
 
     assert output.shape == hidden_states.shape
-    assert observed_branch_shape == (8, 2, 4)
+    assert observed_prefix_length == 2
+    assert observed_branches.shape == (9, 2, 4)
+    torch.testing.assert_close(observed_branches[0, 0], hidden_states.detach()[2, 0])
+    torch.testing.assert_close(observed_branches[0, 1], hidden_states.detach()[2, 0])
     output.sum().backward()
     assert hidden_states.grad is not None
     assert torch.count_nonzero(hidden_states.grad[-3:]) == 12
@@ -104,6 +122,91 @@ def test_expert_bias_counts_apply_logical_multiplicity_and_padding_mask():
     )
     with pytest.raises(ValueError, match="one value per routed token"):
         _expert_bias_token_counts(routing_map, token_multiplicities=torch.ones(4))
+
+
+class _OwnershipRecordingMoELayer(TransformerLayer):
+    def __init__(self, events):
+        torch.nn.Module.__init__(self)
+        self.config = SimpleNamespace(cuda_graph_impl="none")
+        self.self_attention = IdentityOp()
+        self.is_moe_layer = True
+        self.mlp = torch.nn.Module()
+        self.events = events
+
+    def forward(self, *, hidden_states, **_kwargs):
+        self.events.append(
+            (
+                hidden_states[:, 0, 0].to(torch.long).clone(),
+                self.mlp._shared_prefix_token_multiplicities.clone(),
+            )
+        )
+        return hidden_states, None
+
+
+def test_cp_tp_owned_multiplicities_match_nonuniform_routing(monkeypatch):
+    """Exercise the production CP-zigzag then TP-chunk ownership order."""
+
+    layout = SharedPrefixLayout(
+        prefix_len=3, completion_lens=[5, 5], logical_completion_lens=[2, 4], padding_multiple=8
+    )
+    physical_len = 16
+    expected_multiplicities = torch.tensor([2, 2, 2] + [1] * 10 + [0, 0, 0], dtype=torch.float32)
+    expected_local_token_ids = {
+        (0, 0): [0, 1, 2, 3],
+        (0, 1): [12, 13, 14, 15],
+        (1, 0): [4, 5, 6, 7],
+        (1, 1): [8, 9, 10, 11],
+    }
+    global_counts = torch.zeros(3, dtype=torch.float32)
+    observed_token_ids = []
+    monkeypatch.setattr(shared_prefix_module, "_validate_hybrid_stack", lambda *_args: None)
+
+    for (cp_rank, tp_rank), token_ids_list in expected_local_token_ids.items():
+        token_ids = torch.tensor(token_ids_list, dtype=torch.long)
+        events = []
+        stack = SimpleNamespace(
+            layers=[_OwnershipRecordingMoELayer(events)],
+            pg_collection=SimpleNamespace(cp=_RankedGroup(2, cp_rank), tp=_RankedGroup(2, tp_rank)),
+            config=SimpleNamespace(
+                sequence_parallel=True,
+                recompute_granularity=None,
+                moe_router_enable_expert_bias=True,
+            ),
+            training=True,
+            post_process=False,
+            post_layer_norm=False,
+        )
+        hidden_states = token_ids.to(torch.float32).reshape(-1, 1, 1)
+
+        forward_hybrid_stack_shared_prefix(
+            stack, hidden_states, layout, position_embedding_type="none"
+        )
+
+        assert len(events) == 1
+        observed_ids, local_multiplicities = events[0]
+        torch.testing.assert_close(observed_ids, token_ids)
+        torch.testing.assert_close(
+            local_multiplicities, expected_multiplicities.index_select(0, token_ids)
+        )
+        routing_map = torch.nn.functional.one_hot(
+            (observed_ids * 2 + torch.div(observed_ids, 3, rounding_mode="floor") + 1) % 3,
+            num_classes=3,
+        ).to(torch.bool)
+        global_counts += _expert_bias_token_counts(
+            routing_map, token_multiplicities=local_multiplicities
+        )
+        observed_token_ids.extend(observed_ids.tolist())
+
+    global_token_ids = torch.arange(physical_len)
+    expected_routing_map = torch.nn.functional.one_hot(
+        (global_token_ids * 2 + torch.div(global_token_ids, 3, rounding_mode="floor") + 1) % 3,
+        num_classes=3,
+    ).to(torch.bool)
+    expected_counts = _expert_bias_token_counts(
+        expected_routing_map, token_multiplicities=expected_multiplicities
+    )
+    assert sorted(observed_token_ids) == list(range(physical_len))
+    torch.testing.assert_close(global_counts, expected_counts)
 
 
 @pytest.mark.internal

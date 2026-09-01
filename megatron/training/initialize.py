@@ -170,19 +170,21 @@ def _compile_dependencies():
     # Compile dataset C++ code.
     # =========================
     # TODO: move this to ninja
-    if torch.distributed.get_rank() == 0:
-        start_time = time.time()
+    rank = torch.distributed.get_rank()
+    start_time = time.time()
+    if rank == 0:
         print("> compiling dataset index builder ...")
-        from megatron.core.datasets.utils import compile_helpers
+    from megatron.core.datasets.utils import compile_helpers_distributed
 
-        compile_helpers()
+    compile_helpers_distributed()
+
+    if rank == 0:
         print(
             ">>> done with dataset index builder. Compilation time: {:.3f} "
             "seconds".format(time.time() - start_time),
             flush=True,
         )
 
-    torch.distributed.barrier()
 
 def _initialize_tp_communicators():
     """initializing the communicators with user buffers for high-performance tensor-model-parallel

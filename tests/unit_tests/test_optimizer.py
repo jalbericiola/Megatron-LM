@@ -22,6 +22,7 @@ from megatron.core.optimizer import (
     ParamKey,
     ParamPredicate,
     _get_param_groups,
+    _get_precision_aware_optimizer_state_initializer,
     check_config_overrides_consistency,
     get_megatron_optimizer,
     get_standard_config_overrides,
@@ -79,6 +80,105 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+class _LegacyPrecisionAwareOptimizer:
+    def __init__(self):
+        self.calls = []
+
+    def initialize_state(self, param):
+        self.calls.append((param,))
+
+
+class _RemainderPrecisionAwareOptimizer:
+    def __init__(self, store_param_remainders=True):
+        self.store_param_remainders = store_param_remainders
+        self.calls = []
+
+    def initialize_state(self, param, store_param_remainders):
+        self.calls.append((param, store_param_remainders))
+
+
+class _FailingRemainderPrecisionAwareOptimizer(_RemainderPrecisionAwareOptimizer):
+    def initialize_state(self, param, store_param_remainders):
+        self.calls.append((param, store_param_remainders))
+        raise TypeError("state initialization failed")
+
+
+def test_initialize_precision_aware_optimizer_state_preserves_legacy_te_api():
+    param = torch.empty(1, dtype=torch.bfloat16)
+    optimizer = _LegacyPrecisionAwareOptimizer()
+
+    with patch('megatron.core.optimizer.is_te_min_version', return_value=False):
+        initialize_state = _get_precision_aware_optimizer_state_initializer(optimizer)
+    initialize_state(param)
+
+    assert len(optimizer.calls) == 1
+    assert optimizer.calls[0][0] is param
+
+
+@pytest.mark.parametrize(
+    ("optimizer_setting", "param_dtype", "expected_store_param_remainders"),
+    [(True, torch.bfloat16, True), (True, torch.float32, False), (False, torch.bfloat16, False)],
+)
+def test_initialize_precision_aware_optimizer_state_matches_te_step_remainder_flag(
+    optimizer_setting, param_dtype, expected_store_param_remainders
+):
+    param = torch.empty(1, dtype=param_dtype)
+    optimizer = _RemainderPrecisionAwareOptimizer(optimizer_setting)
+
+    with patch('megatron.core.optimizer.is_te_min_version', return_value=True):
+        initialize_state = _get_precision_aware_optimizer_state_initializer(optimizer)
+    initialize_state(param)
+
+    assert len(optimizer.calls) == 1
+    assert optimizer.calls[0][0] is param
+    assert optimizer.calls[0][1] is expected_store_param_remainders
+
+
+@pytest.mark.parametrize(
+    ("is_te_2_1_or_newer", "optimizer_type"),
+    [(True, _LegacyPrecisionAwareOptimizer), (False, _RemainderPrecisionAwareOptimizer)],
+)
+def test_initialize_precision_aware_optimizer_state_rejects_version_signature_mismatch(
+    is_te_2_1_or_newer, optimizer_type
+):
+    param = torch.empty(1, dtype=torch.bfloat16)
+    optimizer = optimizer_type()
+
+    with (
+        patch('megatron.core.optimizer.is_te_min_version', return_value=is_te_2_1_or_newer),
+        pytest.raises(RuntimeError, match="signature is incompatible"),
+    ):
+        _get_precision_aware_optimizer_state_initializer(optimizer)
+
+    assert optimizer.calls == []
+
+
+def test_initialize_precision_aware_optimizer_state_requires_remainder_setting():
+    param = torch.empty(1, dtype=torch.bfloat16)
+    optimizer = _RemainderPrecisionAwareOptimizer()
+    del optimizer.store_param_remainders
+
+    with (
+        patch('megatron.core.optimizer.is_te_min_version', return_value=True),
+        pytest.raises(RuntimeError, match="does not expose the corresponding setting"),
+    ):
+        _get_precision_aware_optimizer_state_initializer(optimizer)
+
+    assert optimizer.calls == []
+
+
+def test_initialize_precision_aware_optimizer_state_does_not_retry_internal_type_error():
+    param = torch.empty(1, dtype=torch.bfloat16)
+    optimizer = _FailingRemainderPrecisionAwareOptimizer()
+
+    with patch('megatron.core.optimizer.is_te_min_version', return_value=True):
+        initialize_state = _get_precision_aware_optimizer_state_initializer(optimizer)
+    with pytest.raises(TypeError, match="state initialization failed"):
+        initialize_state(param)
+
+    assert len(optimizer.calls) == 1
 
 
 def test_copy_optimizer_param_metadata_preserves_allreduce():

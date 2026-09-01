@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
+import inspect
 import logging
 import warnings
 from collections import defaultdict
@@ -89,6 +90,68 @@ from .optimizer_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_precision_aware_optimizer_state_initializer(opt: Any) -> Callable[[torch.Tensor], None]:
+    """Build a TE precision-aware optimizer state initializer for its versioned API.
+
+    TransformerEngine 2.1 added the ``store_param_remainders`` argument to
+    ``FusedAdam.initialize_state``. Validate that the installed method matches the API expected
+    for its reported TE version rather than retrying after a ``TypeError``; retrying could hide a
+    real error raised inside TransformerEngine state initialization.
+    """
+    initialize_state = getattr(opt, 'initialize_state', None)
+    if not callable(initialize_state):
+        raise RuntimeError(
+            "Precision-aware optimizer does not provide a callable initialize_state method."
+        )
+
+    expects_param_remainders = is_te_min_version("2.1.0.dev0")
+    expected_parameter_count = 2 if expects_param_remainders else 1
+    expected_signature = (
+        "(param, store_param_remainders)" if expects_param_remainders else "(param)"
+    )
+
+    try:
+        signature = inspect.signature(initialize_state)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Unable to inspect precision-aware optimizer initialize_state; refusing to guess "
+            f"whether the installed TransformerEngine expects {expected_signature}."
+        ) from exc
+
+    parameters = tuple(signature.parameters.values())
+    positional_parameter_kinds = (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+    signature_matches = (
+        len(parameters) == expected_parameter_count
+        and all(parameter.kind in positional_parameter_kinds for parameter in parameters)
+        and (not expects_param_remainders or parameters[1].name == 'store_param_remainders')
+    )
+    if not signature_matches:
+        raise RuntimeError(
+            "TransformerEngine FusedAdam.initialize_state signature is incompatible with its "
+            f"reported version: expected {expected_signature}, found {signature}."
+        )
+
+    if not expects_param_remainders:
+        return initialize_state
+
+    if not hasattr(opt, 'store_param_remainders'):
+        raise RuntimeError(
+            "TransformerEngine FusedAdam.initialize_state expects store_param_remainders, but "
+            "the optimizer does not expose the corresponding setting."
+        )
+
+    def initialize_state_with_remainders(param: torch.Tensor) -> None:
+        # Match FusedAdam.step exactly: remainders only apply when both the optimizer setting and
+        # the individual parameter's BF16 dtype permit them.
+        store_param_remainders = opt.store_param_remainders and param.dtype == torch.bfloat16
+        initialize_state(param, store_param_remainders)
+
+    return initialize_state_with_remainders
 
 
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
@@ -588,6 +651,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             optimizer = adam_cls(**kwargs)
 
             def init_state_fn(opt, config=None):
+                precision_aware_state_initializer = None
                 for group in opt.param_groups:
                     for p in group['params']:
                         if len(opt.state[p]) == 0:
@@ -595,7 +659,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
-                                opt.initialize_state(p)
+                                if precision_aware_state_initializer is None:
+                                    precision_aware_state_initializer = (
+                                        _get_precision_aware_optimizer_state_initializer(opt)
+                                    )
+                                precision_aware_state_initializer(p)
 
         elif config.optimizer == 'lion':
             if not HAVE_EMERGING_OPTIMIZERS:

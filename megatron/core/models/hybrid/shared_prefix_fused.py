@@ -15,8 +15,11 @@ examples/shared_prefix_attention). Public entry points:
 
 Env knobs (defaults tuned on GB200): NRL_SP_CHAINFIRST (hybrid chain plan), NRL_SP_QSLICE
 (zero-copy q views), NRL_SP_STREAMS (stream overlap), and NRL_SP_COMBINE (cross-pass
-consolidation, default off). The retained Triton LSE merge is production-disabled pending a
-full-model corruption fix.
+consolidation, default off). Experimental Triton KV gather, backward glue, and dQ assembly have
+separate, default-off opt-ins so each can be parity-qualified independently.
+NRL_SP_DETERMINISTIC_BACKWARD is a default-off diagnostic that selects FlashAttention's
+deterministic backward. The retained Triton LSE merge is production-disabled pending a full-model
+corruption fix.
 GB200 net vs block-diagonal at equal work: star-like/balanced trees 1.59x training / 1.56x
 logprob; deep branched trees 1.00x / 1.01x at a 1.10x FLOP ceiling (91-92% kernel efficiency).
 """
@@ -36,8 +39,9 @@ from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_
 # which upcasts every pass output to fp32 and round-trips full [total, np, hn] tensors through
 # memory several times per forward. (a) is fixed by an LRU plan cache keyed on the node arrays;
 # (b) by a single Triton kernel that reads each pass's output/LSE once and writes the merged
-# output (+ final LSE) once, fp32 math in-register, bf16 out. NRL_SP_FUSED_MERGE=0 restores the
-# eager merge (fallback also automatic if Triton is unavailable).
+# output (+ final LSE) once, fp32 math in-register, bf16 out. The LSE merge is fail-closed below;
+# other Triton optimizations have independent default-off gates and automatically fall back when
+# Triton is unavailable.
 try:
     import triton
     import triton.language as tl
@@ -65,7 +69,43 @@ def _resolve_fused_merge_setting():
     return False
 
 
+def _resolve_experimental_triton_setting(env_name):
+    """Resolve a default-off opt-in for one independently parity-qualified Triton path.
+
+    These kernels are intentionally experimental. Reject ambiguous values so a launcher typo
+    cannot silently turn one on before its target topology has passed numerical parity.
+    """
+    value = os.environ.get(env_name, "0")
+    normalized = value.lower()
+    if normalized in ("", "0", "false"):
+        return False
+    if normalized in ("1", "true"):
+        return True
+    raise RuntimeError(f"{env_name} must be one of 0, 1, false, or true; got {value!r}")
+
+
+def _resolve_deterministic_backward_setting():
+    """Resolve the opt-in deterministic FlashAttention backward diagnostic.
+
+    Reject unknown values instead of silently selecting the faster nondeterministic path when a
+    launcher misspells the diagnostic setting.
+    """
+    value = os.environ.get("NRL_SP_DETERMINISTIC_BACKWARD", "0")
+    normalized = value.lower()
+    if normalized in ("0", "false"):
+        return False
+    if normalized in ("1", "true"):
+        return True
+    raise RuntimeError(
+        "NRL_SP_DETERMINISTIC_BACKWARD must be one of 0, 1, false, or true; " f"got {value!r}"
+    )
+
+
 _SP_FUSED_MERGE = _resolve_fused_merge_setting()
+_SP_FUSED_KV_GATHER = _resolve_experimental_triton_setting("NRL_SP_FUSED_KV_GATHER")
+_SP_FUSED_BACKWARD_GLUE = _resolve_experimental_triton_setting("NRL_SP_FUSED_BACKWARD_GLUE")
+_SP_FUSED_DQ_ASSEMBLY = _resolve_experimental_triton_setting("NRL_SP_FUSED_DQ_ASSEMBLY")
+_SP_DETERMINISTIC_BACKWARD = _resolve_deterministic_backward_setting()
 # merge/dq-assembly kernel tile config (swept on GB200; override for other parts)
 _SP_MERGE_BT = int(os.environ.get("NRL_SP_MERGE_BT", "16"))
 _SP_MERGE_WARPS = int(os.environ.get("NRL_SP_MERGE_WARPS", "8"))
@@ -297,6 +337,12 @@ if HAVE_TRITON:
         idx_ptr,  # int64 [rows] pass-row -> token
         kx_ptr,
         vx_ptr,  # [rows, ng, HN] destinations
+        k_stride_t,
+        k_stride_h,
+        k_stride_d,
+        v_stride_t,
+        v_stride_h,
+        v_stride_d,
         ng: tl.constexpr,
         HN: tl.constexpr,
     ):
@@ -304,8 +350,14 @@ if HAVE_TRITON:
         h = tl.program_id(1)
         offs = tl.arange(0, HN)
         t = tl.load(idx_ptr + r)
-        tl.store(kx_ptr + (r * ng + h) * HN + offs, tl.load(k_ptr + (t * ng + h) * HN + offs))
-        tl.store(vx_ptr + (r * ng + h) * HN + offs, tl.load(v_ptr + (t * ng + h) * HN + offs))
+        tl.store(
+            kx_ptr + (r * ng + h) * HN + offs,
+            tl.load(k_ptr + t * k_stride_t + h * k_stride_h + offs * k_stride_d),
+        )
+        tl.store(
+            vx_ptr + (r * ng + h) * HN + offs,
+            tl.load(v_ptr + t * v_stride_t + h * v_stride_h + offs * v_stride_d),
+        )
 
 
 # Round-3: overlap the independent per-pass flash calls on side CUDA streams (they only join at
@@ -329,15 +381,48 @@ def _sp_streams():
     return _SP_STREAM_POOL
 
 
+def _sp_fused_kv_gather_effective():
+    return HAVE_TRITON and _SP_FUSED_KV_GATHER
+
+
+def _sp_fused_backward_glue_effective():
+    return HAVE_TRITON and _SP_FUSED_BACKWARD_GLUE
+
+
+def _sp_fused_dq_assembly_effective(slot_pass):
+    # The kernel has seven statically-unrolled slot arguments. Deeper trees must retain the
+    # eager accumulator instead of tripping the kernel's assertion after an explicit opt-in.
+    return HAVE_TRITON and _SP_FUSED_DQ_ASSEMBLY and len(slot_pass) <= 7
+
+
 def _gather_kv(k, v, k_idx):
-    """Fused K+V gather (one index read, both tensors) via Triton; falls back to two
-    index_selects without it."""
-    if HAVE_TRITON and _SP_FUSED_MERGE:
+    """Fused K+V gather (one index read, both tensors) via Triton.
+
+    K/V commonly arrive as strided views of Megatron's interleaved mixed-QKV projection, so the
+    source strides must be explicit. Treating them as packed ``[total, ng, hn]`` tensors silently
+    reads neighboring Q/K fields on cross-attention passes. The outputs are newly allocated and
+    contiguous; the non-Triton path falls back to two stride-aware ``index_select`` calls.
+    """
+    if _sp_fused_kv_gather_effective():
         rows = k_idx.numel()
         ng, hn = k.shape[1], k.shape[2]
         kx = torch.empty(rows, ng, hn, dtype=k.dtype, device=k.device)
         vx = torch.empty(rows, ng, hn, dtype=v.dtype, device=v.device)
-        _sp_gather_kv_kernel[(rows, ng)](k, v, k_idx, kx, vx, ng=ng, HN=hn)
+        _sp_gather_kv_kernel[(rows, ng)](
+            k,
+            v,
+            k_idx,
+            kx,
+            vx,
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            ng=ng,
+            HN=hn,
+        )
         return kx, vx
     return k.index_select(0, k_idx), v.index_select(0, k_idx)
 
@@ -365,6 +450,17 @@ def _validate_forest_dfs_preorder(node_start, node_len, node_parent):
     par = [int(x) for x in node_parent]
     if len(ns) != len(nl) or len(ns) != len(par):
         raise ValueError("forest node_start, node_len, and node_parent must have equal lengths")
+
+    cursor = 0
+    for i, (start, length) in enumerate(zip(ns, nl)):
+        if start != cursor:
+            raise ValueError(
+                f"forest node {i} start={start} != expected {cursor} "
+                "(spans must be contiguous in array order)"
+            )
+        if length <= 0:
+            raise ValueError(f"forest node {i} has non-positive length {length}")
+        cursor += length
 
     stack: List[int] = []
     for i, parent in enumerate(par):
@@ -902,9 +998,11 @@ class _ComposedForestAttn(torch.autograd.Function):
         lse_final, scale = ctx.lse_final, ctx.scale
         do = do.contiguous()
         total, np_, hn = q.shape[0], q.shape[1], q.shape[2]
-        use_triton = _SP_FUSED_MERGE and HAVE_TRITON and getattr(ctx, "qidx64", None) is not None
+        have_cached_row_maps = getattr(ctx, "qidx64", None) is not None
+        use_backward_glue = _sp_fused_backward_glue_effective() and have_cached_row_maps
+        use_dq_assembly = _sp_fused_dq_assembly_effective(ctx.slot_pass) and have_cached_row_maps
 
-        if use_triton:
+        if use_backward_glue:
             # Fused backward glue: (a) per-pass dout scaling w*do fused with the query gather in
             # one kernel (the eager path materialized an fp32 exp/mul chain + an index_select per
             # pass); (b) the self pass (always pass 0, identity indices over all tokens) INITIALIZES
@@ -966,7 +1064,7 @@ class _ComposedForestAttn(torch.autograd.Function):
                         -1,
                         0.0,
                         None,
-                        False,
+                        _SP_DETERMINISTIC_BACKWARD,
                         None,
                         False,
                     )
@@ -1000,18 +1098,33 @@ class _ComposedForestAttn(torch.autograd.Function):
                     _sp_scatter_accum_kernel[((kro + 15) // 16, ng)](
                         dv, dvx, k_idx, kro, n_=ng, HN=hn
                     )
-            dq = _merge_dq_triton(
-                ctx.slot_pass, ctx.inv_maps, dqxs, total, np_, hn, q.dtype, q.device
-            )
+            if use_dq_assembly:
+                dq = _merge_dq_triton(
+                    ctx.slot_pass, ctx.inv_maps, dqxs, total, np_, hn, q.dtype, q.device
+                )
+            else:
+                dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+                for dqx, result in zip(dqxs, results):
+                    q_idx = result[-1]
+                    if q_idx is None:
+                        dq += dqx.float()
+                    elif isinstance(q_idx, _QSlice):
+                        dq[q_idx.lo : q_idx.hi] += dqx.float()
+                    else:
+                        dq.index_add_(0, q_idx, dqx.float())
+                dq = dq.to(q.dtype)
             return dq, dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
 
-        dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+        dq = None if use_dq_assembly else torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+        dqxs = [] if use_dq_assembly else None
         dk = torch.zeros(k.shape, device=k.device, dtype=torch.float32)
         dv = torch.zeros(v.shape, device=v.device, dtype=torch.float32)
         for (q_idx, k_idx, cu_q, cu_k, mxq, mxk, causal), lse in zip(ctx.passes, ctx.lses):
             qx = _sel_rows(q, q_idx)  # q_idx None => identity (self pass)
-            kx = k if k_idx is None else k.index_select(0, k_idx)
-            vx = v if k_idx is None else v.index_select(0, k_idx)
+            if k_idx is None:
+                kx, vx = k, v
+            else:
+                kx, vx = _gather_kv(k, v, k_idx)
             ox = _sel_rows(o_merged, q_idx)  # MERGED output -> exact
             if isinstance(q_idx, _QSlice):
                 lf = lse_final[:, q_idx.lo : q_idx.hi]
@@ -1046,23 +1159,32 @@ class _ComposedForestAttn(torch.autograd.Function):
                 -1,
                 0.0,
                 None,
-                False,
+                _SP_DETERMINISTIC_BACKWARD,
                 None,
                 False,
             )
-            if q_idx is None:
-                dq += dqx.float()
-            elif isinstance(q_idx, _QSlice):
-                dq[q_idx.lo : q_idx.hi] += dqx.float()
+            if use_dq_assembly:
+                dqxs.append(dqx)
             else:
-                dq.index_add_(0, q_idx, dqx.float())
+                if q_idx is None:
+                    dq += dqx.float()
+                elif isinstance(q_idx, _QSlice):
+                    dq[q_idx.lo : q_idx.hi] += dqx.float()
+                else:
+                    dq.index_add_(0, q_idx, dqx.float())
             if k_idx is None:
                 dk += dkx.float()
                 dv += dvx.float()
             else:
                 dk.index_add_(0, k_idx, dkx.float())
                 dv.index_add_(0, k_idx, dvx.float())
-        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
+        if use_dq_assembly:
+            dq = _merge_dq_triton(
+                ctx.slot_pass, ctx.inv_maps, dqxs, total, np_, hn, q.dtype, q.device
+            )
+        else:
+            dq = dq.to(q.dtype)
+        return dq, dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
 
 
 def flash_composed_forest_attention_fused(
