@@ -891,6 +891,7 @@ def forward_hybrid_stack_shared_prefix(
     layout: SharedPrefixLayout,
     *,
     rotary_pos_emb: Tensor | tuple[Tensor, Tensor] | None = None,
+    position_embedding_type: str = "rope",
 ) -> Tensor:
     """Explicit exact-prompt star forward for a supported ``HybridStack`` topology.
 
@@ -903,8 +904,14 @@ def forward_hybrid_stack_shared_prefix(
         isinstance(layer, TransformerLayer) and isinstance(layer.self_attention, SelfAttention)
         for layer in stack.layers
     )
-    if has_attention and rotary_pos_emb is None:
+    if position_embedding_type not in ("rope", "none"):
+        raise NotImplementedError(
+            "shared-prefix attention supports only RoPE or positionless Hybrid models"
+        )
+    if has_attention and position_embedding_type == "rope" and rotary_pos_emb is None:
         raise ValueError("position-aware rotary_pos_emb is required for shared-prefix attention")
+    if position_embedding_type == "none" and rotary_pos_emb is not None:
+        raise ValueError("positionless shared-prefix attention must not receive rotary_pos_emb")
 
     cp_group = stack.pg_collection.cp
     tp_group = stack.pg_collection.tp
@@ -1016,6 +1023,13 @@ SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY = "hybrid_star_moe_expert_bias_v1"
 SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY = "hybrid_star_full_uniform_recompute_v1"
 SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp1_tp_sp_v1"
 SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp_tp_sp_v1"
+# Validated target-model feature: Nemotron-H attention is positionless while
+# Mamba remains state-positioned by sequence order.
+SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY = "hybrid_star_positionless_attention_v1"
+# Validated MTP predictor feature: reconstruct dense attention/MLP or attention/MoE
+# heads from the shared-prefix physical layout on the supported distributed TP/CP
+# topologies.
+SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY = "hybrid_star_mtp_dense_heads_v1"
 # Topology and feature capabilities are independent so integrations can negotiate their exact
 # validated conjunction without inferring support from a broader aggregate token.
 SHARED_PREFIX_TRAINING_CAPABILITIES = frozenset(
@@ -1027,5 +1041,7 @@ SHARED_PREFIX_TRAINING_CAPABILITIES = frozenset(
         SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
         SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY,
         SHARED_PREFIX_CP_TP_SP_TRAINING_CAPABILITY,
+        SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+        SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
     }
 )

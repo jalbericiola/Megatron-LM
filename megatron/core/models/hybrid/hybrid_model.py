@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+from collections.abc import Iterator
 from typing import Literal, Optional
 
 import torch
@@ -15,6 +16,8 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid.shared_prefix import (
+    SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+    SHARED_PREFIX_TRAINING_CAPABILITIES,
     SharedPrefixLayout,
     _validate_shared_prefix_physical_length,
     forward_hybrid_stack_shared_prefix,
@@ -56,6 +59,160 @@ def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
     if tp_group is None:
         return {}
     return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
+
+
+def _canonicalize_shared_prefix_cp_sequence(
+    local_tensor: Tensor,
+    layout: SharedPrefixLayout,
+    physical_len: int,
+    cp_group: torch.distributed.ProcessGroup,
+    *,
+    reduce_scatter_grad: bool,
+) -> Tensor:
+    """Gather one zigzag CP shard and restore canonical global star order."""
+    cp_size = cp_group.size()
+    if local_tensor.shape[0] * cp_size != physical_len:
+        raise ValueError(
+            "shared-prefix CP-local tensor length does not match the physical star: "
+            f"{local_tensor.shape[0]} * {cp_size} != {physical_len}"
+        )
+    if cp_size == 1:
+        return local_tensor
+
+    rank_order_tensor = gather_from_sequence_parallel_region(
+        local_tensor, tensor_parallel_output_grad=reduce_scatter_grad, group=cp_group
+    )
+    rank_order_indices = torch.cat(
+        [
+            layout.cp_local_indices(physical_len, cp_size, rank, local_tensor.device)
+            for rank in range(cp_size)
+        ]
+    )
+    inverse_order = torch.empty_like(rank_order_indices)
+    inverse_order[rank_order_indices] = torch.arange(
+        physical_len, device=local_tensor.device, dtype=torch.long
+    )
+    return rank_order_tensor.index_select(0, inverse_order)
+
+
+def _iter_shared_prefix_mtp_branches(
+    global_hidden_states: Tensor,
+    global_input_ids: Tensor,
+    global_loss_mask: Tensor,
+    layout: SharedPrefixLayout,
+    *,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
+    """Yield independent dense MTP branches from one canonical star.
+
+    The main Hybrid stack can share its prompt, but MTP shifts future tokens and
+    therefore needs a conventional sequence boundary per completion.  Keeping
+    only the current branch materialized avoids retaining the full dense
+    expansion on every CP rank. When CP is enabled, global-star indices are
+    composed directly with that branch's zigzag CP ownership so the full dense
+    branch is never allocated.
+    """
+    physical_len = global_hidden_states.shape[0]
+    if global_hidden_states.ndim != 3 or global_hidden_states.shape[1] != 1:
+        raise ValueError("shared-prefix MTP hidden states must have shape [tokens, 1, hidden]")
+    if global_input_ids.shape != (1, physical_len):
+        raise ValueError("shared-prefix MTP input IDs must have shape [1, physical_tokens]")
+    if global_loss_mask.shape != (1, physical_len):
+        raise ValueError("shared-prefix MTP loss mask must have shape [1, physical_tokens]")
+    if physical_len < layout.total_len:
+        raise ValueError(
+            f"shared-prefix MTP physical length {physical_len} is shorter than layout "
+            f"length {layout.total_len}"
+        )
+    if layout.logical_completion_lens is None or layout.padding_multiple is None:
+        raise NotImplementedError(
+            "shared-prefix MTP requires explicit logical completion lengths and physical padding"
+        )
+    if cp_size < 1 or not 0 <= cp_rank < cp_size:
+        raise ValueError("shared-prefix MTP received an invalid CP size/rank")
+
+    if torch.count_nonzero(global_loss_mask[:, : layout.prefix_len]).item():
+        raise ValueError("shared-prefix MTP loss mask must exclude every prompt token")
+    if torch.count_nonzero(global_loss_mask[:, layout.total_len :]).item():
+        raise ValueError("shared-prefix MTP loss mask must exclude topology-only padding")
+
+    prompt_indices = torch.arange(
+        layout.prefix_len, device=global_hidden_states.device, dtype=torch.long
+    )
+    for branch_slice, logical_len in zip(
+        layout.completion_slices(), layout.logical_completion_lens, strict=True
+    ):
+        physical_padding_start = branch_slice.start + logical_len
+        if torch.count_nonzero(
+            global_loss_mask[:, physical_padding_start : branch_slice.stop]
+        ).item():
+            raise ValueError(
+                "shared-prefix MTP loss mask must exclude ordinary per-sequence padding"
+            )
+        indices = torch.cat(
+            (
+                prompt_indices,
+                torch.arange(
+                    branch_slice.start,
+                    branch_slice.stop,
+                    device=global_hidden_states.device,
+                    dtype=torch.long,
+                ),
+            )
+        )
+        if cp_size > 1:
+            cp_positions = SharedPrefixLayout.cp_local_indices(
+                indices.numel(), cp_size, cp_rank, indices.device
+            )
+            indices = indices.index_select(0, cp_positions)
+        yield (
+            global_hidden_states.index_select(0, indices),
+            global_input_ids.index_select(1, indices),
+            global_loss_mask.index_select(1, indices),
+        )
+
+
+def _reconstruct_shared_prefix_mtp_branches(
+    global_hidden_states: Tensor,
+    global_input_ids: Tensor,
+    global_loss_mask: Tensor,
+    layout: SharedPrefixLayout,
+) -> tuple[tuple[Tensor, Tensor, Tensor], ...]:
+    """Materialize the iterator for focused reconstruction/parity tests."""
+    return tuple(
+        _iter_shared_prefix_mtp_branches(
+            global_hidden_states, global_input_ids, global_loss_mask, layout
+        )
+    )
+
+
+def _validate_shared_prefix_mtp_pattern(mtp_pattern: Optional[str]) -> None:
+    """Keep the promoted predictor scope narrower than the Hybrid backbone scope."""
+    if mtp_pattern is not None and 'M' in mtp_pattern:
+        raise NotImplementedError(
+            "shared-prefix MTP supports a Mamba Hybrid backbone but does not yet "
+            "support a Mamba layer inside the MTP predictor; use an attention/MLP "
+            "or attention/MoE MTP pattern such as '*-' or '*E'"
+        )
+
+
+def _hybrid_mtp_is_enabled(
+    configured_num_layers: Optional[int], mtp_pattern: Optional[str], mtp_pattern_depths: int
+) -> bool:
+    """Return whether this Hybrid runtime should construct and execute MTP.
+
+    Native Nemotron-H configs can retain MTP pattern metadata while a training
+    recipe explicitly overrides ``mtp_num_layers=0``.  The pattern still
+    describes the checkpoint architecture, but zero must disable the runtime
+    MTP block and its post-processing path.
+    """
+    return bool(
+        configured_num_layers is not None
+        and configured_num_layers > 0
+        and mtp_pattern is not None
+        and mtp_pattern_depths > 0
+    )
 
 
 class HybridModel(LanguageModule, GraphableMegatronModule):
@@ -223,8 +380,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
-            self.mtp_pattern is not None
-            and self.mtp_num_depths > 0
+            _hybrid_mtp_is_enabled(
+                self.config.mtp_num_layers, self.mtp_pattern, self.mtp_num_depths
+            )
             # The following forces MTP to be on the final pipeline stage. It might be more optimal
             # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
             # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
@@ -425,6 +583,214 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
             self.cudagraph_manager = CudaGraphManager(config)
 
+    def _forward_shared_prefix_mtp(
+        self,
+        *,
+        hidden_states: Tensor,
+        input_ids: Tensor,
+        loss_mask: Tensor,
+        layout: SharedPrefixLayout,
+        output_weight: Optional[Tensor],
+        runtime_gather_output: Optional[bool],
+    ) -> Tensor:
+        """Run MTP heads on dense branches while preserving the shared backbone graph."""
+        tp_group = self.pg_collection.tp
+        cp_group = self.pg_collection.cp
+        tp_size = tp_group.size()
+        cp_size = cp_group.size()
+        physical_len = input_ids.shape[1] * cp_size
+
+        # The shared backbone is SP-sharded over TP.  Gather without reducing
+        # gradients because the reconstructed branches are scattered over TP
+        # again below, so each sequence position has one downstream owner.
+        cp_local_hidden = hidden_states
+        if tp_size > 1:
+            cp_local_hidden = gather_from_sequence_parallel_region(
+                cp_local_hidden, tensor_parallel_output_grad=False, group=tp_group
+            )
+
+        global_hidden = _canonicalize_shared_prefix_cp_sequence(
+            cp_local_hidden, layout, physical_len, cp_group, reduce_scatter_grad=True
+        )
+        global_input_ids = _canonicalize_shared_prefix_cp_sequence(
+            input_ids.transpose(0, 1).contiguous(),
+            layout,
+            physical_len,
+            cp_group,
+            reduce_scatter_grad=False,
+        ).transpose(0, 1)
+        global_loss_mask = _canonicalize_shared_prefix_cp_sequence(
+            loss_mask.transpose(0, 1).contiguous(),
+            layout,
+            physical_len,
+            cp_group,
+            reduce_scatter_grad=False,
+        ).transpose(0, 1)
+        global_branch_lengths = [
+            layout.prefix_len + completion_len for completion_len in layout.completion_lens
+        ]
+        if any(branch_len % cp_size for branch_len in global_branch_lengths):
+            raise ValueError("shared-prefix MTP branch length must be divisible by CP size")
+        combined_cp_length = sum(global_branch_lengths) // cp_size
+        if combined_cp_length % tp_size:
+            raise ValueError(
+                "shared-prefix MTP combined CP-local sequence must be divisible by TP size"
+            )
+        packed_sp_length = combined_cp_length // tp_size
+        packed_sp_start = tp_group.rank() * packed_sp_length
+        packed_sp_stop = packed_sp_start + packed_sp_length
+
+        depth_count = 1 + self.config.mtp_num_layers
+        outputs_by_depth = [[] for _ in range(depth_count)]
+        branch_input_ids = []
+        branch_loss_masks = []
+        branch_cp_offset = 0
+        branch_iterator = _iter_shared_prefix_mtp_branches(
+            global_hidden,
+            global_input_ids,
+            global_loss_mask,
+            layout,
+            cp_size=cp_size,
+            cp_rank=cp_group.rank(),
+        )
+        for (branch_hidden, branch_ids, branch_mask), branch_len in zip(
+            branch_iterator, global_branch_lengths, strict=True
+        ):
+            required_alignment = tp_size if cp_size == 1 else 2 * cp_size * tp_size
+            if branch_len % required_alignment:
+                raise ValueError(
+                    "shared-prefix MTP physical branch length must be divisible by "
+                    f"the CP/TP sequence quantum {required_alignment}, got {branch_len}"
+                )
+            branch_cp_indices = (
+                torch.arange(branch_len, device=branch_ids.device, dtype=torch.long)
+                if cp_size == 1
+                else SharedPrefixLayout.cp_local_indices(
+                    branch_len, cp_size, cp_group.rank(), branch_ids.device
+                )
+            )
+            local_hidden = branch_hidden
+            local_ids = branch_ids
+            local_mask = branch_mask
+            local_position_ids = torch.arange(
+                branch_len, device=branch_ids.device, dtype=torch.long
+            ).index_select(0, branch_cp_indices)[None, :]
+            if tp_size > 1:
+                local_hidden = tensor_parallel.scatter_to_sequence_parallel_region(
+                    local_hidden, group=tp_group
+                )
+
+            # RotaryEmbedding owns the standard CP zigzag slice.  MTP receives
+            # one ordinary sequence here, so no forest positions are involved.
+            if self.position_embedding_type == 'rope':
+                branch_rotary_pos_emb = self.rotary_pos_emb(branch_len)
+            elif self.position_embedding_type == 'none':
+                branch_rotary_pos_emb = None
+            else:
+                raise NotImplementedError(
+                    "shared-prefix MTP supports only RoPE or positionless Hybrid models"
+                )
+            branch_output = self.mtp(
+                input_ids=local_ids,
+                position_ids=local_position_ids,
+                hidden_states=local_hidden,
+                attention_mask=None,
+                inference_params=None,
+                rotary_pos_emb=branch_rotary_pos_emb,
+                packed_seq_params=None,
+                embedding=self.embedding,
+            )
+            branch_input_ids.append(local_ids)
+            branch_loss_masks.append(local_mask)
+            branch_chunks = torch.chunk(branch_output, depth_count, dim=0)
+            if len(branch_chunks) != depth_count:
+                raise RuntimeError("shared-prefix MTP returned an invalid prediction depth count")
+            branch_cp_length = branch_len // cp_size
+            for depth, chunk in enumerate(branch_chunks):
+                if tp_size == 1:
+                    outputs_by_depth[depth].append(chunk)
+                    continue
+
+                # Gather only the current branch/depth, then retain only this
+                # rank's slice of the eventual branch-major combined SP shard.
+                # reduce-scatter backward is required because different ranks
+                # select disjoint pieces from their replicated gathered branch.
+                full_branch_chunk = gather_from_sequence_parallel_region(
+                    chunk, tensor_parallel_output_grad=True, group=tp_group
+                )
+                overlap_start = max(branch_cp_offset, packed_sp_start)
+                overlap_stop = min(branch_cp_offset + branch_cp_length, packed_sp_stop)
+                if overlap_start < overlap_stop:
+                    source_start = overlap_start - branch_cp_offset
+                    source_stop = overlap_stop - branch_cp_offset
+                    outputs_by_depth[depth].append(
+                        full_branch_chunk[source_start:source_stop].contiguous()
+                    )
+                else:
+                    # Retain this gather in every TP rank's autograd graph even
+                    # when the rank owns no tokens from this branch.  Omitting
+                    # it lets backward issue the same number of reduce-scatters
+                    # in a different branch order on different ranks, silently
+                    # pairing unrelated branch gradients.
+                    outputs_by_depth[depth].append(full_branch_chunk[:0])
+                del full_branch_chunk
+            branch_cp_offset += branch_cp_length
+            del branch_output, branch_hidden
+
+        # MTP layers run independently so variable-length Mamba branches never
+        # see synthetic batch padding.  Repack their outputs by prediction depth
+        # for one globally normalized loss calculation.  PackedSeqParams is used
+        # only by process_mtp_loss's token/mask shifts, not by an MTP model layer.
+        packed_depth_hidden_states = []
+        for depth_outputs in outputs_by_depth:
+            packed_depth = torch.cat(depth_outputs, dim=0)
+            if packed_depth.shape[0] != packed_sp_length:
+                raise RuntimeError(
+                    "shared-prefix MTP branch-major SP shard has an invalid length: "
+                    f"{packed_depth.shape[0]} != {packed_sp_length}"
+                )
+            packed_depth_hidden_states.append(packed_depth)
+        packed_hidden_states = torch.cat(packed_depth_hidden_states, dim=0)
+        packed_input_ids = torch.cat(branch_input_ids, dim=1)
+        packed_loss_mask = torch.cat(branch_loss_masks, dim=1)
+        cumulative_lengths = [0]
+        for branch_len in global_branch_lengths:
+            cumulative_lengths.append(cumulative_lengths[-1] + branch_len)
+        cu_seqlens = torch.tensor(
+            cumulative_lengths, device=packed_input_ids.device, dtype=torch.int32
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max(global_branch_lengths),
+            max_seqlen_kv=max(global_branch_lengths),
+            local_cp_size=cp_size,
+            cp_group=cp_group,
+        )
+        processed_mtp_hidden = process_mtp_loss(
+            hidden_states=packed_hidden_states,
+            labels=None,
+            loss_mask=packed_loss_mask,
+            output_layer=self.output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            is_training=self.training,
+            compute_language_model_loss=self.compute_language_model_loss,
+            config=self.config,
+            cp_group=cp_group,
+            tp_group=self.tp_group,
+            packed_seq_params=packed_seq_params,
+            scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+            input_ids=packed_input_ids,
+        )
+
+        # The external RL loss consumes star logits.  A zero-valued attachment
+        # retains process_mtp_loss's MTPLossAutoScaler nodes without changing
+        # those logits; its backward hook supplies the auxiliary-loss gradient.
+        mtp_loss_anchor = processed_mtp_hidden.reshape(-1)[0] * 0.0
+        return hidden_states + mtp_loss_anchor
+
     def forward(
         self,
         input_ids: Tensor,
@@ -491,11 +857,28 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 raise NotImplementedError(
                     "shared-prefix HybridModel forward currently requires a complete PP1 model"
                 )
-            if self.mtp_process:
-                raise NotImplementedError("shared-prefix Hybrid forward does not support MTP")
-            if self.position_embedding_type != 'rope' or self.config.multi_latent_attention:
+            if (
+                self.mtp_process
+                and self.training
+                and SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY
+                not in SHARED_PREFIX_TRAINING_CAPABILITIES
+            ):
                 raise NotImplementedError(
-                    "shared-prefix Hybrid forward requires standard RoPE attention"
+                    "shared-prefix Hybrid MTP dense-head support is implemented but not "
+                    "advertised for production; distributed forward/backward parity must "
+                    f"promote capability {SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY!r}"
+                )
+            if self.mtp_process and self.training:
+                _validate_shared_prefix_mtp_pattern(self.mtp_pattern)
+            if self.mtp_process and self.training and loss_mask is None:
+                raise ValueError("shared-prefix Hybrid MTP requires an explicit loss mask")
+            if self.position_embedding_type not in ('rope', 'none'):
+                raise NotImplementedError(
+                    "shared-prefix Hybrid forward supports only RoPE or positionless attention"
+                )
+            if self.config.multi_latent_attention:
+                raise NotImplementedError(
+                    "shared-prefix Hybrid forward does not support multi-latent attention"
                 )
             tp_size = self.pg_collection.tp.size()
             cp_size = self.pg_collection.cp.size()
@@ -561,7 +944,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         rotary_pos_emb = None
-        if shared_prefix_layout is not None:
+        if shared_prefix_layout is not None and self.position_embedding_type == 'rope':
             if decoder_input is None:
                 raise RuntimeError("shared-prefix Hybrid embedding did not produce decoder input")
             cp_group = self.pg_collection.cp
@@ -623,7 +1006,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Run decoder.
         if shared_prefix_layout is not None:
             hidden_states = forward_hybrid_stack_shared_prefix(
-                self.decoder, decoder_input, shared_prefix_layout, rotary_pos_emb=rotary_pos_emb
+                self.decoder,
+                decoder_input,
+                shared_prefix_layout,
+                rotary_pos_emb=rotary_pos_emb,
+                position_embedding_type=self.position_embedding_type,
             )
         else:
             hidden_states = self.decoder(
@@ -649,23 +1036,37 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.num_speculative_tokens > 0
         )
 
-        mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
+        mtp_forward_ran = self.mtp_process and not (
+            in_inference_mode
+            or is_spec_decode
+            or (shared_prefix_layout is not None and not self.training)
+        )
         if mtp_forward_ran:
-            hidden_states = self.mtp(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                embedding=self.embedding,
-            )
+            if shared_prefix_layout is not None:
+                hidden_states = self._forward_shared_prefix_mtp(
+                    hidden_states=hidden_states,
+                    input_ids=input_ids,
+                    loss_mask=loss_mask,
+                    layout=shared_prefix_layout,
+                    output_weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                )
+            else:
+                hidden_states = self.mtp(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    inference_params=inference_params,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    embedding=self.embedding,
+                )
 
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None and self.mtp_process:
+        if self.mtp_process:
             assert self.config.mtp_num_layers > 0
             if is_spec_decode:
                 assert inference_context is not None
@@ -681,7 +1082,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     # Non-block scope: direct assignment; the controller will set
                     # this back to None after reading to allow GC.
                     inference_context.mtp_decoder_hidden_states = hidden_states
-            elif not in_inference_mode:
+            elif not in_inference_mode and shared_prefix_layout is None:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
