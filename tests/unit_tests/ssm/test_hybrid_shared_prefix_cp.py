@@ -239,6 +239,82 @@ def test_tp_sp_explicit_padding_multiple_can_exceed_topology_quantum():
         )
 
 
+def test_explicit_topology_padding_can_be_smaller_than_branch_padding():
+    # TP2/CP2 has Q=8. Dense branches use M=16, but the three-branch star
+    # totals 38 tokens and therefore needs only two topology-padding rows.
+    layout = SharedPrefixLayout(
+        prefix_len=5,
+        completion_lens=[11, 11, 11],
+        logical_completion_lens=[1, 1, 1],
+        padding_multiple=16,
+        topology_padding_multiple=8,
+    )
+    stack = _validation_stack(cp_size=2, tp_size=2)
+    _validate_hybrid_stack(stack, torch.empty(10, 1, 8, dtype=torch.bfloat16), layout)
+
+    with pytest.raises(ValueError, match="must match the active topology quantum"):
+        _validate_hybrid_stack(
+            stack,
+            torch.empty(10, 1, 8, dtype=torch.bfloat16),
+            SharedPrefixLayout(
+                prefix_len=5,
+                completion_lens=[11, 11, 11],
+                logical_completion_lens=[1, 1, 1],
+                padding_multiple=16,
+                topology_padding_multiple=4,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="minimal trailing pad"):
+        _validate_hybrid_stack(stack, torch.empty(12, 1, 8, dtype=torch.bfloat16), layout)
+
+
+def test_explicit_topology_padding_matches_m128_q8_training_geometry():
+    # This is the production NeMo-RL split contract: each of four dense
+    # branches is M=128 aligned, while their prompt-deduplicated star has 500
+    # rows and needs only four trailing rows for TP2/CP2 Q=8.
+    layout = SharedPrefixLayout(
+        prefix_len=4,
+        completion_lens=[124, 124, 124, 124],
+        logical_completion_lens=[3, 4, 5, 2],
+        padding_multiple=128,
+        topology_padding_multiple=8,
+    )
+    stack = _validation_stack(cp_size=2, tp_size=2)
+    assert layout.total_len == 500
+    _validate_hybrid_stack(stack, torch.empty(126, 1, 8, dtype=torch.bfloat16), layout)
+
+    with pytest.raises(ValueError, match="minimal trailing pad"):
+        _validate_hybrid_stack(stack, torch.empty(128, 1, 8, dtype=torch.bfloat16), layout)
+
+    # Existing callers that omit Q retain the legacy whole-star M contract.
+    legacy_layout = SharedPrefixLayout(
+        prefix_len=4,
+        completion_lens=[124, 124, 124, 124],
+        logical_completion_lens=[3, 4, 5, 2],
+        padding_multiple=128,
+    )
+    _validate_hybrid_stack(
+        stack, torch.empty(128, 1, 8, dtype=torch.bfloat16), legacy_layout
+    )
+    with pytest.raises(ValueError, match="global padding multiple"):
+        _validate_hybrid_stack(
+            stack, torch.empty(126, 1, 8, dtype=torch.bfloat16), legacy_layout
+        )
+
+
+@pytest.mark.parametrize("value", [True, 0, 3])
+def test_explicit_topology_padding_rejects_invalid_contract(value):
+    with pytest.raises(ValueError, match="topology_padding_multiple|divisible"):
+        SharedPrefixLayout(
+            prefix_len=5,
+            completion_lens=[11],
+            logical_completion_lens=[1],
+            padding_multiple=16,
+            topology_padding_multiple=value,
+        )
+
+
 def test_tp1_cp1_explicit_layout_accepts_odd_padding_multiple():
     # TP1/CP1 has Q=1. P1 + logical lengths 1,2 minimally pad to M3, giving
     # physical completion spans 2,2 and a star total 5 padded globally to 6.
@@ -248,6 +324,25 @@ def test_tp1_cp1_explicit_layout_accepts_odd_padding_multiple():
     _validate_hybrid_stack(
         _validation_stack(cp_size=1), torch.empty(6, 1, 8, dtype=torch.bfloat16), layout
     )
+
+    explicit_topology_layout = SharedPrefixLayout(
+        prefix_len=1,
+        completion_lens=[2, 2],
+        logical_completion_lens=[1, 2],
+        padding_multiple=3,
+        topology_padding_multiple=1,
+    )
+    _validate_hybrid_stack(
+        _validation_stack(cp_size=1),
+        torch.empty(5, 1, 8, dtype=torch.bfloat16),
+        explicit_topology_layout,
+    )
+    with pytest.raises(ValueError, match="minimal trailing pad"):
+        _validate_hybrid_stack(
+            _validation_stack(cp_size=1),
+            torch.empty(6, 1, 8, dtype=torch.bfloat16),
+            explicit_topology_layout,
+        )
 
 
 def test_tp_sp_validation_rejects_misaligned_or_nonminimal_padding():

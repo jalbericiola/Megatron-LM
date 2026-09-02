@@ -50,6 +50,7 @@ class SharedPrefixLayout:
     completion_lens: Sequence[int]
     logical_completion_lens: Sequence[int] | None = None
     padding_multiple: int | None = None
+    topology_padding_multiple: int | None = None
 
     def __post_init__(self) -> None:
         prefix_len = int(self.prefix_len)
@@ -82,6 +83,22 @@ class SharedPrefixLayout:
                 raise ValueError("shared-prefix padding_multiple must be an integer")
             if self.padding_multiple < 1:
                 raise ValueError("shared-prefix padding_multiple must be positive")
+        if self.topology_padding_multiple is not None:
+            if isinstance(self.topology_padding_multiple, bool) or not isinstance(
+                self.topology_padding_multiple, int
+            ):
+                raise ValueError("shared-prefix topology_padding_multiple must be an integer")
+            if self.topology_padding_multiple < 1:
+                raise ValueError("shared-prefix topology_padding_multiple must be positive")
+            if self.padding_multiple is None:
+                raise ValueError(
+                    "shared-prefix topology_padding_multiple requires padding_multiple"
+                )
+            if self.padding_multiple % self.topology_padding_multiple:
+                raise ValueError(
+                    "shared-prefix padding_multiple must be divisible by "
+                    "topology_padding_multiple"
+                )
 
     @property
     def total_len(self) -> int:
@@ -666,15 +683,27 @@ def _validate_shared_prefix_physical_length(
                     f"logical={logical_completion}, physical={physical_completion}, "
                     f"M={padding_multiple}"
                 )
-        if physical_len % padding_multiple:
+        if (
+            layout.topology_padding_multiple is not None
+            and layout.topology_padding_multiple != topology_multiple
+        ):
             raise ValueError(
-                "shared-prefix physical length must be divisible by padding_multiple: "
-                f"physical={physical_len}, M={padding_multiple}"
+                "shared-prefix topology_padding_multiple must match the active topology "
+                f"quantum: metadata={layout.topology_padding_multiple}, "
+                f"Q={topology_multiple}, TP={tp_size}, CP={cp_size}"
             )
-        if not 0 <= padding < padding_multiple:
+        global_padding_multiple = layout.topology_padding_multiple or padding_multiple
+        if physical_len % global_padding_multiple:
             raise ValueError(
-                "shared-prefix input must use the minimal trailing pad to padding_multiple: "
-                f"physical={physical_len}, layout={layout.total_len}, M={padding_multiple}"
+                "shared-prefix physical length must be divisible by its global padding "
+                f"multiple: physical={physical_len}, global_M={global_padding_multiple}, "
+                f"branch_M={padding_multiple}"
+            )
+        if not 0 <= padding < global_padding_multiple:
+            raise ValueError(
+                "shared-prefix input must use the minimal trailing pad to its global padding "
+                f"multiple: physical={physical_len}, layout={layout.total_len}, "
+                f"global_M={global_padding_multiple}, branch_M={padding_multiple}"
             )
         return
 
