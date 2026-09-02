@@ -11,7 +11,9 @@ from megatron.core.models.hybrid.hybrid_model import (
     _canonicalize_shared_prefix_cp_sequence,
     _hybrid_mtp_is_enabled,
     _iter_shared_prefix_mtp_branches,
+    _pack_shared_prefix_mtp_branches,
     _reconstruct_shared_prefix_mtp_branches,
+    _validate_shared_prefix_mtp_attention_backend,
     _validate_shared_prefix_mtp_pattern,
 )
 from megatron.core.models.hybrid.shared_prefix import (
@@ -164,6 +166,17 @@ def test_shared_prefix_mtp_narrows_only_the_predictor_mamba_scope():
         _validate_shared_prefix_mtp_pattern("M*-")
 
 
+def test_shared_prefix_mtp_rejects_only_the_local_attention_backend():
+    """Only mcore's local attention can never run the packed THD MTP branches."""
+    from megatron.core.transformer.enums import AttnBackend
+
+    for backend in (AttnBackend.flash, AttnBackend.fused, AttnBackend.unfused, AttnBackend.auto):
+        _validate_shared_prefix_mtp_attention_backend(backend)
+
+    with pytest.raises(NotImplementedError, match="local DotProductAttention does not support"):
+        _validate_shared_prefix_mtp_attention_backend(AttnBackend.local)
+
+
 def test_hybrid_mtp_runtime_requires_a_positive_configured_depth():
     assert _hybrid_mtp_is_enabled(5, "*E", 5)
     assert not _hybrid_mtp_is_enabled(0, "*E", 5)
@@ -218,29 +231,41 @@ def test_shared_prefix_mtp_reconstructs_variable_physical_branches_and_gradients
     ]
 
 
-def test_shared_prefix_mtp_reconstruction_rejects_loss_on_prompt_or_padding():
+@pytest.mark.parametrize(
+    "reconstruct",
+    [_reconstruct_shared_prefix_mtp_branches, _pack_shared_prefix_mtp_branches],
+    ids=["per_branch", "packed"],
+)
+def test_shared_prefix_mtp_reconstruction_rejects_loss_on_prompt_or_padding(reconstruct):
     layout = SharedPrefixLayout(
         prefix_len=2,
         completion_lens=[4, 4],
         logical_completion_lens=[2, 2],
         padding_multiple=2,
     )
-    hidden_states = torch.zeros(layout.total_len, 1, 4)
-    input_ids = torch.zeros(1, layout.total_len, dtype=torch.long)
-    loss_mask = torch.zeros(1, layout.total_len)
+    physical_len = layout.total_len + 2
+    hidden_states = torch.zeros(physical_len, 1, 4)
+    input_ids = torch.zeros(1, physical_len, dtype=torch.long)
+    loss_mask = torch.zeros(1, physical_len)
 
     loss_mask[0, 0] = 1
     with pytest.raises(ValueError, match="exclude every prompt token"):
-        _reconstruct_shared_prefix_mtp_branches(
-            hidden_states, input_ids, loss_mask, layout
-        )
+        reconstruct(hidden_states, input_ids, loss_mask, layout)
 
     loss_mask.zero_()
     loss_mask[0, layout.prefix_len + layout.logical_completion_lens[0]] = 1
     with pytest.raises(ValueError, match="ordinary per-sequence padding"):
-        _reconstruct_shared_prefix_mtp_branches(
-            hidden_states, input_ids, loss_mask, layout
-        )
+        reconstruct(hidden_states, input_ids, loss_mask, layout)
+
+    loss_mask.zero_()
+    loss_mask[0, layout.total_len] = 1
+    with pytest.raises(ValueError, match="topology-only padding"):
+        reconstruct(hidden_states, input_ids, loss_mask, layout)
+
+    # Loss on real completion tokens passes the single combined device-side check.
+    loss_mask.zero_()
+    loss_mask[0, layout.prefix_len] = 1
+    reconstruct(hidden_states, input_ids, loss_mask, layout)
 
 
 def test_shared_prefix_mtp_cp1_canonicalization_is_identity():
@@ -290,6 +315,63 @@ def test_shared_prefix_mtp_branch_iterator_composes_cp_ownership_without_dense_c
             torch.testing.assert_close(local[0], full[0].index_select(0, cp_indices))
             torch.testing.assert_close(local[1], full[1].index_select(1, cp_indices))
             torch.testing.assert_close(local[2], full[2].index_select(1, cp_indices))
+
+
+def test_shared_prefix_mtp_packing_matches_branch_reconstruction():
+    """The single-call THD pack equals the branch-by-branch reconstruction, per CP rank."""
+    layout = SharedPrefixLayout(
+        prefix_len=2,
+        completion_lens=[6, 6],
+        logical_completion_lens=[3, 4],
+        padding_multiple=8,
+    )
+    physical_len = layout.total_len + 2
+    hidden_states = torch.arange(physical_len, dtype=torch.float32).reshape(-1, 1, 1)
+    hidden_states.requires_grad_(True)
+    input_ids = torch.arange(physical_len, dtype=torch.long).unsqueeze(0)
+    loss_mask = torch.tensor(
+        [[0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.float32
+    )
+    branch_lengths = [layout.prefix_len + length for length in layout.completion_lens]
+
+    for cp_size, cp_rank in ((1, 0), (2, 0), (2, 1)):
+        branches = tuple(
+            _iter_shared_prefix_mtp_branches(
+                hidden_states, input_ids, loss_mask, layout, cp_size=cp_size, cp_rank=cp_rank
+            )
+        )
+        packed_hidden, packed_ids, packed_mask, packed_positions = (
+            _pack_shared_prefix_mtp_branches(
+                hidden_states, input_ids, loss_mask, layout, cp_size=cp_size, cp_rank=cp_rank
+            )
+        )
+        assert packed_hidden.shape[0] == sum(branch_lengths) // cp_size
+        torch.testing.assert_close(packed_hidden, torch.cat([b[0] for b in branches], dim=0))
+        torch.testing.assert_close(packed_ids, torch.cat([b[1] for b in branches], dim=1))
+        torch.testing.assert_close(packed_mask, torch.cat([b[2] for b in branches], dim=1))
+        # Positions restart at zero per dense branch and follow the same zigzag
+        # ownership as the tokens, so THD RoPE and roll_tensor see ordinary branches.
+        expected_positions = torch.cat(
+            [
+                (
+                    layout.cp_local_indices(branch_len, cp_size, cp_rank, "cpu")
+                    if cp_size > 1
+                    else torch.arange(branch_len, dtype=torch.long)
+                )
+                for branch_len in branch_lengths
+            ]
+        ).unsqueeze(0)
+        torch.testing.assert_close(packed_positions, expected_positions)
+
+    # CP1 spells out the branch-major contract: the prompt is repeated once per
+    # branch and its backbone rows receive the summed gradient of every branch.
+    packed_hidden, packed_ids, _, packed_positions = _pack_shared_prefix_mtp_branches(
+        hidden_states, input_ids, loss_mask, layout
+    )
+    assert packed_ids.tolist() == [[0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 8, 9, 10, 11, 12, 13]]
+    assert packed_positions.tolist() == [[*range(8), *range(8)]]
+    packed_hidden.sum().backward()
+    assert hidden_states.grad.flatten().tolist() == [2, 2, *([1] * 12), 0, 0]
 
 
 @pytest.mark.parametrize(
@@ -704,13 +786,18 @@ def test_hybrid_model_explicit_shared_prefix_forward_matches_dense(
 @pytest.mark.timeout(900)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="shared-prefix MTP parity requires CUDA")
 @pytest.mark.parametrize("position_embedding_type", ["rope", "none"])
-def test_hybrid_shared_prefix_mtp_head_gradient_parity(position_embedding_type):
-    """Production dense-head reconstruction matches a conventional MTP batch."""
+def test_hybrid_shared_prefix_mtp_head_gradient_parity(monkeypatch, position_embedding_type):
+    """The single packed dense-head MTP call matches a conventional MTP batch."""
     pytest.importorskip("causal_conv1d")
     pytest.importorskip("flash_attn")
     pytest.importorskip("mamba_ssm")
     if not torch.cuda.is_bf16_supported():
         pytest.skip("shared-prefix MTP parity requires CUDA bf16 support")
+    # The packed MTP path runs every dense branch as one THD sequence; let TE pick
+    # its flash/fused THD kernels (AttnBackend.auto).  The unit-test conftest pins
+    # NVTE_FLASH_ATTN=0 / NVTE_FUSED_ATTN=0, which AttnBackend.auto rejects.
+    for env_name in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+        monkeypatch.delenv(env_name, raising=False)
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
     from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -757,7 +844,7 @@ def test_hybrid_shared_prefix_mtp_head_gradient_parity(position_embedding_type):
             use_mamba_mem_eff_path=False,
             hidden_dropout=0.0,
             attention_dropout=0.0,
-            attention_backend=AttnBackend.unfused,
+            attention_backend=AttnBackend.auto,
             apply_rope_fusion=False,
         )
         process_groups = ProcessGroupCollection.use_mpu_process_groups(
@@ -776,6 +863,10 @@ def test_hybrid_shared_prefix_mtp_head_gradient_parity(position_embedding_type):
             pg_collection=process_groups,
         ).cuda()
         model.train()
+        mtp_block_calls = []
+        model.mtp.register_forward_pre_hook(
+            lambda module, args, kwargs: mtp_block_calls.append(1), with_kwargs=True
+        )
 
         torch.manual_seed(41)
         prefix = torch.randint(0, model.vocab_size, (prefix_len,), device="cuda")
@@ -802,23 +893,19 @@ def test_hybrid_shared_prefix_mtp_head_gradient_parity(position_embedding_type):
         dense_positions = torch.arange(dense_seq_len, device="cuda").expand_as(dense_tokens)
         dense_loss_mask = torch.zeros_like(dense_tokens, dtype=torch.float32)
         dense_loss_mask[:, prefix_len : prefix_len + logical_completion_len] = 1
-        dense_attention_mask = ~torch.tril(
-            torch.ones(1, 1, dense_seq_len, dense_seq_len, dtype=torch.bool, device="cuda")
-        )
 
-        dense_logits = model(
-            dense_tokens,
-            dense_positions,
-            dense_attention_mask,
-            loss_mask=dense_loss_mask,
-        )
+        # Transformer Engine owns the causal mask for both the dense batch and the
+        # packed THD MTP branches; an explicit boolean mask is not needed.
+        dense_logits = model(dense_tokens, dense_positions, None, loss_mask=dense_loss_mask)
         (dense_logits.sum() * 0.0).backward()
+        assert len(mtp_block_calls) == 1
         dense_mtp_grads = {
             name: parameter.grad.detach().clone()
             for name, parameter in model.mtp.named_parameters()
             if parameter.grad is not None
         }
         assert dense_mtp_grads
+        mtp_block_calls.clear()
 
         model.zero_grad(set_to_none=True)
         star_tokens = torch.cat([prefix, *physical_completions]).unsqueeze(0)
@@ -847,6 +934,9 @@ def test_hybrid_shared_prefix_mtp_head_gradient_parity(position_embedding_type):
             shared_prefix_layout=layout,
         )
         (shared_logits.sum() * 0.0).backward()
+        # The shared-prefix path packs all three dense branches into one THD
+        # sequence and runs the MTP block exactly once, not once per branch.
+        assert len(mtp_block_calls) == 1
         shared_mtp_grads = {
             name: parameter.grad.detach()
             for name, parameter in model.mtp.named_parameters()

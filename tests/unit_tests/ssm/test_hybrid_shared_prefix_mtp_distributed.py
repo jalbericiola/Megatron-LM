@@ -20,6 +20,8 @@ different logical completion length, pads each dense branch to M=32, and adds
 sixteen topology-only tokens to the physical star.  Thus an MTP shift across a
 sibling boundary, a branch/label-order mismatch, or loss on either kind of
 padding changes both the five per-depth losses and the repeated-head gradients.
+The candidate packs its three dense branches into one THD sequence and must run
+the MTP block exactly once per star; the test asserts that call count.
 """
 
 import os
@@ -271,7 +273,17 @@ def _run_mtp_backward(model, *, tokens, positions, loss_mask, layout=None):
     # clearing makes this gate independent of any earlier test's MTP depth.
     MTPLossLoggingHelper.tracker.clear()
     MTPLossAutoScaler.set_loss_scale(torch.ones((), dtype=torch.float32, device="cuda"))
-    logits = model(tokens, positions, None, loss_mask=loss_mask, shared_prefix_layout=layout)
+    mtp_block_calls = []
+    hook = model.mtp.register_forward_pre_hook(
+        lambda module, args, kwargs: mtp_block_calls.append(1), with_kwargs=True
+    )
+    try:
+        logits = model(tokens, positions, None, loss_mask=loss_mask, shared_prefix_layout=layout)
+    finally:
+        hook.remove()
+    # The dense oracle and the packed shared-prefix path both run the MTP block
+    # once per microbatch; the candidate must not fall back to per-branch calls.
+    assert len(mtp_block_calls) == 1, f"expected one MTP block call, got {len(mtp_block_calls)}"
     losses = _snapshot_reduced_mtp_losses()
     # MTP's autograd attachment supplies the auxiliary gradient even though the
     # external RL loss contributes a zero main-logit gradient in this focused gate.
@@ -383,7 +395,9 @@ def test_gradient_parity_rejects_defect_diluted_by_large_family_tensor():
 )
 @pytest.mark.timeout(1200)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="distributed MTP parity requires CUDA")
-def test_repeated_hybrid_mtp_dense_loss_and_gradients_match_shared_prefix(tp_size, cp_size):
+def test_repeated_hybrid_mtp_dense_loss_and_gradients_match_shared_prefix(
+    monkeypatch, tp_size, cp_size
+):
     _require_exact_torchrun(tp_size, cp_size)
     # Grouped GEMM is supplied by Transformer Engine in the RL image rather
     # than by a standalone ``grouped_gemm`` Python package.
@@ -423,6 +437,12 @@ def test_repeated_hybrid_mtp_dense_loss_and_gradients_match_shared_prefix(tp_siz
 
         torch.manual_seed(20260828)
         model_parallel_cuda_manual_seed(20260828)
+        # The unit-test conftest pins NVTE_FLASH_ATTN=0 / NVTE_FUSED_ATTN=0, while
+        # AttnBackend.auto asserts they are unset or 1.  CP attention and the packed
+        # THD MTP branches need TE's flash/fused kernels, so clear the pins here; the
+        # autouse reset_env_vars fixture restores them after the test.
+        for env_name in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+            monkeypatch.delenv(env_name, raising=False)
         model = _build_model(process_groups, tp_size, cp_size, ep_size)
         model.train()
         assert model.position_embedding_type == "none"

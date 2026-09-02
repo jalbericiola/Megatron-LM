@@ -30,7 +30,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -97,23 +97,21 @@ def _canonicalize_shared_prefix_cp_sequence(
     return rank_order_tensor.index_select(0, inverse_order)
 
 
-def _iter_shared_prefix_mtp_branches(
+def _validate_shared_prefix_mtp_star(
     global_hidden_states: Tensor,
     global_input_ids: Tensor,
     global_loss_mask: Tensor,
     layout: SharedPrefixLayout,
     *,
-    cp_size: int = 1,
-    cp_rank: int = 0,
-) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
-    """Yield independent dense MTP branches from one canonical star.
+    cp_size: int,
+    cp_rank: int,
+) -> None:
+    """Validate one canonical star before its dense MTP branches are reconstructed.
 
-    The main Hybrid stack can share its prompt, but MTP shifts future tokens and
-    therefore needs a conventional sequence boundary per completion.  Keeping
-    only the current branch materialized avoids retaining the full dense
-    expansion on every CP rank. When CP is enabled, global-star indices are
-    composed directly with that branch's zigzag CP ownership so the full dense
-    branch is never allocated.
+    The loss-mask contract (no loss on the prompt, on ordinary per-branch padding,
+    or on topology-only padding) is checked with one device-side reduction and a
+    single host sync.  The offending region class is re-derived, with extra
+    syncs, only on the error path so the messages stay specific.
     """
     physical_len = global_hidden_states.shape[0]
     if global_hidden_states.ndim != 3 or global_hidden_states.shape[1] != 1:
@@ -134,47 +132,139 @@ def _iter_shared_prefix_mtp_branches(
     if cp_size < 1 or not 0 <= cp_rank < cp_size:
         raise ValueError("shared-prefix MTP received an invalid CP size/rank")
 
-    if torch.count_nonzero(global_loss_mask[:, : layout.prefix_len]).item():
-        raise ValueError("shared-prefix MTP loss mask must exclude every prompt token")
-    if torch.count_nonzero(global_loss_mask[:, layout.total_len :]).item():
-        raise ValueError("shared-prefix MTP loss mask must exclude topology-only padding")
-
-    prompt_indices = torch.arange(
-        layout.prefix_len, device=global_hidden_states.device, dtype=torch.long
-    )
+    # Every region below is defined by the layout's Python ints, so the mask is
+    # built with plain kernels and the whole contract costs one ``.item()``.
+    device = global_loss_mask.device
+    star_positions = torch.arange(physical_len, device=device)
+    must_be_zero = (star_positions < layout.prefix_len) | (star_positions >= layout.total_len)
     for branch_slice, logical_len in zip(
-        layout.completion_slices(),
-        layout.logical_completion_lens,
-        strict=True,
+        layout.completion_slices(), layout.logical_completion_lens, strict=True
     ):
         physical_padding_start = branch_slice.start + logical_len
-        if torch.count_nonzero(
-            global_loss_mask[:, physical_padding_start : branch_slice.stop]
-        ).item():
-            raise ValueError(
-                "shared-prefix MTP loss mask must exclude ordinary per-sequence padding"
-            )
+        if physical_padding_start < branch_slice.stop:
+            must_be_zero[physical_padding_start : branch_slice.stop] = True
+    if ((global_loss_mask[0] != 0) & must_be_zero).any().item():
+        if torch.count_nonzero(global_loss_mask[:, : layout.prefix_len]).item():
+            raise ValueError("shared-prefix MTP loss mask must exclude every prompt token")
+        if torch.count_nonzero(global_loss_mask[:, layout.total_len :]).item():
+            raise ValueError("shared-prefix MTP loss mask must exclude topology-only padding")
+        raise ValueError("shared-prefix MTP loss mask must exclude ordinary per-sequence padding")
+
+
+def _shared_prefix_mtp_branch_indices(
+    layout: SharedPrefixLayout,
+    device: torch.device | str,
+    *,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+) -> tuple[tuple[Tensor, ...], tuple[Tensor, ...]]:
+    """Return per-branch ``(star_indices, dense_positions)`` in this rank's CP-local order.
+
+    Branch ``i`` is the conventional dense sequence ``[prompt, completion_i]``,
+    including that completion's ordinary per-sequence padding.  ``star_indices[i]``
+    selects those tokens from the canonical global star and ``dense_positions[i]``
+    is each selected token's ``arange`` position inside its own dense branch.  With
+    CP enabled both are composed with the branch's standard two-chunk zigzag
+    ownership, so the full dense branch is never allocated.
+    """
+    prompt_indices = torch.arange(layout.prefix_len, device=device, dtype=torch.long)
+    star_indices = []
+    dense_positions = []
+    for branch_slice in layout.completion_slices():
         indices = torch.cat(
             (
                 prompt_indices,
                 torch.arange(
-                    branch_slice.start,
-                    branch_slice.stop,
-                    device=global_hidden_states.device,
-                    dtype=torch.long,
+                    branch_slice.start, branch_slice.stop, device=device, dtype=torch.long
                 ),
             )
         )
         if cp_size > 1:
-            cp_positions = SharedPrefixLayout.cp_local_indices(
-                indices.numel(), cp_size, cp_rank, indices.device
+            positions = SharedPrefixLayout.cp_local_indices(
+                indices.numel(), cp_size, cp_rank, device
             )
-            indices = indices.index_select(0, cp_positions)
+            indices = indices.index_select(0, positions)
+        else:
+            positions = torch.arange(indices.numel(), device=device, dtype=torch.long)
+        star_indices.append(indices)
+        dense_positions.append(positions)
+    return tuple(star_indices), tuple(dense_positions)
+
+
+def _iter_shared_prefix_mtp_branches(
+    global_hidden_states: Tensor,
+    global_input_ids: Tensor,
+    global_loss_mask: Tensor,
+    layout: SharedPrefixLayout,
+    *,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
+    """Yield independent dense MTP branches from one canonical star.
+
+    The main Hybrid stack can share its prompt, but MTP shifts future tokens and
+    therefore needs a conventional sequence boundary per completion.  This is the
+    per-branch reference form of ``_pack_shared_prefix_mtp_branches``: the
+    production forward packs every branch into one sequence, while tests use
+    this iterator to check that packing against branch-by-branch reconstruction.
+    When CP is enabled, global-star indices are composed directly with that
+    branch's zigzag CP ownership so the full dense branch is never allocated.
+    """
+    _validate_shared_prefix_mtp_star(
+        global_hidden_states,
+        global_input_ids,
+        global_loss_mask,
+        layout,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+    )
+    star_indices, _ = _shared_prefix_mtp_branch_indices(
+        layout, global_hidden_states.device, cp_size=cp_size, cp_rank=cp_rank
+    )
+    for indices in star_indices:
         yield (
             global_hidden_states.index_select(0, indices),
             global_input_ids.index_select(1, indices),
             global_loss_mask.index_select(1, indices),
         )
+
+
+def _pack_shared_prefix_mtp_branches(
+    global_hidden_states: Tensor,
+    global_input_ids: Tensor,
+    global_loss_mask: Tensor,
+    layout: SharedPrefixLayout,
+    *,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Pack every dense MTP branch of one canonical star into a single THD sequence.
+
+    Returns ``(hidden_states, input_ids, loss_mask, position_ids)`` for the
+    branch-major concatenation ``[prompt + completion_1 | ... | prompt +
+    completion_G]`` in this rank's CP-local order, gathered with exactly one
+    ``index_select`` per tensor.  The result equals the concatenation of
+    ``_iter_shared_prefix_mtp_branches`` for the same CP rank; ``position_ids``
+    restart at zero for every branch, exactly as a conventional dense batch.
+    """
+    _validate_shared_prefix_mtp_star(
+        global_hidden_states,
+        global_input_ids,
+        global_loss_mask,
+        layout,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+    )
+    star_indices, dense_positions = _shared_prefix_mtp_branch_indices(
+        layout, global_hidden_states.device, cp_size=cp_size, cp_rank=cp_rank
+    )
+    packed_indices = torch.cat(star_indices)
+    return (
+        global_hidden_states.index_select(0, packed_indices),
+        global_input_ids.index_select(1, packed_indices),
+        global_loss_mask.index_select(1, packed_indices),
+        torch.cat(dense_positions).unsqueeze(0),
+    )
 
 
 def _reconstruct_shared_prefix_mtp_branches(
@@ -198,6 +288,23 @@ def _validate_shared_prefix_mtp_pattern(mtp_pattern: Optional[str]) -> None:
             "shared-prefix MTP supports a Mamba Hybrid backbone but does not yet "
             "support a Mamba layer inside the MTP predictor; use an attention/MLP "
             "or attention/MoE MTP pattern such as '*-' or '*E'"
+        )
+
+
+def _validate_shared_prefix_mtp_attention_backend(attention_backend: AttnBackend) -> None:
+    """Reject the one attention backend that can never run the packed MTP branches.
+
+    Shared-prefix MTP packs every dense branch into a single THD sequence.  mcore's
+    local ``DotProductAttention`` asserts ``packed_seq_params is None``, so it cannot
+    serve that pack under any version.  Transformer Engine backends are left to TE's
+    own per-release backend selection, which raises when the installed release has
+    no THD-capable kernel for the requested backend.
+    """
+    if attention_backend == AttnBackend.local:
+        raise NotImplementedError(
+            "shared-prefix MTP packs every dense branch into one THD sequence, which "
+            "mcore's local DotProductAttention does not support; use a Transformer Engine "
+            "attention backend (flash/fused/unfused/auto)"
         )
 
 
@@ -601,7 +708,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         output_weight: Optional[Tensor],
         runtime_gather_output: Optional[bool],
     ) -> Tensor:
-        """Run MTP heads on dense branches while preserving the shared backbone graph."""
+        """Run the MTP heads once over all dense branches, preserving the backbone graph.
+
+        The star is expanded into the branch-major dense sequence
+        ``[prompt + completion_1 | ... | prompt + completion_G]`` and the MTP block runs
+        a single time on it as a THD packed batch.  Attention, RoPE and the MTP token
+        shifts all respect the ``cu_seqlens`` branch boundaries, so this equals running
+        the block once per branch while issuing one set of kernels and collectives.
+        """
         tp_group = self.pg_collection.tp
         cp_group = self.pg_collection.cp
         tp_size = tp_group.size()
@@ -609,8 +723,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         physical_len = input_ids.shape[1] * cp_size
 
         # The shared backbone is SP-sharded over TP.  Gather without reducing
-        # gradients because the reconstructed branches are scattered over TP
-        # again below, so each sequence position has one downstream owner.
+        # gradients because the packed branches are scattered over TP again
+        # below, so each sequence position has one downstream owner.
         cp_local_hidden = hidden_states
         if tp_size > 1:
             cp_local_hidden = gather_from_sequence_parallel_region(
@@ -651,126 +765,47 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "shared-prefix MTP combined CP-local sequence must be divisible by TP size"
             )
         packed_sp_length = combined_cp_length // tp_size
-        packed_sp_start = tp_group.rank() * packed_sp_length
-        packed_sp_stop = packed_sp_start + packed_sp_length
-
-        depth_count = 1 + self.config.mtp_num_layers
-        outputs_by_depth = [[] for _ in range(depth_count)]
-        branch_input_ids = []
-        branch_loss_masks = []
-        branch_cp_offset = 0
-        branch_iterator = _iter_shared_prefix_mtp_branches(
-            global_hidden,
-            global_input_ids,
-            global_loss_mask,
-            layout,
-            cp_size=cp_size,
-            cp_rank=cp_group.rank(),
-        )
-        for (branch_hidden, branch_ids, branch_mask), branch_len in zip(
-            branch_iterator, global_branch_lengths, strict=True
-        ):
-            required_alignment = tp_size if cp_size == 1 else 2 * cp_size * tp_size
+        required_alignment = tp_size if cp_size == 1 else 2 * cp_size * tp_size
+        for branch_len in global_branch_lengths:
             if branch_len % required_alignment:
                 raise ValueError(
                     "shared-prefix MTP physical branch length must be divisible by "
                     f"the CP/TP sequence quantum {required_alignment}, got {branch_len}"
                 )
-            branch_cp_indices = (
-                torch.arange(branch_len, device=branch_ids.device, dtype=torch.long)
-                if cp_size == 1
-                else SharedPrefixLayout.cp_local_indices(
-                    branch_len, cp_size, cp_group.rank(), branch_ids.device
-                )
+
+        # Build the dense branch-major sequence [P+C_1 | ... | P+C_G] in this
+        # rank's CP-local zigzag order with one index_select per tensor.  Under
+        # THD every branch is its own attention sequence and its own roll_tensor
+        # segment, so one MTP call over the pack equals G independent dense calls.
+        (packed_hidden, packed_input_ids, packed_loss_mask, packed_position_ids) = (
+            _pack_shared_prefix_mtp_branches(
+                global_hidden,
+                global_input_ids,
+                global_loss_mask,
+                layout,
+                cp_size=cp_size,
+                cp_rank=cp_group.rank(),
             )
-            local_hidden = branch_hidden
-            local_ids = branch_ids
-            local_mask = branch_mask
-            local_position_ids = torch.arange(
-                branch_len, device=branch_ids.device, dtype=torch.long
-            ).index_select(0, branch_cp_indices)[None, :]
-            if tp_size > 1:
-                local_hidden = tensor_parallel.scatter_to_sequence_parallel_region(
-                    local_hidden, group=tp_group
-                )
-
-            # RotaryEmbedding owns the standard CP zigzag slice.  MTP receives
-            # one ordinary sequence here, so no forest positions are involved.
-            if self.position_embedding_type == 'rope':
-                branch_rotary_pos_emb = self.rotary_pos_emb(branch_len)
-            elif self.position_embedding_type == 'none':
-                branch_rotary_pos_emb = None
-            else:
-                raise NotImplementedError(
-                    "shared-prefix MTP supports only RoPE or positionless Hybrid models"
-                )
-            branch_output = self.mtp(
-                input_ids=local_ids,
-                position_ids=local_position_ids,
-                hidden_states=local_hidden,
-                attention_mask=None,
-                inference_params=None,
-                rotary_pos_emb=branch_rotary_pos_emb,
-                packed_seq_params=None,
-                embedding=self.embedding,
+        )
+        del cp_local_hidden, global_hidden, global_input_ids, global_loss_mask
+        if packed_hidden.shape[0] != combined_cp_length:
+            raise RuntimeError(
+                "shared-prefix MTP packed CP-local sequence has an invalid length: "
+                f"{packed_hidden.shape[0]} != {combined_cp_length}"
             )
-            branch_input_ids.append(local_ids)
-            branch_loss_masks.append(local_mask)
-            branch_chunks = torch.chunk(branch_output, depth_count, dim=0)
-            if len(branch_chunks) != depth_count:
-                raise RuntimeError("shared-prefix MTP returned an invalid prediction depth count")
-            branch_cp_length = branch_len // cp_size
-            for depth, chunk in enumerate(branch_chunks):
-                if tp_size == 1:
-                    outputs_by_depth[depth].append(chunk)
-                    continue
+        if tp_size > 1:
+            # Scatter the whole pack once.  This rank's SP shard is its contiguous
+            # slice of the branch-major sequence, which is the exact per-depth
+            # layout process_mtp_loss consumes below, so no TP gathers are needed.
+            packed_hidden = tensor_parallel.scatter_to_sequence_parallel_region(
+                packed_hidden, group=tp_group
+            )
 
-                # Gather only the current branch/depth, then retain only this
-                # rank's slice of the eventual branch-major combined SP shard.
-                # reduce-scatter backward is required because different ranks
-                # select disjoint pieces from their replicated gathered branch.
-                full_branch_chunk = gather_from_sequence_parallel_region(
-                    chunk,
-                    tensor_parallel_output_grad=True,
-                    group=tp_group,
-                )
-                overlap_start = max(branch_cp_offset, packed_sp_start)
-                overlap_stop = min(
-                    branch_cp_offset + branch_cp_length, packed_sp_stop
-                )
-                if overlap_start < overlap_stop:
-                    source_start = overlap_start - branch_cp_offset
-                    source_stop = overlap_stop - branch_cp_offset
-                    outputs_by_depth[depth].append(
-                        full_branch_chunk[source_start:source_stop].contiguous()
-                    )
-                else:
-                    # Retain this gather in every TP rank's autograd graph even
-                    # when the rank owns no tokens from this branch.  Omitting
-                    # it lets backward issue the same number of reduce-scatters
-                    # in a different branch order on different ranks, silently
-                    # pairing unrelated branch gradients.
-                    outputs_by_depth[depth].append(full_branch_chunk[:0])
-                del full_branch_chunk
-            branch_cp_offset += branch_cp_length
-            del branch_output, branch_hidden
-
-        # MTP layers run independently so variable-length Mamba branches never
-        # see synthetic batch padding.  Repack their outputs by prediction depth
-        # for one globally normalized loss calculation.  PackedSeqParams is used
-        # only by process_mtp_loss's token/mask shifts, not by an MTP model layer.
-        packed_depth_hidden_states = []
-        for depth_outputs in outputs_by_depth:
-            packed_depth = torch.cat(depth_outputs, dim=0)
-            if packed_depth.shape[0] != packed_sp_length:
-                raise RuntimeError(
-                    "shared-prefix MTP branch-major SP shard has an invalid length: "
-                    f"{packed_depth.shape[0]} != {packed_sp_length}"
-                )
-            packed_depth_hidden_states.append(packed_depth)
-        packed_hidden_states = torch.cat(packed_depth_hidden_states, dim=0)
-        packed_input_ids = torch.cat(branch_input_ids, dim=1)
-        packed_loss_mask = torch.cat(branch_loss_masks, dim=1)
+        # Global (pre-CP) cumulative branch lengths, as in the packed non-shared
+        # path: TE attention, THD RoPE, and roll_tensor divide by CP internally and
+        # map each branch onto this rank's two zigzag chunks.  cp_group/local_cp_size
+        # stay unset exactly like trainer-built PackedSeqParams, so TE keeps the CP
+        # group it was constructed with instead of re-binding it every microbatch.
         cumulative_lengths = [0]
         for branch_len in global_branch_lengths:
             cumulative_lengths.append(cumulative_lengths[-1] + branch_len)
@@ -785,11 +820,45 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             cu_seqlens_kv=cu_seqlens,
             max_seqlen_q=max(global_branch_lengths),
             max_seqlen_kv=max(global_branch_lengths),
-            local_cp_size=cp_size,
-            cp_group=cp_group,
         )
+
+        # Mirror the packed non-shared forward: one table covering the longest
+        # branch, not CP-sliced (packed_seq=True).  THD RoPE selects each branch's
+        # positions from cu_seqlens, taking this CP rank's front/back zigzag chunks
+        # of every branch, which is what RotaryEmbedding(branch_len) did per branch.
+        if self.position_embedding_type == 'rope':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                None, None, None, self.config, packed_seq_params
+            )
+            packed_rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=True)
+        elif self.position_embedding_type == 'none':
+            packed_rotary_pos_emb = None
+        else:
+            raise NotImplementedError(
+                "shared-prefix MTP supports only RoPE or positionless Hybrid models"
+            )
+        packed_mtp_hidden = self.mtp(
+            input_ids=packed_input_ids,
+            position_ids=packed_position_ids,
+            hidden_states=packed_hidden,
+            attention_mask=None,
+            inference_params=None,
+            rotary_pos_emb=packed_rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            embedding=self.embedding,
+        )
+        del packed_hidden
+        # MultiTokenPredictionBlock returns depth-major chunks [depth_0 | ... |
+        # depth_D], each the SP shard of the branch-major pack, which is the layout
+        # process_mtp_loss chunks by depth.
+        depth_count = 1 + self.config.mtp_num_layers
+        if packed_mtp_hidden.shape[0] != depth_count * packed_sp_length:
+            raise RuntimeError(
+                "shared-prefix MTP returned an invalid depth-major SP shard length: "
+                f"{packed_mtp_hidden.shape[0]} != {depth_count} * {packed_sp_length}"
+            )
         processed_mtp_hidden = process_mtp_loss(
-            hidden_states=packed_hidden_states,
+            hidden_states=packed_mtp_hidden,
             labels=None,
             loss_mask=packed_loss_mask,
             output_layer=self.output_layer,
@@ -890,6 +959,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 )
             if self.mtp_process and self.training:
                 _validate_shared_prefix_mtp_pattern(self.mtp_pattern)
+                _validate_shared_prefix_mtp_attention_backend(self.config.attention_backend)
             if self.mtp_process and self.training and loss_mask is None:
                 raise ValueError("shared-prefix Hybrid MTP requires an explicit loss mask")
             if self.position_embedding_type not in ('rope', 'none'):
