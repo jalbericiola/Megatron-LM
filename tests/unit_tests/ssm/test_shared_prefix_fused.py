@@ -1,7 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import ast
 import importlib
 import inspect
+import textwrap
 
 import pytest
 import torch
@@ -23,6 +25,57 @@ def test_fused_merge_old_opt_in_fails_closed(monkeypatch):
 
     with pytest.raises(RuntimeError, match="known nondeterministic"):
         shared_prefix_fused._resolve_fused_merge_setting()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(None, False, id="unset"),
+        pytest.param("0", False, id="zero"),
+        pytest.param("false", False, id="false"),
+        pytest.param("1", True, id="one"),
+        pytest.param("TRUE", True, id="true"),
+    ],
+)
+def test_deterministic_backward_gate_is_explicit_and_default_off(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("NRL_SP_DETERMINISTIC_BACKWARD", raising=False)
+    else:
+        monkeypatch.setenv("NRL_SP_DETERMINISTIC_BACKWARD", value)
+
+    assert shared_prefix_fused._resolve_deterministic_backward_setting() is expected
+
+
+@pytest.mark.parametrize("value", ["", "yes", "2", " true "])
+def test_deterministic_backward_gate_rejects_ambiguous_values(monkeypatch, value):
+    monkeypatch.setenv("NRL_SP_DETERMINISTIC_BACKWARD", value)
+
+    with pytest.raises(RuntimeError, match="must be one of"):
+        shared_prefix_fused._resolve_deterministic_backward_setting()
+
+
+def test_deterministic_backward_accessor_reports_import_time_setting(monkeypatch):
+    monkeypatch.setattr(shared_prefix_fused, "_SP_DETERMINISTIC_BACKWARD", True)
+
+    assert shared_prefix_fused.is_shared_prefix_deterministic_backward_enabled() is True
+
+
+def test_both_flash_backward_paths_use_deterministic_gate():
+    source = textwrap.dedent(inspect.getsource(shared_prefix_fused._ComposedForestAttn.backward))
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_flash_attn_varlen_backward"
+    ]
+
+    assert len(calls) == 2
+    for call in calls:
+        deterministic = call.args[20]
+        assert isinstance(deterministic, ast.Name)
+        assert deterministic.id == "_SP_DETERMINISTIC_BACKWARD"
 
 
 def test_star_forest_builds_exact_cpu_attention_plan():

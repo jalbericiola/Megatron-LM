@@ -16,7 +16,8 @@ examples/shared_prefix_attention). Public entry points:
 Env knobs (defaults tuned on GB200): NRL_SP_CHAINFIRST (hybrid chain plan), NRL_SP_QSLICE
 (zero-copy q views), NRL_SP_STREAMS (stream overlap), and NRL_SP_COMBINE (cross-pass
 consolidation, default off). The retained Triton LSE merge is production-disabled pending a
-full-model corruption fix.
+full-model corruption fix. NRL_SP_DETERMINISTIC_BACKWARD is a default-off diagnostic that
+selects FlashAttention's deterministic backward.
 GB200 net vs block-diagonal at equal work: star-like/balanced trees 1.59x training / 1.56x
 logprob; deep branched trees 1.00x / 1.01x at a 1.10x FLOP ceiling (91-92% kernel efficiency).
 """
@@ -65,7 +66,38 @@ def _resolve_fused_merge_setting():
     return False
 
 
+def _resolve_deterministic_backward_setting():
+    """Resolve the opt-in deterministic FlashAttention backward diagnostic.
+
+    Reject unknown values instead of silently selecting the faster nondeterministic path when a
+    launcher misspells the diagnostic setting.
+    """
+    value = os.environ.get("NRL_SP_DETERMINISTIC_BACKWARD", "0")
+    normalized = value.lower()
+    if normalized in ("0", "false"):
+        return False
+    if normalized in ("1", "true"):
+        return True
+    raise RuntimeError(
+        "NRL_SP_DETERMINISTIC_BACKWARD must be one of 0, 1, false, or true; " f"got {value!r}"
+    )
+
+
 _SP_FUSED_MERGE = _resolve_fused_merge_setting()
+_SP_DETERMINISTIC_BACKWARD = _resolve_deterministic_backward_setting()
+
+
+def is_shared_prefix_deterministic_backward_enabled() -> bool:
+    """Report the import-time FlashAttention backward setting used by this module.
+
+    Integrations use this accessor to fail closed before publishing a determinism
+    receipt.  Reading the resolved value, rather than re-reading the environment,
+    also detects modules imported before the launcher installed its contract.
+    """
+
+    return _SP_DETERMINISTIC_BACKWARD
+
+
 # merge/dq-assembly kernel tile config (swept on GB200; override for other parts)
 _SP_MERGE_BT = int(os.environ.get("NRL_SP_MERGE_BT", "16"))
 _SP_MERGE_WARPS = int(os.environ.get("NRL_SP_MERGE_WARPS", "8"))
@@ -966,7 +998,7 @@ class _ComposedForestAttn(torch.autograd.Function):
                         -1,
                         0.0,
                         None,
-                        False,
+                        _SP_DETERMINISTIC_BACKWARD,
                         None,
                         False,
                     )
@@ -1046,7 +1078,7 @@ class _ComposedForestAttn(torch.autograd.Function):
                 -1,
                 0.0,
                 None,
-                False,
+                _SP_DETERMINISTIC_BACKWARD,
                 None,
                 False,
             )
