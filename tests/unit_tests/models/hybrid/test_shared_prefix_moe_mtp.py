@@ -207,6 +207,7 @@ def _process_mtp_loss(hidden_depths, input_ids, loss_mask, lengths, groups, inpu
         mtp_loss_scaling_factor=_FACTOR,
         calculate_per_token_loss=True,
         mtp_detach_heads=False,
+        attention_cp_layout="zigzag",
     )
     return process_mtp_loss(
         hidden_states=torch.cat(hidden_depths, dim=0),
@@ -214,7 +215,6 @@ def _process_mtp_loss(hidden_depths, input_ids, loss_mask, lengths, groups, inpu
         loss_mask=loss_mask,
         output_layer=output_layer,
         output_weight=None,
-        runtime_gather_output=None,
         is_training=False,
         compute_language_model_loss=language_model_loss,
         config=config,
