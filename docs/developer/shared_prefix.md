@@ -12,8 +12,12 @@ the packed layout. `megatron.core.models.hybrid.shared_prefix` validates a
 execution: `megatron.core.ssm.mamba_shared_prefix` and the ragged Mamba kernels
 under `megatron.core.ssm` fork the prefix state, and
 `megatron.core.transformer.shared_prefix_attention` runs the forest attention.
-Callers build the layout and own their configuration, batch transport,
-distributed coordination, and RL objective.
+Reusable packing lives in `megatron.rl`:
+row/star/forest planning, group sharding and slots, tensor materialization,
+TP/CP geometry, real-row alignment, and dense-bin reconstruction. See the
+[packing API and integration contract](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/rl/shared_prefix.md).
+Callers retain their configuration, batch transport, distributed coordination,
+and RL objective. NeMo RL uses adapters to this implementation.
 
 ## Layout and attention
 
@@ -24,9 +28,11 @@ star. RoPE positions restart at the original prompt length for each completion.
 The layout also records physical padding, logical lengths, and CP token ownership.
 Backward accumulates the completion contributions into shared prompt activations.
 
-Core layouts describe only stars (`SharedPrefixLayout`) and forests of contiguous
-stars (`SharedPrefixForestLayout`) whose prompt roots carry no padding. A caller
-with deeper trees must lower them to these types first.
+`PackedTreeLayout` also describes deeper trees; ancestry-aware reference masks for
+them live with the tests in `tests/unit_tests/rl/shared_prefix_oracles.py`. The fused
+hybrid attention/Mamba adapter still lowers only contiguous stars and forests with
+unpadded prompt roots; deeper layouts fail explicitly. See the
+[tree descriptor contracts](../../tests/unit_tests/rl/test_tree_layout.py).
 
 TP sequence parallelism and CP zigzag ownership use the caller's process groups.
 The fused attention path exchanges the required sequence/head shards and retains
@@ -185,6 +191,9 @@ replaces:
 - `tests/unit_tests/models/hybrid/test_shared_prefix_guards.py` and
   `tests/unit_tests/test_shared_prefix_layout.py`: the explicit guards and layout
   metadata, on CPU.
+- `tests/unit_tests/models/hybrid/test_shared_prefix_rl_parity.py`: the
+  `megatron.rl` planner and core execution agree on the padding quantum and CP
+  ownership, on CPU.
 
 In FP32, shared and dense execution differ only in summation order. The layer
 tests bound that difference at 1e-5 relative L2 for MoE and 5e-5 for Mamba. Their
@@ -221,7 +230,9 @@ replayed bit-exactly in `test_shared_prefix_attention.py` and
 see the [determinism testing requirements](determinism/testing.md). The attention
 tests also compare outputs and gradients with an FP64 reference, within twice the
 error of ordinary FlashAttention over the dense branches, use real NCCL exchanges
-at CP1/2/4, and drive the shared-prefix branch of `SelfAttention.forward`.
+at CP1/2/4, and drive the shared-prefix branch of `SelfAttention.forward`. The
+CPU packing contracts are described with the
+[packing API](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/rl/shared_prefix.md#validation-scope).
 
 These tests qualify layer- and model-level numerics and determinism on small
 models. They include no whole-model gradient comparison at a large training
