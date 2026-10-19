@@ -6,9 +6,10 @@ This module deliberately does not alter :class:`HybridStack`'s normal ``forward`
 ``forward_hybrid_stack_shared_prefix`` with a shared-prefix layout (stars ``[P, C_1, ..., C_G]``)
 to opt in. This module validates the stack and runs its layers in order; the layer-specific
 execution lives with the layers. Mamba layers run
-:func:`megatron.core.ssm.mamba_shared_prefix.forward_mamba_layer_shared_prefix`, which scans each
-prefix once and forks its state into the completion branches. Attention layers run the
-exact-backward forest attention in :mod:`megatron.core.transformer.shared_prefix_attention`.
+:func:`megatron.core.ssm.mamba_shared_prefix.forward_mamba_layer_shared_prefix`, which calls the
+layer and scans each prefix once, forking its state into the completion branches. Attention
+layers run the exact-backward forest attention in
+:mod:`megatron.core.transformer.shared_prefix_attention`.
 Unsupported topology or model features fail before executing a partial forward.
 
 CP>1 uses the model's standard zigzag sequence shards and sequence-to-head all-to-alls. The
@@ -180,6 +181,14 @@ def _validate_hybrid_stack(
         raise NotImplementedError("shared-prefix Hybrid does not yet support mHC connections")
     if getattr(stack.config, "attn_logit_softcapping", None) is not None:
         raise NotImplementedError("shared-prefix attention does not yet support logit softcapping")
+    # Batch-invariant mode promises bitwise training/inference agreement. Shared-prefix attention
+    # runs FlashAttention 2 passes although this mode pins version 3 or 4, and shared-prefix Mamba
+    # applies its gate to the rounded scan output instead of inside the scan.
+    if getattr(stack.config, "batch_invariant_mode", False):
+        raise NotImplementedError(
+            "shared-prefix Hybrid does not yet support batch-invariant mode: its attention runs "
+            "FlashAttention 2 and its Mamba layers gate after the scan output is rounded"
+        )
     tp_size = stack.tp_group.size()
     sequence_parallel = bool(stack.config.sequence_parallel)
     if tp_size > 1 and not sequence_parallel:
@@ -444,7 +453,9 @@ def forward_hybrid_stack_shared_prefix(
                 moe_layer._shared_prefix_token_multiplicities = token_multiplicities
             try:
                 if isinstance(layer, MambaLayer):
-                    # Every topology and root count honors NRL_SP_MAMBA_IMPL.
+                    # Runs the layer through MambaLayer.__call__ and MambaMixer.__call__, like the
+                    # attention branch below, so module hooks fire as on the dense path. Every
+                    # topology and root count honors NRL_SP_MAMBA_IMPL.
                     hidden_states = forward_mamba_layer_shared_prefix(layer, hidden_states, layout)
                 elif isinstance(layer.self_attention, IdentityOp):
                     hidden_states = layer(hidden_states=hidden_states, attention_mask=None)

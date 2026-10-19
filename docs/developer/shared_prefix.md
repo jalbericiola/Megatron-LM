@@ -45,6 +45,8 @@ Attention runs every star of a forest in at most two FlashAttention varlen passe
 a causal self pass and a non-causal pass from completions to their prompt, and
 merges them by log-sum-exp. Forward and backward are exact. The backward requires
 flash-attn 2.7.0 or later, which stack validation checks before any layer runs.
+The passes always call FlashAttention 2, whatever `flash_attention_version` pins for
+Transformer Engine and the inference engine.
 Under `torch.use_deterministic_algorithms(True)`, which `--deterministic-mode`
 enables, the backward uses FlashAttention's deterministic kernel; no other switch
 is needed for bit-exact attention replay.
@@ -62,6 +64,11 @@ exactly once in every Mamba sub-operation. The shared aligned prefix, residual-t
 replay, and convolution halo are distinct parts of the contract. Every shared path
 passes channel-last input to `causal_conv1d`, as `MambaMixer` does, because its
 channel-first backward is wrong at some sequence lengths.
+
+Each Mamba layer runs through `MambaLayer.__call__` and `MambaMixer.__call__`, as
+attention and MoE layers run through their module calls, so module hooks such as
+Megatron FSDP's parameter gathers fire as on the dense path. Shared-prefix training
+under Megatron FSDP has not been qualified.
 
 `NRL_SP_MAMBA_IMPL` selects the Mamba backend. The default, `ragged_state_fork`,
 applies to every topology and root count, including TP1/CP1 single stars; it pads
@@ -150,15 +157,15 @@ Unsupported combinations fail explicitly, including hash routing, quantization
 recipes, fp8/fp4, wide residual streams, mHC, multi-latent attention,
 attention-logit softcapping, QK-clip statistics, selective core-attention
 recomputation, sliding-window attention, external attention/padding masks,
-inference contexts, fine-grained activation offloading, and CUDA graphs. At CP
-greater than one, Mamba requires `linear_cp_layout='zigzag'`. For MoE, the adapter
-rejects load balancing that replaces top-k routing (such as sinkhorn), nonzero
-auxiliary-loss and z-loss coefficients, input jitter, randomized forced routing,
-expert-capacity token dropping, per-rank capacity token dropping
-(`moe_expert_rank_capacity_factor`), routing replay, and training MLP chunking.
-Auxiliary-loss balancing types with zero coefficients, the MCore default, are
-accepted because they leave top-k routing unchanged. See the validation functions
-for the complete runtime contract.
+inference contexts, fine-grained activation offloading, CUDA graphs, and
+batch-invariant mode. At CP greater than one, Mamba requires
+`linear_cp_layout='zigzag'`. For MoE, the adapter rejects load balancing that
+replaces top-k routing (such as sinkhorn), nonzero auxiliary-loss and z-loss
+coefficients, input jitter, randomized forced routing, expert-capacity token
+dropping, per-rank capacity token dropping (`moe_expert_rank_capacity_factor`),
+routing replay, and training MLP chunking. Auxiliary-loss balancing types with
+zero coefficients, the MCore default, are accepted because they leave top-k
+routing unchanged. See the validation functions for the complete runtime contract.
 
 The capability tokens at the end of `shared_prefix.py` name the implemented code
 paths so integrations can require the exact conjunction they use. They are
@@ -170,27 +177,27 @@ full-model scale.
 GPU tests compare shared execution with the dense rows `[prompt, completion_g]` it
 replaces:
 
-- `tests/unit_tests/models/hybrid/test_shared_prefix_model_parity.py`: HybridModel
-  logits, parameter gradients and expert-bias counts for stars and forests at
-  TP1/CP1, TP2/SP/CP2 and TP1/CP4; full recomputation against the plain shared
-  forward; and the default path with an explicit `None` layout, bit for bit.
-- `tests/unit_tests/models/hybrid/test_shared_prefix_moe_mtp.py` and
+- `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_model_parity.py`:
+  HybridModel logits, parameter gradients and expert-bias counts for stars and
+  forests at TP1/CP1, TP2/SP/CP2 and TP1/CP4; full recomputation against the plain
+  shared forward; and the default path with an explicit `None` layout, bit for bit.
+- `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_moe_mtp.py` and
   `test_shared_prefix_mtp_branches.py`: expert-bias counts through a real router,
   MTP parity and grouped normalization at TP1/CP1 and TP2/SP/CP2, the fixed-order
   prompt-row gather, and the MTP input guards.
-- `tests/unit_tests/transformer/test_multi_token_prediction_loss_groups.py`: one
+- `tests/unit_tests/shared_prefix/test_multi_token_prediction_loss_groups.py`: one
   grouped `process_mtp_loss` call against one call per loss group, on CPU.
-- `tests/unit_tests/ssm/test_shared_prefix_mamba_numerics.py` and
+- `tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py` and
   `test_shared_prefix_mamba_backends.py`: the four differentiable Mamba backends
   against dense rows, including branch lengths in the defective `causal_conv1d`
   length classes, and backend selection.
-- `tests/unit_tests/transformer/moe/test_router_shared_prefix.py` and
+- `tests/unit_tests/shared_prefix/test_router_shared_prefix.py` and
   `tests/unit_tests/tensor_parallel/test_random.py`: routing arguments, logical
   expert counts, fixed-row router blocks, the frozen-router backward, and the
   forward context restored during recomputation.
-- `tests/unit_tests/models/hybrid/test_shared_prefix_guards.py` and
-  `tests/unit_tests/test_shared_prefix_layout.py`: the explicit guards and layout
-  metadata, on CPU.
+- `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_guards.py` and
+  `tests/unit_tests/shared_prefix/test_shared_prefix_layout.py`: the explicit
+  guards, the layout metadata, and the order of Mamba module hooks, on CPU.
 - `tests/unit_tests/models/hybrid/test_shared_prefix_rl_parity.py`: the
   `megatron.rl` planner and core execution agree on the padding quantum and CP
   ownership, on CPU.
