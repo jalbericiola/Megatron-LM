@@ -29,10 +29,11 @@ The layout also records physical padding, logical lengths, and CP token ownershi
 Backward accumulates the completion contributions into shared prompt activations.
 
 `PackedTreeLayout` also describes deeper trees; ancestry-aware reference masks for
-them live with the tests in `tests/unit_tests/rl/shared_prefix_oracles.py`. The fused
-hybrid attention/Mamba adapter still lowers only contiguous stars and forests with
-unpadded prompt roots; deeper layouts fail explicitly. See the
-[tree descriptor contracts](../../tests/unit_tests/rl/test_tree_layout.py).
+them live with the tests in `tests/unit_tests/rl/shared_prefix/shared_prefix_oracles.py`.
+The fused hybrid attention/Mamba adapter still lowers only contiguous stars and forests
+with unpadded prompt roots; deeper layouts fail explicitly. See the `tree-` cases of the
+[planning tests](../../tests/unit_tests/rl/shared_prefix/test_shared_prefix_planning.py)
+for the tree descriptor contracts.
 
 TP sequence parallelism and CP zigzag ownership use the caller's process groups.
 The fused attention path exchanges the required sequence/head shards and retains
