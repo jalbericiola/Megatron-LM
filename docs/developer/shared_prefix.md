@@ -198,7 +198,7 @@ replaces:
 - `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_guards.py` and
   `tests/unit_tests/shared_prefix/test_shared_prefix_layout.py`: the explicit
   guards, the layout metadata, and the order of Mamba module hooks, on CPU.
-- `tests/unit_tests/models/hybrid/test_shared_prefix_rl_parity.py`: the
+- `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_rl_parity.py`: the
   `megatron.rl` planner and core execution agree on the padding quantum and CP
   ownership, on CPU.
 
