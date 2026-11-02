@@ -10,14 +10,22 @@ Model execution is split by owner. `megatron.core.shared_prefix_layout` describe
 the packed layout. `megatron.core.models.hybrid.shared_prefix` validates a
 `HybridStack` and runs its layers in order. Each layer type keeps its own
 execution: `megatron.core.ssm.mamba_shared_prefix` and the ragged Mamba kernels
-under `megatron.core.ssm` fork the prefix state, and
-`megatron.core.transformer.shared_prefix_attention` runs the forest attention.
-Reusable packing lives in `megatron.rl`:
+under `megatron.core.ssm` fork the prefix state,
+`megatron.core.ops.attention.shared_prefix` runs the forest attention, and
+`megatron.core.transformer.shared_prefix_attention` checks that a self-attention
+layer can run it. Reusable packing lives in `megatron.rl`:
 row/star/forest planning, group sharding and slots, tensor materialization,
 TP/CP geometry, real-row alignment, and dense-bin reconstruction. See the
 [packing API and integration contract](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/rl/shared_prefix.md).
 Callers retain their configuration, batch transport, distributed coordination,
 and RL objective. NeMo RL uses adapters to this implementation.
+
+The stack passes each layer its shared-prefix input as a keyword argument of the
+layer call. Self-attention layers receive the layout as `shared_prefix_forest`.
+Mamba layers receive a `shared_prefix_call` request, which `MambaLayer` passes on
+to `MambaMixer`. With expert bias enabled, MoE layers receive the logical token
+counts as `shared_prefix_token_multiplicities`. No module state is set, so
+activation recomputation replays each layer call with its own arguments.
 
 ## Layout and attention
 
@@ -36,7 +44,7 @@ with unpadded prompt roots; deeper layouts fail explicitly. See the `tree-` case
 for the tree descriptor contracts.
 
 TP sequence parallelism and CP zigzag ownership use the caller's process groups.
-The fused attention path exchanges the required sequence/head shards and retains
+The forest attention path exchanges the required sequence/head shards and retains
 an independent causal domain for each completion. This is an execution layout;
 logical sample weights, loss masks, and group normalization remain the caller's
 responsibility. Log-probability and training forwards must use the same assignment
@@ -154,19 +162,21 @@ Full activation recomputation supports the uniform method. `HybridModel.forward`
 validates a request once, before the embedding, from the configuration, process
 groups, layer types and global physical length.
 
-Unsupported combinations fail explicitly, including hash routing, quantization
-recipes, fp8/fp4, wide residual streams, mHC, multi-latent attention,
-attention-logit softcapping, QK-clip statistics, selective core-attention
-recomputation, sliding-window attention, external attention/padding masks,
-inference contexts, fine-grained activation offloading, CUDA graphs, and
-batch-invariant mode. At CP greater than one, Mamba requires
-`linear_cp_layout='zigzag'`. For MoE, the adapter rejects load balancing that
-replaces top-k routing (such as sinkhorn), nonzero auxiliary-loss and z-loss
-coefficients, input jitter, randomized forced routing, expert-capacity token
-dropping, per-rank capacity token dropping (`moe_expert_rank_capacity_factor`),
+Unsupported combinations fail explicitly, including `hybrid_layer_config_list`
+(use `hybrid_layer_pattern`), hash routing, quantization recipes, fp8/fp4, wide
+residual streams, mHC, multi-latent attention, attention-logit softcapping,
+QK-clip statistics, selective core-attention recomputation, sliding-window
+attention, external attention/padding masks, inference contexts, fine-grained
+activation offloading, CUDA graphs, and batch-invariant mode. At CP greater than
+one, Mamba requires `linear_cp_layout='zigzag'`. For MoE, the adapter rejects
+load balancing that replaces top-k routing (such as sinkhorn), nonzero
+auxiliary-loss and z-loss coefficients, input jitter, randomized forced routing,
+expert-capacity token dropping, per-rank capacity token dropping
+(`moe_expert_rank_capacity_factor`), the flex dispatcher's `ncclep` backend,
 routing replay, and training MLP chunking. Auxiliary-loss balancing types with
 zero coefficients, the MCore default, are accepted because they leave top-k
-routing unchanged. See the validation functions for the complete runtime contract.
+routing unchanged. See the validation functions for the complete runtime
+contract.
 
 The capability tokens at the end of `shared_prefix.py` name the implemented code
 paths so integrations can require the exact conjunction they use. They are
@@ -198,7 +208,8 @@ replaces:
   forward context restored during recomputation.
 - `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_guards.py` and
   `tests/unit_tests/shared_prefix/test_shared_prefix_layout.py`: the explicit
-  guards, the layout metadata, and the order of Mamba module hooks, on CPU.
+  guards, the layout metadata, the arguments each layer call receives, and the
+  order of Mamba module hooks, on CPU.
 - `tests/unit_tests/shared_prefix/hybrid/test_shared_prefix_rl_parity.py`: the
   `megatron.rl` planner and core execution agree on the padding quantum and CP
   ownership, on CPU.
@@ -238,8 +249,9 @@ replayed bit-exactly in `test_shared_prefix_attention.py` and
 see the [determinism testing requirements](determinism/testing.md). The attention
 tests also compare outputs and gradients with an FP64 reference, within twice the
 error of ordinary FlashAttention over the dense branches, use real NCCL exchanges
-at CP1/2/4, and drive the shared-prefix branch of `SelfAttention.forward`. The
-CPU packing contracts are described with the
+at CP1/2/4, and drive the shared-prefix branch of `SelfAttention.forward`,
+checking that the forest kernel replaces core attention. The CPU packing contracts
+are described with the
 [packing API](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/rl/shared_prefix.md#validation-scope).
 
 These tests qualify layer- and model-level numerics and determinism on small

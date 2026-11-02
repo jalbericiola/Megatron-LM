@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from packaging.version import Version
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid import shared_prefix
@@ -17,11 +18,12 @@ from megatron.core.models.hybrid.shared_prefix import (
     _validate_hybrid_stack,
     forward_hybrid_stack_shared_prefix,
 )
-from megatron.core.shared_prefix_layout import SharedPrefixLayout
+from megatron.core.ops import _backends
+from megatron.core.ops.attention import shared_prefix as forest_attention
+from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
 from megatron.core.ssm import mamba_shared_prefix
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import MambaMixer
-from megatron.core.transformer import shared_prefix_attention
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.identity_op import IdentityOp
@@ -184,9 +186,11 @@ def test_full_attention_window_accepted(window_size):
     _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 
-def _attention_layer():
+def _attention_layer(config):
     layer = Mock(spec=TransformerLayer)
     layer.self_attention = Mock(spec=SelfAttention)
+    # The attention validation reads the module's own config, which SelfAttention stores.
+    layer.self_attention.config = config
     layer.self_attention.core_attention = Mock(spec=DotProductAttention)
     layer.self_attention.checkpoint_core_attention = False
     layer.self_attention.pg_collection = SimpleNamespace(tp=_group(1), cp=_group(1))
@@ -194,18 +198,33 @@ def _attention_layer():
     return layer
 
 
-@pytest.mark.parametrize("installed", [False, True])
-def test_old_or_missing_flash_attn_rejected_before_any_layer(monkeypatch, installed):
-    def is_fa_min_version(version):
-        if not installed:
-            raise ImportError("No module named 'flash_attn'")
-        return False
+@pytest.mark.parametrize(
+    "version, match",
+    [
+        (None, r"Shared-prefix forest attention requires flash_attn\.flash_attn_interface: No"),
+        ("2.6.3", r"requires flash_attn\.flash_attn_interface>=2\.7\.0; found 2\.6\.3"),
+    ],
+    ids=["missing", "old"],
+)
+def test_old_or_missing_flash_attn_rejected_before_any_layer(request, monkeypatch, version, match):
+    def import_module(name):
+        if version is None:
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return SimpleNamespace(
+            flash_attn_varlen_func=object(), _flash_attn_varlen_backward=object()
+        )
 
-    monkeypatch.setattr(shared_prefix_attention, "is_fa_min_version", is_fa_min_version)
-    stack = _stack(_config(), [_attention_layer()])
-    with pytest.raises(RuntimeError, match="flash-attn >= 2.7.0"):
+    monkeypatch.setattr(_backends, "import_module", import_module)
+    monkeypatch.setattr(_backends, "installed_version", lambda *_args: Version(version))
+    # A successful check is cached. Clear it so this test imports the stand-in, and again
+    # afterwards so later tests bind the installed flash-attn.
+    forest_attention._flash_attn_interface.cache_clear()
+    request.addfinalizer(forest_attention._flash_attn_interface.cache_clear)
+    config = _config()
+    stack = _stack(config, [_attention_layer(config)])
+    with pytest.raises(ImportError, match=match):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
-    # Attention-free stacks never reach the fused attention kernel.
+    # Attention-free stacks never reach the forest attention kernel.
     _validate_hybrid_stack(_stack(_config()), _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 
@@ -249,6 +268,11 @@ _REJECTED_MOE_CONFIGS = [
     ({"moe_z_loss_coeff": 1e-3}, "router z-loss"),
     ({"moe_input_jitter_eps": 0.1}, "input jitter"),
     ({"mlp_chunks_for_training": 2}, "MLP chunking"),
+    # NCCL EP sizes its buffers from the first unpacked microbatch.
+    (
+        {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "ncclep"},
+        "'ncclep' backend",
+    ),
     # Expert-bias accounting needs logical completion lengths; _LAYOUT has none.
     ({"moe_router_enable_expert_bias": True}, "explicit physical branch padding"),
 ]
@@ -268,7 +292,7 @@ def test_unsupported_stack_config_rejected(overrides, error, message):
 def test_batch_invariant_mode_rejected_before_layer_checks():
     """One stack-level message, before the attention and Mamba layers report their own causes."""
     config = _config(batch_invariant_mode=True, flash_attention_version=3)
-    stack = _stack(config, [_attention_layer(), _mamba_layer(1, contiguous=False)])
+    stack = _stack(config, [_attention_layer(config), _mamba_layer(1, contiguous=False)])
     with pytest.raises(NotImplementedError, match="Hybrid does not yet support batch-invariant"):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
@@ -292,17 +316,18 @@ def test_unsupported_stack_topology_and_layers_rejected():
     stack = _stack(_config(), [Mock(spec=torch.nn.Linear)])
     with pytest.raises(NotImplementedError, match="not implemented for"):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
-    checkpointed = _attention_layer()
+    config = _config()
+    checkpointed = _attention_layer(config)
     checkpointed.self_attention.checkpoint_core_attention = True
     with pytest.raises(NotImplementedError, match="selective core-attention recomputation"):
         _validate_hybrid_stack(
-            _stack(_config(), [checkpointed]), _LAYOUT, physical_len=_PHYSICAL_LEN[1]
+            _stack(config, [checkpointed]), _LAYOUT, physical_len=_PHYSICAL_LEN[1]
         )
+    # The attention validation reports QK clipping from the layer's own config.
+    config = _config(qk_clip=True)
     with pytest.raises(NotImplementedError, match="QK-clipping"):
         _validate_hybrid_stack(
-            _stack(_config(qk_clip=True), [_attention_layer()]),
-            _LAYOUT,
-            physical_len=_PHYSICAL_LEN[1],
+            _stack(config, [_attention_layer(config)]), _LAYOUT, physical_len=_PHYSICAL_LEN[1]
         )
 
 
@@ -326,9 +351,10 @@ def test_consecutive_mamba_layers_run_their_module_hooks(monkeypatch):
     """Each Mamba layer reaches its mixer through MambaLayer.__call__ and MambaMixer.__call__.
 
     Module hooks, such as Megatron FSDP's unshard, prefetch and reshard hooks, fire only on module
-    calls, so the stack must not call a layer's shared-prefix helper around them.
+    calls, so the stack must not call a layer's shared-prefix helper around them. The request is
+    the ``shared_prefix_call`` argument of both calls.
     """
-    events = []
+    events, requests = [], {}
 
     def mixer_half(mixer, hidden_states, call):
         call.consumed = True
@@ -341,7 +367,12 @@ def test_consecutive_mamba_layers_run_their_module_hooks(monkeypatch):
     layers = [_bare_mamba_layer(config) for _ in range(2)]
     for index, layer in enumerate(layers):
         for name, module in ((f"layer{index}", layer), (f"mixer{index}", layer.mixer)):
-            module.register_forward_pre_hook(lambda m, a, name=name: events.append(f"{name}_pre"))
+
+            def pre_hook(module, args, kwargs, name=name):
+                events.append(f"{name}_pre")
+                requests[name] = kwargs.get("shared_prefix_call")
+
+            module.register_forward_pre_hook(pre_hook, with_kwargs=True)
             module.register_forward_hook(lambda m, a, o, name=name: events.append(f"{name}_post"))
     hidden_states = torch.randint(-4, 5, (_LAYOUT.total_len, 1, 8)).to(torch.bfloat16)
 
@@ -357,7 +388,13 @@ def test_consecutive_mamba_layers_run_their_module_hooks(monkeypatch):
     assert events == [event.format(index) for index in range(2) for event in layer_events]
     # Each layer adds its residual to the mixer output 2 * h.
     torch.testing.assert_close(output, 9 * hidden_states, rtol=0, atol=0)
-    assert all(layer.mixer._shared_prefix_call is None for layer in layers)
+    # Every layer call gets its own request and passes it on to its mixer, which serves it.
+    for index in range(2):
+        request = requests[f"layer{index}"]
+        assert isinstance(request, mamba_shared_prefix.MambaSharedPrefixCall)
+        assert request.consumed and request.layout is _LAYOUT
+        assert requests[f"mixer{index}"] is request
+    assert requests["layer0"] is not requests["layer1"]
 
 
 def test_stack_validation_needs_only_the_physical_length():
@@ -373,11 +410,10 @@ def _moe_identity_layer(calls):
     layer.is_moe_layer = True
     layer.mlp = Mock(spec=MoELayer)
     layer.mlp.router = Mock(spec=TopKRouter)
-    # MoELayer declares the scoped slot with a None class default.
-    layer.mlp._shared_prefix_token_multiplicities = None
 
-    def forward(hidden_states, attention_mask):
-        calls.append(layer.mlp._shared_prefix_token_multiplicities.clone())
+    # An attention-free MoE layer takes the multiplicities and no attention arguments.
+    def forward(hidden_states, attention_mask, shared_prefix_token_multiplicities):
+        calls.append(shared_prefix_token_multiplicities.clone())
         return hidden_states
 
     layer.side_effect = forward
@@ -389,8 +425,10 @@ _PADDED_LAYOUT = SharedPrefixLayout(3, (5, 1), logical_completion_lens=(3, 1), p
 
 
 # (moe_token_dispatcher_type, moe_flex_dispatcher_backend, padding excluded when unstated)
+# The backend matters only to the flex dispatcher; flex with 'ncclep' is rejected.
 _DISPATCHERS = [
     ("alltoall", "deepep", False),
+    ("alltoall", "ncclep", False),
     ("allgather", "hybridep", False),
     ("flex", "deepep", False),
     ("flex", "hybridep", True),
@@ -443,10 +481,9 @@ def test_prevalidated_forward_checks_only_the_physical_length():
     config = _config(moe=True, moe_router_enable_expert_bias=True)
     hidden_states = torch.zeros(12, 1, 8, dtype=torch.bfloat16)
     calls = []
+    stack = _stack(config, [_moe_identity_layer(calls)])
 
     def forward(**kwargs):
-        # A fresh mock layer per call: the stack deletes the per-call slot after each layer.
-        stack = _stack(config, [_moe_identity_layer(calls)])
         forward_hybrid_stack_shared_prefix(
             stack, hidden_states, _PADDED_LAYOUT, position_embedding_type="none", **kwargs
         )
@@ -463,13 +500,116 @@ def test_prevalidated_forward_checks_only_the_physical_length():
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("forest", [False, True], ids=["star", "forest"])
+def test_layer_calls_carry_their_shared_prefix_arguments(forest):
+    """Each layer call receives the shared-prefix inputs of its layer type as arguments.
+
+    Self-attention layers get the RoPE table and the layout as a forest (a star becomes a forest
+    with one root); MoE layers get the expert-bias multiplicities; a layer with both gets both.
+    """
+    layout = SharedPrefixForestLayout((_PADDED_LAYOUT,)) if forest else _PADDED_LAYOUT
+    config = _config(moe=True, moe_router_enable_expert_bias=True)
+    moe = Mock(spec=TransformerLayer)
+    moe.self_attention = IdentityOp()
+    layers = {"attention": _attention_layer(config), "moe": moe, "both": _attention_layer(config)}
+    moe.is_moe_layer = layers["both"].is_moe_layer = True
+    received = {}
+    for name, layer in layers.items():
+
+        def forward(*, name=name, **kwargs):
+            received[name] = kwargs
+            return kwargs["hidden_states"]
+
+        layer.side_effect = forward
+    rotary_pos_emb = torch.zeros(1)
+
+    forward_hybrid_stack_shared_prefix(
+        _stack(config, list(layers.values())),
+        torch.zeros(12, 1, 8, dtype=torch.bfloat16),
+        layout,
+        rotary_pos_emb=rotary_pos_emb,
+        validated_physical_len=12,
+    )
+
+    attention_args = {"hidden_states", "attention_mask", "rotary_pos_emb", "shared_prefix_forest"}
+    moe_args = {"hidden_states", "attention_mask", "shared_prefix_token_multiplicities"}
+    assert set(received["attention"]) == attention_args
+    assert set(received["moe"]) == moe_args
+    assert set(received["both"]) == attention_args | moe_args
+    for name in ("attention", "both"):
+        assert received[name]["attention_mask"] is None
+        assert received[name]["rotary_pos_emb"] is rotary_pos_emb
+        assert received[name]["shared_prefix_forest"] == SharedPrefixForestLayout((_PADDED_LAYOUT,))
+        if forest:
+            assert received[name]["shared_prefix_forest"] is layout
+    multiplicities = received["moe"]["shared_prefix_token_multiplicities"]
+    assert received["both"]["shared_prefix_token_multiplicities"] is multiplicities
+    expected = torch.tensor([2.0, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 0])
+    torch.testing.assert_close(multiplicities, expected, rtol=0, atol=0)
+
+
+def test_full_recompute_replays_each_layer_call_with_its_arguments(monkeypatch):
+    """Backward recomputation calls every layer again with the same shared-prefix arguments."""
+    config = _config(
+        moe=True,
+        moe_router_enable_expert_bias=True,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+    )
+    moe = Mock(spec=TransformerLayer)
+    moe.self_attention = IdentityOp()
+    moe.is_moe_layer = True
+    layers = {"attention": _attention_layer(config), "moe": moe}
+    calls = {name: [] for name in layers}
+    for name, layer in layers.items():
+
+        def forward(*, name=name, **kwargs):
+            calls[name].append(kwargs)
+            return 2 * kwargs["hidden_states"]
+
+        layer.side_effect = forward
+    # Megatron's checkpoint needs the CUDA RNG tracker; torch's replays the callable the same way.
+    monkeypatch.setattr(
+        shared_prefix.tensor_parallel,
+        "checkpoint",
+        lambda function, distribute_saved_activations, *args: torch.utils.checkpoint.checkpoint(
+            function, *args, use_reentrant=True
+        ),
+    )
+    hidden_states = torch.ones(12, 1, 8, dtype=torch.bfloat16, requires_grad=True)
+
+    output = forward_hybrid_stack_shared_prefix(
+        _stack(config, list(layers.values())),
+        hidden_states,
+        _PADDED_LAYOUT,
+        position_embedding_type="none",
+        validated_physical_len=12,
+    )
+    assert [len(layer_calls) for layer_calls in calls.values()] == [1, 1]
+    output.float().sum().backward()
+
+    for (forward_call, replay), argument in zip(
+        calls.values(), ("shared_prefix_forest", "shared_prefix_token_multiplicities")
+    ):
+        assert replay.keys() == forward_call.keys()
+        assert replay[argument] is forward_call[argument]
+
+
 def test_hybrid_model_rejects_config_list_before_any_preprocessing():
     """Shared-prefix guards read the model-level config, not config-list per-layer configs."""
     from megatron.core.models.hybrid.hybrid_model import HybridModel
 
-    # The guard runs before the forward touches any module, so no allocation is needed.
+    # The guard runs before the forward touches any module, so no allocation is needed. The stub
+    # is a complete PP1 training model without MTP, so the other early guards pass wherever the
+    # config-list guard sits among them.
     model = HybridModel.__new__(HybridModel)
     torch.nn.Module.__init__(model)
+    model.pre_process = True
+    model.post_process = True
+    model.vp_stage = None
+    model.mtp_process = False
+    model.training = True
     model.hybrid_layer_config_list = (_config(),)
     with pytest.raises(NotImplementedError, match="hybrid_layer_config_list"):
         HybridModel.forward(

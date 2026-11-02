@@ -8,8 +8,8 @@ to opt in. This module validates the stack and runs its layers in order; the lay
 execution lives with the layers. Mamba layers run
 :func:`megatron.core.ssm.mamba_shared_prefix.forward_mamba_layer_shared_prefix`, which calls the
 layer and scans each prefix once, forking its state into the completion branches. Attention
-layers run the exact-backward forest attention in
-:mod:`megatron.core.transformer.shared_prefix_attention`.
+layers run the exact-backward forest attention in :mod:`megatron.core.ops.attention.shared_prefix`
+after :mod:`megatron.core.transformer.shared_prefix_attention` validates them.
 Unsupported topology or model features fail before executing a partial forward.
 
 CP>1 uses the model's standard zigzag sequence shards and sequence-to-head all-to-alls. The
@@ -33,10 +33,7 @@ from megatron.core.ssm.mamba_shared_prefix import (
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe.moe_utils import router_gating_token_blocks
-from megatron.core.transformer.shared_prefix_attention import (
-    require_shared_prefix_flash_attn,
-    validate_shared_prefix_attention,
-)
+from megatron.core.transformer.shared_prefix_attention import validate_shared_prefix_attention
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
 
@@ -240,7 +237,7 @@ def _validate_hybrid_stack(
             "shared-prefix Hybrid adapter does not support sliding-window attention"
         )
     if stack.config.softmax_type != "vanilla":
-        raise NotImplementedError("shared-prefix fused attention supports only vanilla softmax")
+        raise NotImplementedError("shared-prefix forest attention supports only vanilla softmax")
 
     num_moe_experts = stack.config.num_moe_experts
     expert_bias_enabled = bool(getattr(stack.config, "moe_router_enable_expert_bias", False))
@@ -303,6 +300,18 @@ def _validate_hybrid_stack(
                 "token dropping: the per-rank budget counts physical star rows, and a dropped "
                 "prompt row is lost for every completion that shares it"
             )
+        # Without THD packing, NCCL EP sizes its buffers once, from the first microbatch, and
+        # needs the same size on every rank. Shared-prefix forwards are unpacked, and their
+        # length changes with every microbatch and differs across ranks.
+        if (
+            stack.config.moe_token_dispatcher_type == "flex"
+            and stack.config.moe_flex_dispatcher_backend == "ncclep"
+        ):
+            raise NotImplementedError(
+                "shared-prefix Hybrid adapter does not support the flex dispatcher's 'ncclep' "
+                "backend: without THD packing it sizes its buffers from the first microbatch, "
+                "while shared-prefix microbatches change length"
+            )
         # Replay targets are recorded per dense row; shared-prefix routes physical star rows.
         if stack.config.moe_enable_routing_replay:
             raise NotImplementedError(
@@ -315,7 +324,6 @@ def _validate_hybrid_stack(
                 "shared-prefix Hybrid MoE adapter does not support training MLP chunking"
             )
 
-    has_attention = False
     for layer in stack.layers:
         if isinstance(layer, MambaLayer):
             validate_mamba_layer_shared_prefix(layer, tp_size=tp_size, cp_size=cp_size)
@@ -326,9 +334,9 @@ def _validate_hybrid_stack(
                     'layers'
                 )
             if isinstance(layer.self_attention, SelfAttention):
-                has_attention = True
+                # Also binds flash-attn, so a missing or old install fails before any layer runs.
                 validate_shared_prefix_attention(
-                    layer.self_attention, stack.config, tp_size=tp_size, cp_size=cp_size
+                    layer.self_attention, tp_size=tp_size, cp_size=cp_size
                 )
             if expert_bias_enabled and getattr(layer, "is_moe_layer", False):
                 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -345,9 +353,6 @@ def _validate_hybrid_stack(
             raise NotImplementedError(
                 f"shared-prefix state forking is not implemented for {type(layer).__name__}"
             )
-    if has_attention:
-        # The attention entry repeats this check; failing here precedes the first Mamba layer.
-        require_shared_prefix_flash_attn()
 
 
 def forward_hybrid_stack_shared_prefix(
@@ -362,9 +367,11 @@ def forward_hybrid_stack_shared_prefix(
 ) -> Tensor:
     """Explicit exact-prompt star forward for a supported ``HybridStack`` topology.
 
-    Normal ``HybridStack.forward`` and ``Attention.forward`` behavior is unchanged unless this
-    function installs its scoped private forest descriptor. The descriptor is always removed in a
-    ``finally`` block, including when a layer raises.
+    Normal ``HybridStack.forward`` behavior is unchanged. Each layer receives its shared-prefix
+    input as a keyword argument of its own call: self-attention layers ``shared_prefix_forest``,
+    Mamba layers ``shared_prefix_call`` (built by :func:`forward_mamba_layer_shared_prefix`), and,
+    with expert bias, MoE layers ``shared_prefix_token_multiplicities``. No module state is set,
+    so recomputation replays a layer with the arguments of its own call.
 
     ``exclude_sequence_padding_from_expert_bias`` states the caller's dense expert-bias
     convention for per-branch padding rows. ``True`` excludes them, as a dense forward with the
@@ -377,7 +384,7 @@ def forward_hybrid_stack_shared_prefix(
     stack validation is then not repeated; the length implied by ``hidden_states`` must match.
     """
     if hidden_states.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("fused shared-prefix attention requires fp16 or bf16 hidden states")
+        raise TypeError("shared-prefix forest attention requires fp16 or bf16 hidden states")
     if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
         raise ValueError(
             "shared-prefix Hybrid input must have shape [sequence/(TP*CP), 1, hidden] "
@@ -441,42 +448,31 @@ def forward_hybrid_stack_shared_prefix(
                 "shared-prefix token multiplicity ownership does not match the local hidden rows"
             )
 
+    # Self-attention takes the layout as a forest; a single star is a forest with one root.
+    attention_forest = (
+        layout
+        if isinstance(layout, SharedPrefixForestLayout)
+        else SharedPrefixForestLayout((layout,))
+    )
+
     @router_gating_token_blocks()
     def forward_layer_range(hidden_states: Tensor, start: int, end: int) -> Tensor:
         for layer in stack.layers[start:end]:
-            moe_layer = (
-                layer.mlp if expert_bias_enabled and getattr(layer, "is_moe_layer", False) else None
-            )
-            if moe_layer is not None:
-                if moe_layer._shared_prefix_token_multiplicities is not None:
-                    raise RuntimeError("nested shared-prefix MoE dispatch is not supported")
-                moe_layer._shared_prefix_token_multiplicities = token_multiplicities
-            try:
-                if isinstance(layer, MambaLayer):
-                    # Runs the layer through MambaLayer.__call__ and MambaMixer.__call__, like the
-                    # attention branch below, so module hooks fire as on the dense path. Every
-                    # topology and root count honors NRL_SP_MAMBA_IMPL.
-                    hidden_states = forward_mamba_layer_shared_prefix(layer, hidden_states, layout)
-                elif isinstance(layer.self_attention, IdentityOp):
-                    hidden_states = layer(hidden_states=hidden_states, attention_mask=None)
-                else:
-                    attention = layer.self_attention
-                    if attention._shared_prefix_forest is not None:
-                        raise RuntimeError(
-                            "nested shared-prefix attention dispatch is not supported"
-                        )
-                    attention._shared_prefix_forest = layout.forest
-                    try:
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=None,
-                            rotary_pos_emb=rotary_pos_emb,
-                        )
-                    finally:
-                        del attention._shared_prefix_forest
-            finally:
-                if moe_layer is not None:
-                    del moe_layer._shared_prefix_token_multiplicities
+            if isinstance(layer, MambaLayer):
+                # Runs the layer through MambaLayer.__call__ and MambaMixer.__call__, like the
+                # other layers below, so module hooks fire as on the dense path. Every
+                # topology and root count honors NRL_SP_MAMBA_IMPL.
+                hidden_states = forward_mamba_layer_shared_prefix(layer, hidden_states, layout)
+            else:
+                layer_kwargs = {}
+                if not isinstance(layer.self_attention, IdentityOp):
+                    layer_kwargs["rotary_pos_emb"] = rotary_pos_emb
+                    layer_kwargs["shared_prefix_forest"] = attention_forest
+                if expert_bias_enabled and getattr(layer, "is_moe_layer", False):
+                    layer_kwargs["shared_prefix_token_multiplicities"] = token_multiplicities
+                hidden_states = layer(
+                    hidden_states=hidden_states, attention_mask=None, **layer_kwargs
+                )
 
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[0]
@@ -488,7 +484,8 @@ def forward_hybrid_stack_shared_prefix(
             end = min(start + chunk_size, len(stack.layers))
 
             def custom_forward(hidden_states: Tensor, start=start, end=end) -> Tensor:
-                # Scopes live inside the callable so backward replay reconstructs them.
+                # The router scope and the layer calls, with their shared-prefix arguments, live
+                # inside the callable, so backward replay reconstructs them.
                 return forward_layer_range(hidden_states, start, end)
 
             hidden_states = tensor_parallel.checkpoint(
